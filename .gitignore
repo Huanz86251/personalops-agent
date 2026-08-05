@@ -1,0 +1,70 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+secrets*.json
+
+# Python environments and generated files
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+build/
+dist/
+*.egg-info/
+
+# IDE and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Project runtime state and generated workspace content
+.agent/
+.models/
+workspace/
+
+# Databases, logs, caches, and traces
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+*.trace
+*.cache
+
+# Downloaded model weights and serialized artifacts
+*.bin
+*.ckpt
+*.gguf
+*.joblib
+*.onnx
+*.pickle
+*.pkl
+*.pt
+*.pth
+*.safetensors
+
+# Notebook and tool caches
+.ipynb_checkpoints/
+.cache/
+.huggingface/
+.playwright/
+
