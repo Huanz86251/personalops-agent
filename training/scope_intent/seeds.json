@@ -1,0 +1,562 @@
+[
+  {
+    "seed_id": "d01",
+    "label": "DIRECT_RESPONSE",
+    "split": "train",
+    "text": "解释一下什么是向量数据库。",
+    "note": "纯知识问答"
+  },
+  {
+    "seed_id": "d02",
+    "label": "DIRECT_RESPONSE",
+    "split": "train",
+    "text": "把这句话翻译成英文：今天下午会下雨。",
+    "note": "输入内已有全部材料"
+  },
+  {
+    "seed_id": "d03",
+    "label": "DIRECT_RESPONSE",
+    "split": "train",
+    "text": "帮我把下面这段话改得更礼貌。",
+    "note": "文本改写"
+  },
+  {
+    "seed_id": "d04",
+    "label": "DIRECT_RESPONSE",
+    "split": "train",
+    "text": "比较 REST 和 GraphQL 的优缺点。",
+    "note": "概念比较"
+  },
+  {
+    "seed_id": "d05",
+    "label": "DIRECT_RESPONSE",
+    "split": "train",
+    "text": "给我三个适合周会的破冰问题。",
+    "note": "内容生成"
+  },
+  {
+    "seed_id": "d06",
+    "label": "DIRECT_RESPONSE",
+    "split": "train",
+    "text": "12.5% 的 480 是多少？",
+    "note": "本地可计算"
+  },
+  {
+    "seed_id": "d07",
+    "label": "DIRECT_RESPONSE",
+    "split": "train",
+    "text": "如果要归档旧邮件，一般应该先检查什么？",
+    "note": "询问做法但不要求执行"
+  },
+  {
+    "seed_id": "d08",
+    "label": "DIRECT_RESPONSE",
+    "split": "train",
+    "text": "写一段 Python 示例，演示如何读取 CSV。",
+    "note": "只生成示例代码"
+  },
+  {
+    "seed_id": "d09",
+    "label": "DIRECT_RESPONSE",
+    "split": "train",
+    "text": "总结我粘贴在下面的会议记录。",
+    "note": "材料随请求提供"
+  },
+  {
+    "seed_id": "d10",
+    "label": "DIRECT_RESPONSE",
+    "split": "train",
+    "text": "What does eventual consistency mean?",
+    "note": "英文知识问答"
+  },
+  {
+    "seed_id": "d11",
+    "label": "DIRECT_RESPONSE",
+    "split": "train",
+    "text": "Draft a short apology message for arriving late.",
+    "note": "英文内容生成"
+  },
+  {
+    "seed_id": "d12",
+    "label": "DIRECT_RESPONSE",
+    "split": "train",
+    "text": "How would I use grep to find TODO comments?",
+    "note": "询问命令但不执行"
+  },
+  {
+    "seed_id": "d13",
+    "label": "DIRECT_RESPONSE",
+    "split": "train",
+    "text": "判断这句话的情感是积极还是消极：这家店服务很好。",
+    "note": "输入内分类"
+  },
+  {
+    "seed_id": "d14",
+    "label": "DIRECT_RESPONSE",
+    "split": "train",
+    "text": "根据这些已给出的数字做一个简单结论：3、5、8、13。",
+    "note": "仅处理上下文数据"
+  },
+  {
+    "seed_id": "d15",
+    "label": "DIRECT_RESPONSE",
+    "split": "validation",
+    "text": "解释为什么写入数据后通常要回读验证。",
+    "note": "讨论工具策略但不执行"
+  },
+  {
+    "seed_id": "d16",
+    "label": "DIRECT_RESPONSE",
+    "split": "validation",
+    "text": "把“项目延期”换一种不那么生硬的说法。",
+    "note": "短改写"
+  },
+  {
+    "seed_id": "d17",
+    "label": "DIRECT_RESPONSE",
+    "split": "validation",
+    "text": "Give me a checklist for reviewing a pull request.",
+    "note": "给清单而非操作仓库"
+  },
+  {
+    "seed_id": "d18",
+    "label": "DIRECT_RESPONSE",
+    "split": "test",
+    "text": "我应该怎样整理下载文件夹？",
+    "note": "建议而非真实整理"
+  },
+  {
+    "seed_id": "d19",
+    "label": "DIRECT_RESPONSE",
+    "split": "test",
+    "text": "Explain this error message using only the text I pasted.",
+    "note": "限定使用已给文本"
+  },
+  {
+    "seed_id": "d20",
+    "label": "DIRECT_RESPONSE",
+    "split": "test",
+    "text": "为一家咖啡店想五个名字。",
+    "note": "创意生成"
+  },
+  {
+    "seed_id": "s01",
+    "label": "REQUIRES_SCOPE_CONTRACT",
+    "split": "train",
+    "text": "把下载文件夹里的 PDF 移到归档目录。",
+    "note": "文件读取和写入"
+  },
+  {
+    "seed_id": "s02",
+    "label": "REQUIRES_SCOPE_CONTRACT",
+    "split": "train",
+    "text": "查看我明天的日历并把冲突的会议列出来。",
+    "note": "读取外部账户状态"
+  },
+  {
+    "seed_id": "s03",
+    "label": "REQUIRES_SCOPE_CONTRACT",
+    "split": "train",
+    "text": "给最近给我发报价的供应商回一封确认邮件。",
+    "note": "搜索并发送外部消息"
+  },
+  {
+    "seed_id": "s04",
+    "label": "REQUIRES_SCOPE_CONTRACT",
+    "split": "train",
+    "text": "把仓库里的测试修好并提交改动。",
+    "note": "代码和文件操作"
+  },
+  {
+    "seed_id": "s05",
+    "label": "REQUIRES_SCOPE_CONTRACT",
+    "split": "train",
+    "text": "查一下北京周末天气并安排一个户外活动。",
+    "note": "联网查询后行动"
+  },
+  {
+    "seed_id": "s06",
+    "label": "REQUIRES_SCOPE_CONTRACT",
+    "split": "train",
+    "text": "把表格中逾期且未付款的订单标成红色。",
+    "note": "集合筛选后写入"
+  },
+  {
+    "seed_id": "s07",
+    "label": "REQUIRES_SCOPE_CONTRACT",
+    "split": "train",
+    "text": "下载最新财务报告并保存到共享目录。",
+    "note": "外部获取和文件交付"
+  },
+  {
+    "seed_id": "s08",
+    "label": "REQUIRES_SCOPE_CONTRACT",
+    "split": "train",
+    "text": "把我歌单中已经点赞的歌曲评分设为五星。",
+    "note": "两个集合求交后写入"
+  },
+  {
+    "seed_id": "s09",
+    "label": "REQUIRES_SCOPE_CONTRACT",
+    "split": "train",
+    "text": "登录后台，把库存少于十件的商品下架。",
+    "note": "登录、筛选和外部写入"
+  },
+  {
+    "seed_id": "s10",
+    "label": "REQUIRES_SCOPE_CONTRACT",
+    "split": "train",
+    "text": "检查服务日志，找出昨晚失败的请求。",
+    "note": "读取运行环境"
+  },
+  {
+    "seed_id": "s11",
+    "label": "REQUIRES_SCOPE_CONTRACT",
+    "split": "train",
+    "text": "Open the project and rename every draft report.",
+    "note": "英文批量文件操作"
+  },
+  {
+    "seed_id": "s12",
+    "label": "REQUIRES_SCOPE_CONTRACT",
+    "split": "train",
+    "text": "Find the cheapest direct flight and book it.",
+    "note": "英文查询和外部交易"
+  },
+  {
+    "seed_id": "s13",
+    "label": "REQUIRES_SCOPE_CONTRACT",
+    "split": "train",
+    "text": "在数据库里找出重复客户并合并记录。",
+    "note": "数据库读写"
+  },
+  {
+    "seed_id": "s14",
+    "label": "REQUIRES_SCOPE_CONTRACT",
+    "split": "train",
+    "text": "打开网页，把所有未读通知标为已读。",
+    "note": "浏览器状态操作"
+  },
+  {
+    "seed_id": "s15",
+    "label": "REQUIRES_SCOPE_CONTRACT",
+    "split": "validation",
+    "text": "把团队网盘里我创建的空文件夹删除。",
+    "note": "归属与筛选条件"
+  },
+  {
+    "seed_id": "s16",
+    "label": "REQUIRES_SCOPE_CONTRACT",
+    "split": "validation",
+    "text": "Search my inbox for the invoice and attach it to the ticket.",
+    "note": "跨系统读取和写入"
+  },
+  {
+    "seed_id": "s17",
+    "label": "REQUIRES_SCOPE_CONTRACT",
+    "split": "validation",
+    "text": "运行测试，只修复由这次改动引起的失败。",
+    "note": "执行与范围限制"
+  },
+  {
+    "seed_id": "s18",
+    "label": "REQUIRES_SCOPE_CONTRACT",
+    "split": "test",
+    "text": "把 CRM 里没有跟进记录的潜在客户分配给销售。",
+    "note": "否定条件筛选后更新"
+  },
+  {
+    "seed_id": "s19",
+    "label": "REQUIRES_SCOPE_CONTRACT",
+    "split": "test",
+    "text": "检查这些链接是否还能访问，并更新失效项。",
+    "note": "批量核验和写入"
+  },
+  {
+    "seed_id": "s20",
+    "label": "REQUIRES_SCOPE_CONTRACT",
+    "split": "test",
+    "text": "从最近的会议录音中提取行动项并写入任务系统。",
+    "note": "读取媒体并创建外部任务"
+  },
+  {
+    "split": "train",
+    "seed_id": "d21",
+    "note": "分析执行请求而不执行",
+    "text": "解释下面这条用户命令中，条件限制的是哪个对象，但不要执行命令。",
+    "label": "DIRECT_RESPONSE"
+  },
+  {
+    "split": "train",
+    "seed_id": "d22",
+    "note": "材料已在上下文",
+    "text": "根据我贴出的 JSON 返回值，判断哪些字段可能是主键。",
+    "label": "DIRECT_RESPONSE"
+  },
+  {
+    "split": "train",
+    "seed_id": "d23",
+    "note": "只生成代码不执行",
+    "text": "写一条 SQL，查询已付款但尚未发货的订单，不要连接数据库。",
+    "label": "DIRECT_RESPONSE"
+  },
+  {
+    "split": "train",
+    "seed_id": "d24",
+    "note": "只生成示例",
+    "text": "给我一个写入后回读检查的伪代码例子。",
+    "label": "DIRECT_RESPONSE"
+  },
+  {
+    "split": "train",
+    "seed_id": "d25",
+    "note": "对已提供计划做分析",
+    "text": "评价这份三步执行计划有没有把任务拆得太碎。",
+    "label": "DIRECT_RESPONSE"
+  },
+  {
+    "split": "train",
+    "seed_id": "d26",
+    "note": "假设数据内计算",
+    "text": "假设文件列表如下，请算出标星文件和 PDF 文件的交集。",
+    "label": "DIRECT_RESPONSE"
+  },
+  {
+    "split": "train",
+    "seed_id": "d27",
+    "note": "条件归属解释",
+    "text": "说明“我的文件夹里的机密文件”和“我的机密文件夹里的文件”有什么区别。",
+    "label": "DIRECT_RESPONSE"
+  },
+  {
+    "split": "train",
+    "seed_id": "d28",
+    "note": "设计建议",
+    "text": "帮我设计一个判断请求是否需要工具调用的二分类标签。",
+    "label": "DIRECT_RESPONSE"
+  },
+  {
+    "split": "train",
+    "seed_id": "d29",
+    "note": "已有错误文本",
+    "text": "下面是一次 API 错误，请只根据错误文本解释可能原因。",
+    "label": "DIRECT_RESPONSE"
+  },
+  {
+    "split": "train",
+    "seed_id": "d30",
+    "note": "英文只生成命令",
+    "text": "Write a shell command that would list large files, but do not run it.",
+    "label": "DIRECT_RESPONSE"
+  },
+  {
+    "split": "train",
+    "seed_id": "d31",
+    "note": "英文范围分析",
+    "text": "Explain whether the two conditions in this sentence form a union or an intersection.",
+    "label": "DIRECT_RESPONSE"
+  },
+  {
+    "split": "train",
+    "seed_id": "d32",
+    "note": "模板生成",
+    "text": "Draft a template for asking a colleague to verify a completed change.",
+    "label": "DIRECT_RESPONSE"
+  },
+  {
+    "split": "train",
+    "seed_id": "d33",
+    "note": "规划建议不执行",
+    "text": "我打算清理邮箱，帮我列出操作前应该确认的问题。",
+    "label": "DIRECT_RESPONSE"
+  },
+  {
+    "split": "train",
+    "seed_id": "d34",
+    "note": "显式禁止外部访问",
+    "text": "不用访问我的账户，告诉我一般怎样检查订阅是否自动续费。",
+    "label": "DIRECT_RESPONSE"
+  },
+  {
+    "split": "validation",
+    "seed_id": "d35",
+    "note": "只处理提供内容",
+    "text": "把我提供的工具调用记录整理成一段交接摘要。",
+    "label": "DIRECT_RESPONSE"
+  },
+  {
+    "split": "validation",
+    "seed_id": "d36",
+    "note": "计划审阅",
+    "text": "判断这段计划是否遗漏了验收步骤，并说明理由。",
+    "label": "DIRECT_RESPONSE"
+  },
+  {
+    "split": "validation",
+    "seed_id": "d37",
+    "note": "英文抽象教学",
+    "text": "Give an example showing why a filter may apply to a container rather than its items.",
+    "label": "DIRECT_RESPONSE"
+  },
+  {
+    "split": "test",
+    "seed_id": "d38",
+    "note": "给定集合运算",
+    "text": "根据这份静态清单，找出同时属于 A 和 B 的编号。",
+    "label": "DIRECT_RESPONSE"
+  },
+  {
+    "split": "test",
+    "seed_id": "d39",
+    "note": "英文请求改写",
+    "text": "Rewrite this request so its object and exclusions are unambiguous.",
+    "label": "DIRECT_RESPONSE"
+  },
+  {
+    "split": "test",
+    "seed_id": "d40",
+    "note": "RAG边界解释",
+    "text": "解释为什么模型不应把检索到的文档当成用户要求。",
+    "label": "DIRECT_RESPONSE"
+  },
+  {
+    "split": "train",
+    "seed_id": "s21",
+    "note": "附件读取和产物",
+    "text": "读取我上传的合同，找出终止条款并整理成表格。",
+    "label": "REQUIRES_SCOPE_CONTRACT"
+  },
+  {
+    "split": "train",
+    "seed_id": "s22",
+    "note": "对象范围和排除条件",
+    "text": "把我的文件夹中标星的文件移到归档区，已归档的跳过。",
+    "label": "REQUIRES_SCOPE_CONTRACT"
+  },
+  {
+    "split": "train",
+    "seed_id": "s23",
+    "note": "条件限制容器",
+    "text": "找出机密文件夹里的所有文件并撤销外部共享。",
+    "label": "REQUIRES_SCOPE_CONTRACT"
+  },
+  {
+    "split": "train",
+    "seed_id": "s24",
+    "note": "两个动态集合求交",
+    "text": "将我拥有的项目和最近更新的项目取交集，然后生成报告。",
+    "label": "REQUIRES_SCOPE_CONTRACT"
+  },
+  {
+    "split": "train",
+    "seed_id": "s25",
+    "note": "差集与例外",
+    "text": "删除测试账户，但保留管理员和过去七天登录过的账户。",
+    "label": "REQUIRES_SCOPE_CONTRACT"
+  },
+  {
+    "split": "train",
+    "seed_id": "s26",
+    "note": "写入后全量回读",
+    "text": "修改配置后重新读取配置，确认四个字段都已生效。",
+    "label": "REQUIRES_SCOPE_CONTRACT"
+  },
+  {
+    "split": "train",
+    "seed_id": "s27",
+    "note": "前置读取产生后续参数",
+    "text": "先查客户资料，再用真实客户编号创建售后工单。",
+    "label": "REQUIRES_SCOPE_CONTRACT"
+  },
+  {
+    "split": "train",
+    "seed_id": "s28",
+    "note": "跨系统交接和集合运算",
+    "text": "从邮件附件取得名单，与 CRM 中活跃客户比对并更新标签。",
+    "label": "REQUIRES_SCOPE_CONTRACT"
+  },
+  {
+    "split": "train",
+    "seed_id": "s29",
+    "note": "读取当前界面状态",
+    "text": "检查当前网页上的筛选条件，再导出实际显示的记录。",
+    "label": "REQUIRES_SCOPE_CONTRACT"
+  },
+  {
+    "split": "train",
+    "seed_id": "s30",
+    "note": "条件执行和产物",
+    "text": "运行脚本，若测试通过就生成发布包，否则保留错误日志。",
+    "label": "REQUIRES_SCOPE_CONTRACT"
+  },
+  {
+    "split": "train",
+    "seed_id": "s31",
+    "note": "英文归属与否定条件",
+    "text": "Find every calendar event I organized but did not attend and cancel it.",
+    "label": "REQUIRES_SCOPE_CONTRACT"
+  },
+  {
+    "split": "train",
+    "seed_id": "s32",
+    "note": "英文联网和外部写入",
+    "text": "Compare the latest prices from two stores and add the cheaper item to my cart.",
+    "label": "REQUIRES_SCOPE_CONTRACT"
+  },
+  {
+    "split": "train",
+    "seed_id": "s33",
+    "note": "文件范围约束",
+    "text": "打开仓库中的配置文件，只修改生产环境的超时时间。",
+    "label": "REQUIRES_SCOPE_CONTRACT"
+  },
+  {
+    "split": "train",
+    "seed_id": "s34",
+    "note": "跨Worker状态交接",
+    "text": "读取上一个执行者留下的记录，接着完成尚未验证的步骤。",
+    "label": "REQUIRES_SCOPE_CONTRACT"
+  },
+  {
+    "split": "validation",
+    "seed_id": "s35",
+    "note": "复杂归属条件只读",
+    "text": "把共享盘中不是我创建但由我管理的空目录列出来。",
+    "label": "REQUIRES_SCOPE_CONTRACT"
+  },
+  {
+    "split": "validation",
+    "seed_id": "s36",
+    "note": "英文动态查询和核验",
+    "text": "Search the live logs for failed payments, then verify each affected order.",
+    "label": "REQUIRES_SCOPE_CONTRACT"
+  },
+  {
+    "split": "validation",
+    "seed_id": "s37",
+    "note": "新增修改跳过三分类",
+    "text": "更新所有不符合当前值的记录，缺少记录的要新增。",
+    "label": "REQUIRES_SCOPE_CONTRACT"
+  },
+  {
+    "split": "test",
+    "seed_id": "s38",
+    "note": "运行状态决定执行范围",
+    "text": "查看我当前登录的是哪个账号，只在测试账号下创建数据。",
+    "label": "REQUIRES_SCOPE_CONTRACT"
+  },
+  {
+    "split": "test",
+    "seed_id": "s39",
+    "note": "英文附件读写验收",
+    "text": "Read the attached spreadsheet, correct invalid totals, and save a reviewed copy.",
+    "label": "REQUIRES_SCOPE_CONTRACT"
+  },
+  {
+    "split": "test",
+    "seed_id": "s40",
+    "note": "发现后执行禁止猜测",
+    "text": "查找最新版本的接口文档，确认方法名后再调用真实接口。",
+    "label": "REQUIRES_SCOPE_CONTRACT"
+  }
+]

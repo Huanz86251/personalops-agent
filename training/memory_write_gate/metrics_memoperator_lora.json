@@ -1,0 +1,147 @@
+{
+  "created_at_utc": "2026-09-15T14:13:17.446094+00:00",
+  "base_model": "MemTensor/MemOperator-0.6B",
+  "architecture": "Qwen3ForSequenceClassification + PEFT LoRA",
+  "device": "cuda",
+  "dtype": "torch.bfloat16",
+  "epochs": 3,
+  "batch_size": 16,
+  "gradient_accumulation": 2,
+  "max_length": 256,
+  "learning_rate": 0.0002,
+  "best_epoch": 1,
+  "best_validation_accuracy": 0.9040625,
+  "trainable_parameters": 10094592,
+  "total_parameters": 606146560,
+  "trainable_fraction": 0.01665371490353752,
+  "rows": {
+    "train": 14200,
+    "validation": 3200,
+    "test": 2600
+  },
+  "seed_counts": {
+    "train": 142,
+    "validation": 32,
+    "test": 26
+  },
+  "threshold_selection": "minimize validation false positives subject to SAVE recall >= 0.97",
+  "history": [
+    {
+      "epoch": 1,
+      "train_loss": 0.10087834856565203,
+      "validation": {
+        "threshold": 0.690976,
+        "accuracy": 0.9040625,
+        "roc_auc": 0.941404296875,
+        "per_label": {
+          "SKIP": {
+            "precision": 0.9654427645788337,
+            "recall": 0.838125,
+            "f1": 0.8972900635664103
+          },
+          "SAVE": {
+            "precision": 0.8569850911098841,
+            "recall": 0.97,
+            "f1": 0.9099970683084139
+          }
+        },
+        "confusion_matrix": [
+          [
+            1341,
+            259
+          ],
+          [
+            48,
+            1552
+          ]
+        ]
+      }
+    },
+    {
+      "epoch": 2,
+      "train_loss": 0.014864812009372152,
+      "validation": {
+        "threshold": 0.914596,
+        "accuracy": 0.8725,
+        "roc_auc": 0.92162421875,
+        "per_label": {
+          "SKIP": {
+            "precision": 0.9627329192546584,
+            "recall": 0.775,
+            "f1": 0.8587257617728532
+          },
+          "SAVE": {
+            "precision": 0.8117154811715481,
+            "recall": 0.97,
+            "f1": 0.8838268792710706
+          }
+        },
+        "confusion_matrix": [
+          [
+            1240,
+            360
+          ],
+          [
+            48,
+            1552
+          ]
+        ]
+      }
+    }
+  ],
+  "validation": {
+    "threshold": 0.690976,
+    "accuracy": 0.9040625,
+    "roc_auc": 0.941404296875,
+    "per_label": {
+      "SKIP": {
+        "precision": 0.9654427645788337,
+        "recall": 0.838125,
+        "f1": 0.8972900635664103
+      },
+      "SAVE": {
+        "precision": 0.8569850911098841,
+        "recall": 0.97,
+        "f1": 0.9099970683084139
+      }
+    },
+    "confusion_matrix": [
+      [
+        1341,
+        259
+      ],
+      [
+        48,
+        1552
+      ]
+    ]
+  },
+  "test": {
+    "threshold": 0.690976,
+    "accuracy": 0.8973076923076924,
+    "roc_auc": 0.9689230769230769,
+    "per_label": {
+      "SKIP": {
+        "precision": 0.9336691855583543,
+        "recall": 0.8553846153846154,
+        "f1": 0.8928141308711361
+      },
+      "SAVE": {
+        "precision": 0.8665720369056068,
+        "recall": 0.9392307692307692,
+        "f1": 0.9014396456256921
+      }
+    },
+    "confusion_matrix": [
+      [
+        1112,
+        188
+      ],
+      [
+        79,
+        1221
+      ]
+    ]
+  },
+  "limitation": "Synthetic held-out seed families do not replace a human-labeled production blind set."
+}

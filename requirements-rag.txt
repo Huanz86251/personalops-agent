@@ -1,0 +1,14 @@
+# Additive dependencies; resolver verified against the existing agent environment.
+langchain-experimental==0.4.2
+langchain-qdrant==1.1.0
+qdrant-client==1.19.0
+rank-bm25==0.2.2
+jieba==0.42.1
+pypdf==6.18.0
+python-docx==1.2.0
+portalocker==3.2.0
+peft==0.20.0
+
+# Structured document parsing and token-aware chunking.
+docling==2.126.0
+docling-core==2.95.0

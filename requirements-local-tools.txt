@@ -1,0 +1,8 @@
+# Local native tools; optional isolated install: python scripts/setup_local_tools.py
+# No MCP server packages, API keys, or hosted conversion services.
+markitdown[pdf,docx,xlsx,pptx]==0.1.7
+openpyxl==3.1.5
+pypandoc_binary==1.17
+markdownify==1.2.3
+ruff==0.16.6
+sympy==1.14.0

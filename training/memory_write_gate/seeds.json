@@ -1,0 +1,802 @@
+[
+  {
+    "seed_id": "save-001",
+    "label": "SAVE",
+    "split": "train",
+    "category": "identity",
+    "text": "我叫陈宇，英文名是 Ethan。",
+    "note": "明确的用户身份与称呼，未来仍有用。"
+  },
+  {
+    "seed_id": "skip-001",
+    "label": "SKIP",
+    "split": "train",
+    "category": "greeting",
+    "text": "你好，今天怎么样？",
+    "note": "寒暄，不形成长期事实。"
+  },
+  {
+    "seed_id": "save-002",
+    "label": "SAVE",
+    "split": "validation",
+    "category": "identity",
+    "text": "以后叫我小林就行。",
+    "note": "长期称呼偏好，不是一次性要求。"
+  },
+  {
+    "seed_id": "skip-002",
+    "label": "SKIP",
+    "split": "train",
+    "category": "greeting",
+    "text": "Thanks, that was helpful.",
+    "note": "致谢，不形成长期事实。"
+  },
+  {
+    "seed_id": "save-003",
+    "label": "SAVE",
+    "split": "validation",
+    "category": "identity",
+    "text": "My name is Olivia Chen, and I prefer Liv.",
+    "note": "明确姓名和长期称呼偏好。"
+  },
+  {
+    "seed_id": "skip-003",
+    "label": "SKIP",
+    "split": "train",
+    "category": "greeting",
+    "text": "好的，继续吧。",
+    "note": "简短确认，不应保存。"
+  },
+  {
+    "seed_id": "save-004",
+    "label": "SAVE",
+    "split": "train",
+    "category": "identity",
+    "text": "我常住杭州，时区按中国标准时间。",
+    "note": "稳定所在地和时区信息。"
+  },
+  {
+    "seed_id": "skip-004",
+    "label": "SKIP",
+    "split": "train",
+    "category": "question",
+    "text": "今天天气怎么样？",
+    "note": "实时查询，不是用户长期信息。"
+  },
+  {
+    "seed_id": "save-005",
+    "label": "SAVE",
+    "split": "train",
+    "category": "identity",
+    "text": "English is my second language, so please keep explanations plain.",
+    "note": "长期语言背景及沟通偏好。"
+  },
+  {
+    "seed_id": "skip-005",
+    "label": "SKIP",
+    "split": "test",
+    "category": "question",
+    "text": "最近有什么大新闻？",
+    "note": "临时资讯问题。"
+  },
+  {
+    "seed_id": "save-006",
+    "label": "SAVE",
+    "split": "train",
+    "category": "preference",
+    "text": "以后给我技术方案时，先写结论再解释原因。",
+    "note": "跨会话仍需遵守的回答偏好。"
+  },
+  {
+    "seed_id": "skip-006",
+    "label": "SKIP",
+    "split": "train",
+    "category": "question",
+    "text": "What time is it in London right now?",
+    "note": "一次性实时问题。"
+  },
+  {
+    "seed_id": "save-007",
+    "label": "SAVE",
+    "split": "test",
+    "category": "preference",
+    "text": "我不喜欢邮件里使用夸张的感叹号。",
+    "note": "稳定写作禁忌。"
+  },
+  {
+    "seed_id": "skip-007",
+    "label": "SKIP",
+    "split": "train",
+    "category": "question",
+    "text": "Python里的装饰器是什么？",
+    "note": "普通知识问题。"
+  },
+  {
+    "seed_id": "save-008",
+    "label": "SAVE",
+    "split": "train",
+    "category": "preference",
+    "text": "Please use British spelling in documents you draft for me.",
+    "note": "长期文档风格偏好。"
+  },
+  {
+    "seed_id": "skip-008",
+    "label": "SKIP",
+    "split": "train",
+    "category": "question",
+    "text": "小明喜欢篮球吗？",
+    "note": "提问而非已确认事实。"
+  },
+  {
+    "seed_id": "save-009",
+    "label": "SAVE",
+    "split": "validation",
+    "category": "preference",
+    "text": "我买电子产品时更看重续航，不追求最轻。",
+    "note": "稳定消费取舍偏好。"
+  },
+  {
+    "seed_id": "skip-009",
+    "label": "SKIP",
+    "split": "train",
+    "category": "one_off",
+    "text": "把这段话翻译成英文。",
+    "note": "一次性操作指令。"
+  },
+  {
+    "seed_id": "save-010",
+    "label": "SAVE",
+    "split": "train",
+    "category": "preference",
+    "text": "以后安排会议尽量避开周五下午。",
+    "note": "长期日程偏好。"
+  },
+  {
+    "seed_id": "skip-010",
+    "label": "SKIP",
+    "split": "validation",
+    "category": "one_off",
+    "text": "帮我算一下128乘37。",
+    "note": "一次性计算。"
+  },
+  {
+    "seed_id": "save-011",
+    "label": "SAVE",
+    "split": "validation",
+    "category": "health",
+    "text": "我对花生严重过敏，推荐餐厅时要避开。",
+    "note": "重要且长期有效的健康约束。"
+  },
+  {
+    "seed_id": "skip-011",
+    "label": "SKIP",
+    "split": "validation",
+    "category": "one_off",
+    "text": "把当前页面保存成PDF。",
+    "note": "一次性工具操作。"
+  },
+  {
+    "seed_id": "save-012",
+    "label": "SAVE",
+    "split": "train",
+    "category": "health",
+    "text": "My daughter Emma cannot eat shellfish.",
+    "note": "与用户家庭相关的长期健康约束。"
+  },
+  {
+    "seed_id": "skip-012",
+    "label": "SKIP",
+    "split": "train",
+    "category": "one_off",
+    "text": "Please summarize this email in three bullets.",
+    "note": "一次性内容处理。"
+  },
+  {
+    "seed_id": "save-013",
+    "label": "SAVE",
+    "split": "train",
+    "category": "health",
+    "text": "我吃素，但可以接受鸡蛋和牛奶。",
+    "note": "长期饮食偏好。"
+  },
+  {
+    "seed_id": "skip-013",
+    "label": "SKIP",
+    "split": "validation",
+    "category": "one_off",
+    "text": "给这张图片加一个白色背景。",
+    "note": "一次性编辑任务。"
+  },
+  {
+    "seed_id": "save-014",
+    "label": "SAVE",
+    "split": "test",
+    "category": "health",
+    "text": "我跑步时膝盖容易不舒服，训练建议不要安排跳跃。",
+    "note": "长期运动约束。"
+  },
+  {
+    "seed_id": "skip-014",
+    "label": "SKIP",
+    "split": "test",
+    "category": "temporary_preference",
+    "text": "这一次回答短一点。",
+    "note": "只限制当前回答。"
+  },
+  {
+    "seed_id": "save-015",
+    "label": "SAVE",
+    "split": "train",
+    "category": "accessibility",
+    "text": "I have red-green colour blindness; charts should not rely on those colours alone.",
+    "note": "长期无障碍需求。"
+  },
+  {
+    "seed_id": "skip-015",
+    "label": "SKIP",
+    "split": "train",
+    "category": "temporary_preference",
+    "text": "For this email only, use a very formal tone.",
+    "note": "明确仅本次有效。"
+  },
+  {
+    "seed_id": "save-016",
+    "label": "SAVE",
+    "split": "train",
+    "category": "relationship",
+    "text": "张伟是我的直属领导，项目汇报需要抄送他。",
+    "note": "与用户工作相关的人物关系和规则。"
+  },
+  {
+    "seed_id": "skip-016",
+    "label": "SKIP",
+    "split": "validation",
+    "category": "temporary_preference",
+    "text": "今天先别给我看代码。",
+    "note": "短暂偏好。"
+  },
+  {
+    "seed_id": "save-017",
+    "label": "SAVE",
+    "split": "train",
+    "category": "relationship",
+    "text": "我的同事 Lina 负责财务审批。",
+    "note": "稳定同事职责关系。"
+  },
+  {
+    "seed_id": "skip-017",
+    "label": "SKIP",
+    "split": "train",
+    "category": "temporary_state",
+    "text": "我现在有点困。",
+    "note": "短暂状态，没有持续价值。"
+  },
+  {
+    "seed_id": "save-018",
+    "label": "SAVE",
+    "split": "train",
+    "category": "relationship",
+    "text": "Michael is my accountant and handles the annual tax filing.",
+    "note": "稳定服务关系。"
+  },
+  {
+    "seed_id": "skip-018",
+    "label": "SKIP",
+    "split": "train",
+    "category": "temporary_state",
+    "text": "今天网络特别慢。",
+    "note": "临时环境状态。"
+  },
+  {
+    "seed_id": "save-019",
+    "label": "SAVE",
+    "split": "validation",
+    "category": "relationship",
+    "text": "我朋友小明喜欢爵士乐，给他选礼物可以参考。",
+    "note": "与用户朋友相关、未来可用的偏好事实。"
+  },
+  {
+    "seed_id": "skip-019",
+    "label": "SKIP",
+    "split": "train",
+    "category": "temporary_state",
+    "text": "I am waiting at the airport right now.",
+    "note": "转瞬即逝的当前位置。"
+  },
+  {
+    "seed_id": "save-020",
+    "label": "SAVE",
+    "split": "train",
+    "category": "relationship",
+    "text": "Sophie is my sister, and her birthday is 18 May.",
+    "note": "家庭关系和未来提醒价值。"
+  },
+  {
+    "seed_id": "skip-020",
+    "label": "SKIP",
+    "split": "validation",
+    "category": "temporary_state",
+    "text": "这个测试目前跑到第七条了。",
+    "note": "当前任务进度。"
+  },
+  {
+    "seed_id": "save-021",
+    "label": "SAVE",
+    "split": "train",
+    "category": "habit",
+    "text": "我每周三晚上七点上英语课。",
+    "note": "重复发生的稳定日程。"
+  },
+  {
+    "seed_id": "skip-021",
+    "label": "SKIP",
+    "split": "train",
+    "category": "temporary_state",
+    "text": "刚才那个接口又报错了。",
+    "note": "当前执行错误，不是长期事实。"
+  },
+  {
+    "seed_id": "save-022",
+    "label": "SAVE",
+    "split": "test",
+    "category": "habit",
+    "text": "I normally go running before work on Mondays and Thursdays.",
+    "note": "长期重复习惯。"
+  },
+  {
+    "seed_id": "skip-022",
+    "label": "SKIP",
+    "split": "train",
+    "category": "speculation",
+    "text": "我最近可能要搬到上海，但还没决定。",
+    "note": "未确认的猜测，不应当作稳定事实。"
+  },
+  {
+    "seed_id": "save-023",
+    "label": "SAVE",
+    "split": "train",
+    "category": "habit",
+    "text": "我每个月最后一个工作日整理发票。",
+    "note": "重复工作习惯。"
+  },
+  {
+    "seed_id": "skip-023",
+    "label": "SKIP",
+    "split": "train",
+    "category": "speculation",
+    "text": "Maybe I will learn Korean someday.",
+    "note": "没有形成计划的愿望。"
+  },
+  {
+    "seed_id": "save-024",
+    "label": "SAVE",
+    "split": "train",
+    "category": "habit",
+    "text": "每天早上我先看邮件，再处理即时消息。",
+    "note": "稳定工作习惯。"
+  },
+  {
+    "seed_id": "skip-024",
+    "label": "SKIP",
+    "split": "train",
+    "category": "speculation",
+    "text": "老板可能会让 Alice 接手项目。",
+    "note": "未经确认的第三方猜测。"
+  },
+  {
+    "seed_id": "save-025",
+    "label": "SAVE",
+    "split": "train",
+    "category": "habit",
+    "text": "我通常凌晨一点睡觉，早会尽量不要排太早。",
+    "note": "稳定作息和安排约束。"
+  },
+  {
+    "seed_id": "skip-025",
+    "label": "SKIP",
+    "split": "train",
+    "category": "speculation",
+    "text": "我猜 Michael 应该喜欢咖啡。",
+    "note": "没有证据的推测。"
+  },
+  {
+    "seed_id": "save-026",
+    "label": "SAVE",
+    "split": "validation",
+    "category": "project",
+    "text": "PersonalOps项目的后端统一使用Python。",
+    "note": "长期项目技术约束。"
+  },
+  {
+    "seed_id": "skip-026",
+    "label": "SKIP",
+    "split": "train",
+    "category": "quoted_text",
+    "text": "新闻里说这家公司明年会裁员。",
+    "note": "引用外部消息，不是用户事实。"
+  },
+  {
+    "seed_id": "save-027",
+    "label": "SAVE",
+    "split": "train",
+    "category": "project",
+    "text": "我们已经决定这个版本不接入桌面控制。",
+    "note": "已经确认的项目决定。"
+  },
+  {
+    "seed_id": "skip-027",
+    "label": "SKIP",
+    "split": "train",
+    "category": "quoted_text",
+    "text": "朋友开玩笑说我应该搬去北京。",
+    "note": "引用建议，不是用户决定。"
+  },
+  {
+    "seed_id": "save-028",
+    "label": "SAVE",
+    "split": "train",
+    "category": "project",
+    "text": "The Atlas project must remain compatible with PostgreSQL 16.",
+    "note": "长期项目兼容性约束。"
+  },
+  {
+    "seed_id": "skip-028",
+    "label": "SKIP",
+    "split": "train",
+    "category": "quoted_text",
+    "text": "The email says Daniel prefers a call, but I have not confirmed it.",
+    "note": "未确认的引用内容。"
+  },
+  {
+    "seed_id": "save-029",
+    "label": "SAVE",
+    "split": "validation",
+    "category": "project",
+    "text": "这个研究只使用IEC104数据，不混入其他协议。",
+    "note": "长期研究边界。"
+  },
+  {
+    "seed_id": "skip-029",
+    "label": "SKIP",
+    "split": "train",
+    "category": "deletion",
+    "text": "忘掉我以前说过的地址。",
+    "note": "删除命令应走删除流程，不新增记忆。"
+  },
+  {
+    "seed_id": "save-030",
+    "label": "SAVE",
+    "split": "train",
+    "category": "project",
+    "text": "客户要求所有导出文件保留审计编号。",
+    "note": "持续适用的客户要求。"
+  },
+  {
+    "seed_id": "skip-030",
+    "label": "SKIP",
+    "split": "train",
+    "category": "deletion",
+    "text": "Please remove my old dietary preference from memory.",
+    "note": "删除已有记忆，不应写入新记忆。"
+  },
+  {
+    "seed_id": "save-031",
+    "label": "SAVE",
+    "split": "train",
+    "category": "goal",
+    "text": "我的目标是明年通过日语N2。",
+    "note": "长期个人目标。"
+  },
+  {
+    "seed_id": "skip-031",
+    "label": "SKIP",
+    "split": "train",
+    "category": "secret",
+    "text": "我的验证码是483921。",
+    "note": "包含秘密值，必须拦截。"
+  },
+  {
+    "seed_id": "save-032",
+    "label": "SAVE",
+    "split": "train",
+    "category": "goal",
+    "text": "I am preparing to apply for data engineering roles this winter.",
+    "note": "未来一段时间持续有效的目标。"
+  },
+  {
+    "seed_id": "skip-032",
+    "label": "SKIP",
+    "split": "train",
+    "category": "secret",
+    "text": "API key: [SYNTHETIC_API_KEY]",
+    "note": "即使是假例也属于秘密值格式。"
+  },
+  {
+    "seed_id": "save-033",
+    "label": "SAVE",
+    "split": "train",
+    "category": "goal",
+    "text": "我计划在年底前完成论文初稿。",
+    "note": "带期限的长期目标。"
+  },
+  {
+    "seed_id": "skip-033",
+    "label": "SKIP",
+    "split": "validation",
+    "category": "secret",
+    "text": "登录密码是 Summer2026!",
+    "note": "包含密码。"
+  },
+  {
+    "seed_id": "save-034",
+    "label": "SAVE",
+    "split": "train",
+    "category": "goal",
+    "text": "接下来三个月我要把体脂率降到20%。",
+    "note": "跨会话有用的阶段目标。"
+  },
+  {
+    "seed_id": "skip-034",
+    "label": "SKIP",
+    "split": "train",
+    "category": "assistant_claim",
+    "text": "你刚才说我住在南京。",
+    "note": "只复述助手说法，不能建立用户事实。"
+  },
+  {
+    "seed_id": "save-035",
+    "label": "SAVE",
+    "split": "train",
+    "category": "goal",
+    "text": "Our team aims to migrate the service before the end of Q4.",
+    "note": "团队长期目标。"
+  },
+  {
+    "seed_id": "skip-035",
+    "label": "SKIP",
+    "split": "test",
+    "category": "assistant_claim",
+    "text": "The assistant assumed that Emma is my manager.",
+    "note": "指出助手假设，不确认事实。"
+  },
+  {
+    "seed_id": "save-036",
+    "label": "SAVE",
+    "split": "validation",
+    "category": "decision",
+    "text": "我已经决定下一台电脑买Windows，不考虑Mac。",
+    "note": "已经确认、未来有用的决定。"
+  },
+  {
+    "seed_id": "skip-036",
+    "label": "SKIP",
+    "split": "test",
+    "category": "correction_context",
+    "text": "你为什么觉得我喜欢跑步？",
+    "note": "质疑旧结论，不表示用户喜欢跑步。"
+  },
+  {
+    "seed_id": "save-037",
+    "label": "SAVE",
+    "split": "test",
+    "category": "decision",
+    "text": "We agreed to use Stripe instead of PayPal for the new checkout.",
+    "note": "已确认的项目选择。"
+  },
+  {
+    "seed_id": "skip-037",
+    "label": "SKIP",
+    "split": "validation",
+    "category": "generic_fact",
+    "text": "巴黎是法国首都。",
+    "note": "普通世界知识，不是用户记忆。"
+  },
+  {
+    "seed_id": "save-038",
+    "label": "SAVE",
+    "split": "train",
+    "category": "decision",
+    "text": "以后出差我优先选高铁，超过六小时再坐飞机。",
+    "note": "稳定出行决策规则。"
+  },
+  {
+    "seed_id": "skip-038",
+    "label": "SKIP",
+    "split": "train",
+    "category": "generic_fact",
+    "text": "Alice works at a bank in this example sentence.",
+    "note": "示例文本中的人物事实。"
+  },
+  {
+    "seed_id": "save-039",
+    "label": "SAVE",
+    "split": "train",
+    "category": "decision",
+    "text": "我确定不再续费那项健身会员。",
+    "note": "已确认且可能影响未来操作的决定。"
+  },
+  {
+    "seed_id": "skip-039",
+    "label": "SKIP",
+    "split": "train",
+    "category": "generic_fact",
+    "text": "小王喜欢音乐是一道语法例句。",
+    "note": "例句内容不能当作真实关系。"
+  },
+  {
+    "seed_id": "save-040",
+    "label": "SAVE",
+    "split": "train",
+    "category": "decision",
+    "text": "The team approved Alice as the release owner.",
+    "note": "已确认的团队职责决定。"
+  },
+  {
+    "seed_id": "skip-040",
+    "label": "SKIP",
+    "split": "test",
+    "category": "ephemeral_request",
+    "text": "两分钟后再刷新一次页面。",
+    "note": "当前任务中的短暂动作。"
+  },
+  {
+    "seed_id": "save-041",
+    "label": "SAVE",
+    "split": "train",
+    "category": "future_task",
+    "text": "我后天早上八点从浦东机场出发，记得行程相关建议按这个时间。",
+    "note": "短期但跨后续对话仍有效的确定行程。"
+  },
+  {
+    "seed_id": "skip-041",
+    "label": "SKIP",
+    "split": "train",
+    "category": "ephemeral_request",
+    "text": "等下载结束后关闭这个窗口。",
+    "note": "一次性操作步骤。"
+  },
+  {
+    "seed_id": "save-042",
+    "label": "SAVE",
+    "split": "test",
+    "category": "future_task",
+    "text": "Next Tuesday I need to send the signed contract to Daniel.",
+    "note": "未来仍待完成的明确任务。"
+  },
+  {
+    "seed_id": "skip-042",
+    "label": "SKIP",
+    "split": "test",
+    "category": "ephemeral_request",
+    "text": "Send this draft to Lina now.",
+    "note": "一次性发送命令。"
+  },
+  {
+    "seed_id": "save-043",
+    "label": "SAVE",
+    "split": "train",
+    "category": "future_task",
+    "text": "下个月15号之前要完成公司年检。",
+    "note": "带期限的待办事项。"
+  },
+  {
+    "seed_id": "skip-043",
+    "label": "SKIP",
+    "split": "train",
+    "category": "current_task",
+    "text": "这个文件已经改到第三版了。",
+    "note": "当前任务过程状态。"
+  },
+  {
+    "seed_id": "save-044",
+    "label": "SAVE",
+    "split": "train",
+    "category": "future_task",
+    "text": "My dentist appointment is on 3 October at 2 pm.",
+    "note": "确定的未来预约。"
+  },
+  {
+    "seed_id": "skip-044",
+    "label": "SKIP",
+    "split": "train",
+    "category": "current_task",
+    "text": "The Docker container is still starting.",
+    "note": "当前运行状态。"
+  },
+  {
+    "seed_id": "save-045",
+    "label": "SAVE",
+    "split": "test",
+    "category": "future_task",
+    "text": "周五下午要给王经理演示新版本。",
+    "note": "近期但后续对话仍有用的确定安排。"
+  },
+  {
+    "seed_id": "skip-045",
+    "label": "SKIP",
+    "split": "train",
+    "category": "current_task",
+    "text": "先看第二个Trace，其他的等会儿再说。",
+    "note": "当前会话的操作顺序。"
+  },
+  {
+    "seed_id": "save-046",
+    "label": "SAVE",
+    "split": "train",
+    "category": "email",
+    "text": "以后给客户 Grace 写邮件时称呼她为 Dr. Liu。",
+    "note": "长期邮件称呼规则。"
+  },
+  {
+    "seed_id": "skip-046",
+    "label": "SKIP",
+    "split": "train",
+    "category": "conditional",
+    "text": "如果明天下雨，也许我就不去了。",
+    "note": "条件未发生且决定未形成。"
+  },
+  {
+    "seed_id": "save-047",
+    "label": "SAVE",
+    "split": "test",
+    "category": "email",
+    "text": "财务类邮件默认抄送 finance@example.com，但不要保存邮箱密码。",
+    "note": "长期邮件流程偏好，不包含秘密值。"
+  },
+  {
+    "seed_id": "skip-047",
+    "label": "SKIP",
+    "split": "validation",
+    "category": "conditional",
+    "text": "If the price drops, I might buy it.",
+    "note": "不确定的条件性想法。"
+  },
+  {
+    "seed_id": "save-048",
+    "label": "SAVE",
+    "split": "train",
+    "category": "email",
+    "text": "When emailing Noah, keep the message concise and include the ticket number.",
+    "note": "针对稳定联系人的邮件规则。"
+  },
+  {
+    "seed_id": "skip-048",
+    "label": "SKIP",
+    "split": "test",
+    "category": "other_person",
+    "text": "有个叫James的人喜欢徒步。",
+    "note": "与用户没有关系的孤立第三方事实。"
+  },
+  {
+    "seed_id": "save-049",
+    "label": "SAVE",
+    "split": "train",
+    "category": "privacy",
+    "text": "我的文件默认不要上传到公共网盘。",
+    "note": "长期隐私约束。"
+  },
+  {
+    "seed_id": "skip-049",
+    "label": "SKIP",
+    "split": "train",
+    "category": "other_person",
+    "text": "听说李华下个月可能离职。",
+    "note": "未经确认且与用户关系不明。"
+  },
+  {
+    "seed_id": "save-050",
+    "label": "SAVE",
+    "split": "train",
+    "category": "privacy",
+    "text": "Never include my home address in public event registrations.",
+    "note": "长期隐私禁忌。"
+  },
+  {
+    "seed_id": "skip-050",
+    "label": "SKIP",
+    "split": "train",
+    "category": "meta",
+    "text": "请判断这句话值不值得保存。",
+    "note": "关于系统的临时测试请求。"
+  }
+]

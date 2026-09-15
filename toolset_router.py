@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 
 from dataclasses import (
@@ -8,8 +9,11 @@ from dataclasses import (
 
 from typing import (
     Any,
+    Mapping,
     Sequence,
 )
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from observability import (
     set_span_attributes,
@@ -17,9 +21,7 @@ from observability import (
     trace_span,
 )
 
-from prompt_loader import (
-    render_prompt,
-)
+from prompt_loader import load_prompt
 
 from retrieval_models import (
     RetrievalModelManager,
@@ -37,11 +39,35 @@ logger = logging.getLogger(
 )
 
 
-TOOLSET_ROUTING_TASK_MAX_CHARS = 400
+TOOLSET_ROUTING_TASK_MAX_CHARS = 1600
 
-TOOLSET_ROUTER_MAX_TOOLSETS = 3
+TOOLSET_ROUTER_MAX_TOOLSETS = 2
+TOOLSET_ROUTING_MIN_SCORE = 0.4
+TOOLSET_NO_TOOL_THRESHOLD = 0.4
+TOOLSET_NO_TOOL_MARGIN = 0.0
 
-TOOLSET_ROUTER_MAX_TOKENS = 64
+# 更宽能力组已包含较窄组的执行能力时，不重复向下游暴露同一批工具。
+TOOLSET_DOMINANCE = {
+    "FILE_EDITING": frozenset({"FILE_INSPECTION"}),
+    "SOFTWARE_DEVELOPMENT": frozenset({"FILE_INSPECTION", "FILE_EDITING"}),
+    "APPWORLD": frozenset({"WEB_RESEARCH", "BROWSER_AUTOMATION"}),
+}
+
+
+class ModelToolsetSelection(BaseModel):
+    """低置信本地路由后的同Worker模型选择。"""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    reason: str = Field(
+        min_length=1,
+        max_length=500,
+        description="先说明当前Step为什么需要所选能力组。",
+    )
+    selected_toolsets: list[str] = Field(
+        min_length=1,
+        max_length=2,
+        description="从本次提供的真实可用能力组名称中选择一到两个。",
+    )
 
 
 @dataclass(frozen=True)
@@ -64,6 +90,16 @@ class RoutedToolset:
 
 
 @dataclass(frozen=True)
+class ToolsetRouteScore:
+    """保存一个候选组的原始相关性分数与决策阈值。"""
+
+    name: str
+    score: float
+    threshold: float
+    selected: bool
+
+
+@dataclass(frozen=True)
 class ToolsetRouteDecision:
     """表示一次完整工具组路由结果。"""
 
@@ -81,6 +117,11 @@ class ToolsetRouteDecision:
 
     routed_toolsets: tuple[
         RoutedToolset,
+        ...,
+    ]
+
+    route_scores: tuple[
+        ToolsetRouteScore,
         ...,
     ]
 
@@ -136,7 +177,7 @@ class ToolsetRouteDecision:
 
 
 class ToolsetRouter:
-    """使用本地Router选择工具组并展开真实工具。"""
+    """使用常驻Cross-Encoder选择工具组并展开真实工具。"""
 
     def __init__(
         self,
@@ -149,18 +190,28 @@ class ToolsetRouter:
         max_toolsets: int = (
             TOOLSET_ROUTER_MAX_TOOLSETS
         ),
-        max_tokens: int = (
-            TOOLSET_ROUTER_MAX_TOKENS
-        ),
+        minimum_score: float = TOOLSET_ROUTING_MIN_SCORE,
+        no_tool_threshold: float = TOOLSET_NO_TOOL_THRESHOLD,
+        no_tool_margin: float = TOOLSET_NO_TOOL_MARGIN,
     ) -> None:
         if max_toolsets < 1:
             raise ValueError(
                 "max_toolsets不能小于1。"
             )
 
-        if max_tokens < 1:
+        if not 0.0 <= minimum_score <= 1.0:
             raise ValueError(
-                "max_tokens不能小于1。"
+                "minimum_score必须在0到1之间。"
+            )
+
+        if not 0.0 <= no_tool_threshold <= 1.0:
+            raise ValueError(
+                "no_tool_threshold必须在0到1之间。"
+            )
+
+        if not 0.0 <= no_tool_margin <= 1.0:
+            raise ValueError(
+                "no_tool_margin必须在0到1之间。"
             )
 
         self.retrieval_models = (
@@ -173,8 +224,14 @@ class ToolsetRouter:
             max_toolsets
         )
 
-        self.max_tokens = (
-            max_tokens
+        self.minimum_score = minimum_score
+
+        self.no_tool_threshold = (
+            no_tool_threshold
+        )
+
+        self.no_tool_margin = (
+            no_tool_margin
         )
 
     async def route(
@@ -183,6 +240,11 @@ class ToolsetRouter:
         available_tools: Sequence[
             Any
         ],
+        *,
+        allow_no_tool: bool = True,
+        user_request_text: str = "",
+        step_weight: float = 0.4,
+        user_weight: float = 0.6,
     ) -> ToolsetRouteDecision | None:
         """为当前请求选择工具组，并生成去重工具集合。"""
 
@@ -191,6 +253,15 @@ class ToolsetRouter:
                 task_text
             )
         )
+
+        user_routing_task = _compact_routing_task(user_request_text)
+        use_weighted_scores = bool(user_routing_task)
+        if use_weighted_scores:
+            if step_weight < 0 or user_weight < 0 or step_weight + user_weight <= 0:
+                raise ValueError("工具路由权重必须为非负数且总和大于0。")
+            weight_total = step_weight + user_weight
+            step_weight /= weight_total
+            user_weight /= weight_total
 
         if not routing_task:
             return None
@@ -215,30 +286,39 @@ class ToolsetRouter:
 
             return None
 
-        allowed_labels = (
-            self.registry
-            .available_route_labels(
-                available_tools
-            )
-        )
-
-        toolset_metadata_text = (
-            _format_toolset_metadata(
-                router_metadata
-            )
-        )
-
-        prompt = render_prompt(
-            "toolset_router",
-
-            routing_task=(
-                routing_task
+        candidate_specs = [
+            self.registry.get(item["name"])
+            for item in router_metadata
+        ]
+        candidate_specs = [
+            spec for spec in candidate_specs
+            if spec is not None
+        ]
+        no_tool_profile = load_prompt("routing/toolsets/no_tool") if allow_no_tool else ""
+        candidate_names = [
+            *([NO_TOOL_ROUTE] if allow_no_tool else []),
+            *(spec.name for spec in candidate_specs),
+        ]
+        candidate_documents = [
+            *(
+                [
+                    _build_routing_document(
+                        name=NO_TOOL_ROUTE,
+                        description="无需读取外部状态或执行动作，可以直接用语言回答。",
+                        profile=no_tool_profile,
+                    )
+                ]
+                if allow_no_tool else []
             ),
-
-            toolset_metadata=(
-                toolset_metadata_text
+            *(
+                _build_routing_document(
+                    name=spec.name,
+                    description=spec.description,
+                    profile=spec.routing_profile,
+                )
+                for spec in candidate_specs
             ),
-        )
+        ]
 
         available_tool_names = tuple(
             _read_tool_name(
@@ -247,6 +327,18 @@ class ToolsetRouter:
 
             for tool in available_tools
         )
+
+        scoring_task = routing_task
+        scoring_user_task = user_routing_task
+        fit_query = getattr(self.retrieval_models, "fit_rerank_query", None)
+        if callable(fit_query):
+            try:
+                scoring_task = fit_query(routing_task, candidate_documents)
+                if use_weighted_scores:
+                    scoring_user_task = fit_query(user_routing_task, candidate_documents)
+            except Exception:
+                logger.exception("无法按真实Tokenizer约束工具路由query，将使用原始有界query")
+                scoring_task = routing_task
 
         with trace_span(
             "toolset_routing",
@@ -258,6 +350,10 @@ class ToolsetRouter:
                     routing_task
                 ),
 
+                "effective_scoring_task": scoring_task,
+                "user_request_routing_task": user_routing_task,
+                "effective_user_scoring_task": scoring_user_task,
+
                 "available_tool_names": (
                     available_tool_names
                 ),
@@ -266,19 +362,32 @@ class ToolsetRouter:
                     router_metadata
                 ),
 
-                "allowed_labels": (
-                    allowed_labels
+                "candidate_names": (
+                    candidate_names
                 ),
 
                 "max_toolsets": (
                     self.max_toolsets
                 ),
 
-                "thinking_enabled": False,
-
-                "max_tokens": (
-                    self.max_tokens
-                ),
+                "scoring_input_kind": "task_text_vs_toolset_capability_document",
+                "scoring_explanation": "任务文本与每个候选的名称、简介、正向场景和例子配对评分；不是工具参数 Schema，也不是仅按名称匹配。完整能力卡仅供审计。",
+                "candidate_documents": [
+                    {"name": name, "scoring_text": document,
+                     "full_profile_for_audit_only": profile}
+                    for name, document, profile in zip(
+                        candidate_names, candidate_documents,
+                        [*([no_tool_profile] if allow_no_tool else []), *(spec.routing_profile for spec in candidate_specs)],
+                    )
+                ],
+                "scorer_implementation": type(self.retrieval_models).__module__ + "." + type(self.retrieval_models).__qualname__,
+                "selection_method": "weighted_cross_encoder" if use_weighted_scores else "cross_encoder",
+                "step_weight": step_weight if use_weighted_scores else 1.0,
+                "user_weight": user_weight if use_weighted_scores else 0.0,
+                "minimum_score": self.minimum_score,
+                "no_tool_threshold": self.minimum_score,
+                "no_tool_margin": 0.0,
+                "allow_no_tool": allow_no_tool,
             },
 
             attributes={
@@ -296,45 +405,112 @@ class ToolsetRouter:
             },
         ) as span:
 
-            selected_names = await (
-                self.retrieval_models
-                .aclassify_many_with_router(
-                    prompt=prompt,
-
-                    allowed_labels=(
-                        allowed_labels
-                    ),
-
-                    trace_name=(
-                        "toolset_route"
-                    ),
-
-                    thinking=False,
-
-                    max_tokens=(
-                        self.max_tokens
-                    ),
-
-                    max_labels=(
-                        self.max_toolsets
-                    ),
+            try:
+                step_ranked_results = await self.retrieval_models.arerank(
+                    query=scoring_task,
+                    documents=candidate_documents,
+                    top_k=len(candidate_documents),
                 )
+                user_ranked_results = (
+                    await self.retrieval_models.arerank(
+                        query=scoring_user_task,
+                        documents=candidate_documents,
+                        top_k=len(candidate_documents),
+                    )
+                    if use_weighted_scores
+                    else []
+                )
+            except Exception as error:
+                logger.exception(
+                    "Cross-Encoder工具组路由失败，本次交给上层保守回退"
+                )
+                set_span_attributes(
+                    span,
+                    **{
+                        "toolset.route_valid": False,
+                        "toolset.fallback_required": True,
+                        "toolset.router_error": type(error).__name__,
+                    },
+                )
+                set_span_output(
+                    span,
+                    {
+                        "status": "cross_encoder_failed",
+                        "error_type": type(error).__name__,
+                        "selected_toolsets": [],
+                        "fallback_required": True,
+                    },
+                )
+                return None
+
+            # Preserve actual returned evidence; missing scores below use a decision
+            # default of zero and must not be mistaken for observed model scores.
+            step_ranked_results = list(step_ranked_results)
+            user_ranked_results = list(user_ranked_results)
+            step_scores_by_name = {
+                candidate_names[result.index]: float(result.score)
+                for result in step_ranked_results
+                if 0 <= result.index < len(candidate_names)
+            }
+            user_scores_by_name = {
+                candidate_names[result.index]: float(result.score)
+                for result in user_ranked_results
+                if 0 <= result.index < len(candidate_names)
+            }
+            scores_by_name = {
+                name: (
+                    step_weight * step_scores_by_name.get(name, 0.0)
+                    + user_weight * user_scores_by_name.get(name, 0.0)
+                    if use_weighted_scores
+                    else step_scores_by_name.get(name, 0.0)
+                )
+                for name in candidate_names
+            }
+            set_span_attributes(span, **{
+                "toolset.scorer_returned_count": len(step_ranked_results) + len(user_ranked_results),
+                "toolset.scorer_returned_scores": [
+                    f"step:{result.index}:{float(result.score)}" for result in step_ranked_results
+                ] + [
+                    f"user:{result.index}:{float(result.score)}" for result in user_ranked_results
+                ],
+                "toolset.missing_score_policy": "decision_default_zero_not_observed_score",
+            })
+            score_items = [
+                {
+                    "name": name,
+                    "score": round(scores_by_name.get(name, 0.0), 8),
+                    "step_score": round(step_scores_by_name.get(name, 0.0), 8),
+                    "user_score": round(user_scores_by_name.get(name, 0.0), 8) if use_weighted_scores else None,
+                    "threshold": (
+                        self.minimum_score
+                    ),
+                }
+                for name in candidate_names
+            ]
+            ranked_names = sorted(
+                candidate_names,
+                key=lambda name: scores_by_name.get(name, 0.0),
+                reverse=True,
+            )
+            best_name = ranked_names[0] if ranked_names else ""
+            best_score = scores_by_name.get(best_name, 0.0) if best_name else 0.0
+
+            # 只使用绝对阈值。加权分数仍不足时，上层直接调用同Worker
+            # 模型做一次短结构化选择，不再展开全部工具。
+            selected_names = (
+                [best_name]
+                if best_name and best_score > self.minimum_score
+                else []
             )
 
-            selected_names = (
-                _normalize_selected_toolsets(
-                    selected_names=(
-                        selected_names
-                    ),
-
-                    allowed_labels=(
-                        allowed_labels
-                    ),
-
-                    max_toolsets=(
-                        self.max_toolsets
-                    ),
+            route_scores = tuple(
+                ToolsetRouteScore(
+                    name=item["name"],
+                    score=item["score"],
+                    threshold=item["threshold"],
+                    selected=item["name"] in selected_names,
                 )
+                for item in score_items
             )
 
             if not selected_names:
@@ -352,9 +528,10 @@ class ToolsetRouter:
 
                     {
                         "status": (
-                            "router_failed"
+                            "uncertain_scores"
                         ),
 
+                        "scores": score_items,
                         "selected_toolsets": [],
 
                         "fallback_required": True,
@@ -381,6 +558,7 @@ class ToolsetRouter:
                         tools=(),
 
                         routed_toolsets=(),
+                        route_scores=route_scores,
                     )
                 )
 
@@ -401,6 +579,8 @@ class ToolsetRouter:
                     {
                         "status": "success",
 
+                        "selection_method": "weighted_cross_encoder" if use_weighted_scores else "cross_encoder",
+                        "scores": score_items,
                         "selected_toolsets": [
                             NO_TOOL_ROUTE
                         ],
@@ -570,6 +750,7 @@ class ToolsetRouter:
                 routed_toolsets=tuple(
                     routed_toolsets
                 ),
+                route_scores=route_scores,
             )
 
             set_span_attributes(
@@ -604,6 +785,8 @@ class ToolsetRouter:
                 {
                     "status": "success",
 
+                    "selection_method": "weighted_cross_encoder" if use_weighted_scores else "cross_encoder",
+                    "scores": score_items,
                     "selected_toolsets": (
                         selected_names
                     ),
@@ -662,6 +845,137 @@ class ToolsetRouter:
             return decision
 
 
+    def resolve_selected_toolsets(
+        self,
+        selected_names: Sequence[str],
+        available_tools: Sequence[Any],
+        *,
+        routing_task: str,
+        allow_no_tool: bool = True,
+    ) -> ToolsetRouteDecision | None:
+        """校验模型选择并展开当前真实可用工具组。"""
+        available_tools = tuple(available_tools)
+        metadata = self.registry.build_router_metadata(available_tools)
+        available_names = {
+            *(str(item.get("name") or "") for item in metadata),
+        }
+        if allow_no_tool:
+            available_names.add(NO_TOOL_ROUTE)
+        normalized: list[str] = []
+        for raw_name in selected_names:
+            name = str(raw_name or "").strip().upper()
+            if name in available_names and name not in normalized:
+                normalized.append(name)
+        if not normalized:
+            return None
+        if allow_no_tool and NO_TOOL_ROUTE in normalized:
+            return ToolsetRouteDecision(
+                routing_task=_compact_routing_task(routing_task),
+                selected_toolset_names=(NO_TOOL_ROUTE,),
+                tools=(),
+                routed_toolsets=(),
+                route_scores=(),
+            )
+        normalized = _apply_toolset_dominance(normalized)[: self.max_toolsets]
+        exclusive = [
+            name for name in normalized
+            if (self.registry.get(name) is not None and self.registry.get(name).exclusive)
+        ]
+        if exclusive:
+            normalized = [exclusive[0]]
+
+        routed: list[RoutedToolset] = []
+        unique_tools: dict[str, Any] = {}
+        for name in normalized:
+            resolution = self.registry.resolve(name, available_tools)
+            if not resolution.is_available:
+                return None
+            routed.append(RoutedToolset(
+                name=resolution.spec.name,
+                tool_names=resolution.tool_names,
+                instructions=resolution.spec.instructions,
+                missing_optional_tool_names=resolution.missing_optional_tool_names,
+            ))
+            for current_tool in resolution.tools:
+                unique_tools.setdefault(_read_tool_name(current_tool), current_tool)
+        return ToolsetRouteDecision(
+            routing_task=_compact_routing_task(routing_task),
+            selected_toolset_names=tuple(normalized),
+            tools=tuple(unique_tools.values()),
+            routed_toolsets=tuple(routed),
+            route_scores=(),
+        )
+
+    async def route_with_model(
+        self,
+        model: Any,
+        *,
+        primary_task: str,
+        user_request_window: str,
+        available_tools: Sequence[Any],
+        allow_no_tool: bool = True,
+    ) -> ToolsetRouteDecision | None:
+        """两轮本地分数都不足时，复用当前角色模型选择一到两个组。"""
+        metadata = self.registry.build_router_metadata(tuple(available_tools))
+        if not metadata or model is None or not hasattr(model, "with_structured_output"):
+            return None
+        catalog = [
+            *(
+                [{
+                    "name": NO_TOOL_ROUTE,
+                    "description": "当前Step无需读取外部状态或执行动作，可以直接回答。",
+                }]
+                if allow_no_tool else []
+            ),
+            *(
+                {"name": item["name"], "description": item["description"]}
+                for item in metadata
+            ),
+        ]
+        messages = [
+            {
+                "role": "system",
+                "content": load_prompt("routing/toolset_model_fallback")
+                + "\n输出Schema："
+                + json.dumps(ModelToolsetSelection.model_json_schema(), ensure_ascii=False, separators=(",", ":")),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "current_step": _compact_routing_task(primary_task),
+                        "user_request": str(user_request_window or "").strip(),
+                        "available_toolsets": catalog,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            },
+        ]
+        try:
+            structured = model.with_structured_output(
+                ModelToolsetSelection, method="json_mode", include_raw=True,
+            )
+            response = await structured.ainvoke(messages)
+            if isinstance(response, ModelToolsetSelection):
+                parsed = response
+            elif isinstance(response, Mapping):
+                if response.get("parsing_error") is not None:
+                    return None
+                parsed = ModelToolsetSelection.model_validate(response.get("parsed"))
+            else:
+                parsed = ModelToolsetSelection.model_validate(response)
+        except Exception:
+            logger.exception("同Worker模型工具组回退失败，交给上层展示全部工具")
+            return None
+        return self.resolve_selected_toolsets(
+            parsed.selected_toolsets,
+            available_tools,
+            routing_task=primary_task,
+            allow_no_tool=allow_no_tool,
+        )
+
+
 def _compact_routing_task(
     text: str,
 ) -> str:
@@ -704,125 +1018,52 @@ def _compact_routing_task(
     )
 
 
-def _format_toolset_metadata(
-    metadata: list[
-        dict[
-            str,
-            str,
-        ]
-    ],
+def _build_routing_document(
+    *,
+    name: str,
+    description: str,
+    profile: str,
 ) -> str:
-    """把工具组名称和描述转换成短文本。"""
+    """只把正向定义和正例交给相关性模型。
 
-    lines: list[
-        str
-    ] = []
+    完整能力卡仍保留反例与边界供人审查；通用Reranker并不可靠理解
+    Markdown中的否定关系，把反例原文输入模型反而会制造关键词假阳性。
+    """
 
-    for item in metadata:
-        toolset_name = str(
-            item.get(
-                "name",
-                "",
-            )
-        ).strip()
+    selected_lines: list[str] = []
+    include_section = False
+    positive_sections = {"选择它", "典型命令"}
 
-        description = str(
-            item.get(
-                "description",
-                "",
-            )
-        ).strip()
-
-        if not toolset_name:
+    for raw_line in profile.splitlines():
+        line = raw_line.strip()
+        if line.startswith("## "):
+            include_section = line[3:].strip() in positive_sections
             continue
+        if include_section and line:
+            selected_lines.append(line)
 
-        lines.append(
-            f"- {toolset_name}: "
-            f"{description}"
-        )
+    positive_text = "\n".join(selected_lines).strip()
+    if not positive_text:
+        raise ValueError(f"工具组{name}的能力卡缺少正向路由章节。")
 
-    return "\n".join(
-        lines
+    return (
+        f"能力组：{name}\n"
+        f"核心能力：{description.strip()}\n"
+        f"适用场景与例子：\n{positive_text}"
     )
 
 
-def _normalize_selected_toolsets(
-    selected_names: Sequence[
-        str
-    ] | None,
-    allowed_labels: Sequence[
-        str
-    ],
-    max_toolsets: int,
-) -> list[str]:
-    """再次验证、去重并截断Router结果。"""
+def _apply_toolset_dominance(selected_names: Sequence[str]) -> list[str]:
+    """去掉已被更宽工具组完整覆盖的窄组，同时保留相关性顺序。"""
 
-    if not selected_names:
-        return []
-
-    allowed_name_set = {
-        label.strip().upper()
-
-        for label in allowed_labels
-
-        if label.strip()
+    selected_set = set(selected_names)
+    suppressed = {
+        covered_name
+        for selected_name in selected_names
+        for covered_name in TOOLSET_DOMINANCE.get(selected_name, ())
+        if covered_name in selected_set
     }
-
-    normalized_names: list[
-        str
-    ] = []
-
-    seen_names: set[
-        str
-    ] = set()
-
-    for selected_name in selected_names:
-        normalized_name = (
-            str(
-                selected_name
-            )
-            .strip()
-            .upper()
-        )
-
-        if (
-            normalized_name
-            not in allowed_name_set
-        ):
-            continue
-
-        if normalized_name in seen_names:
-            continue
-
-        seen_names.add(
-            normalized_name
-        )
-
-        normalized_names.append(
-            normalized_name
-        )
-
-    # 只要存在真实工具组，
-    # NO_TOOL就失去意义。
-    if (
-        NO_TOOL_ROUTE
-        in normalized_names
-
-        and len(
-            normalized_names
-        ) > 1
-    ):
-        normalized_names = [
-            name
-
-            for name in normalized_names
-
-            if name != NO_TOOL_ROUTE
-        ]
-
-    return normalized_names[
-        :max_toolsets
-    ]
+    return [name for name in selected_names if name not in suppressed]
 
 
 def _read_tool_name(

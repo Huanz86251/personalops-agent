@@ -23,10 +23,14 @@ from .web_tools import (
     web_search,
     web_search_tool,
 )
-from .request_toolset import (
-    request_toolset,
-    request_toolset_tool,
+from .show_all_toolsets import (
+    show_all_toolsets,
+    show_all_toolsets_tool,
 )
+from .local_native import LOCAL_NATIVE_TOOLS
+from .feishu_file_tools import send_local_file_to_feishu
+from .schedule_tools import SCHEDULE_TOOLS
+from .desktop_tools import DESKTOP_TOOLS
 
 ALL_TOOLS = [
     get_current_time_tool,
@@ -41,7 +45,11 @@ ALL_TOOLS = [
     web_search_tool,
     github_mirror_tool,
 
-    request_toolset_tool,
+    show_all_toolsets_tool,
+    *LOCAL_NATIVE_TOOLS,
+    *SCHEDULE_TOOLS,
+    *DESKTOP_TOOLS,
+    send_local_file_to_feishu,
 ]
 
 
@@ -76,6 +84,6 @@ __all__ = [
     "github_mirror_tool",
 
 
-    "request_toolset",
-    "request_toolset_tool",
+    "show_all_toolsets",
+    "show_all_toolsets_tool",
 ]

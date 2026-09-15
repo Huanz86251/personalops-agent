@@ -1,26 +1,12 @@
+import json
 
 from typing import Any
-
-from langchain.agents import (
-    AgentState,
-    create_agent,
-)
 
 from langchain.chat_models import (
     init_chat_model,
 )
-from typing_extensions import (
-    NotRequired,
-)
 from config import (
-    PlanningSettings,
     Settings,
-)
-from context_middlewares import (
-    build_context_middlewares,
-)
-from middlewares import (
-    build_middlewares,
 )
 from prompt_loader import (
     load_prompt,
@@ -30,63 +16,9 @@ from observability import (
     set_span_output,
     trace_span,
 )
+from worker_termination import build_worker_cancellation_record
 
 TRACE_MESSAGE_PREVIEW_MAX_CHARS = 1200
-
-class ConversationState(
-    AgentState
-):
-    """单条Conversation需要持久化的额外状态。"""
-
-    conversation_id: NotRequired[
-        str
-    ]
-
-    conversation_title: NotRequired[
-        str
-    ]
-
-    channel_key: NotRequired[
-        str
-    ]
-
-    created_at: NotRequired[
-        str
-    ]
-
-    last_active_at: NotRequired[
-        str
-    ]
-
-    title_generated: NotRequired[
-        bool
-    ]
-    memory_context: NotRequired[
-        str
-    ]
-    conversation_summary: NotRequired[
-        str
-    ]
-
-    conversation_summary_message_count: NotRequired[
-        int
-    ]
-    # Planning Graph为当前Step Attempt计算的动态预算。
-    #
-    # 这些字段由执行层Middleware读取，
-    # 不由模型直接决定。
-    executor_model_run_limit: NotRequired[
-        int
-    ]
-
-    executor_tool_run_limit: NotRequired[
-        int
-    ]
-
-    request_toolset_run_limit: NotRequired[
-        int
-    ]
-
 
 def _build_chat_model(
     *,
@@ -95,22 +27,18 @@ def _build_chat_model(
     max_tokens: int,
     timeout_seconds: int,
     thinking_enabled: bool,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    reasoning_effort: str | None = None,
+    extra_body: dict | None = None,
+    max_retries: int = 2,
+    token_limit_parameter: str = "max_completion_tokens",
+    trace_role: str = "model",
 ):
-    """统一构造普通模型和Hard模型。
+    """Construct role models with provider-specific reasoning controls.
 
-    当前只有DeepSeek需要通过extra_body
-    显式控制thinking模式。
-
-    其他供应商暂时只复用：
-    - model
-    - model_provider
-    - max_tokens
-    - timeout
-    - max_retries
-
-    后续如果OpenAI或Anthropic需要额外的
-    reasoning参数，应继续在这个函数中集中适配，
-    不要分别散落到Supervisor和Executor中。
+    DeepSeek supports disabled thinking; GPT-5 nano uses minimal effort
+    when thinking_enabled is false, since it cannot disable reasoning.
     """
 
     normalized_provider = (
@@ -159,7 +87,7 @@ def _build_chat_model(
         #
         # 它不属于新的业务模型轮次，
         # 后续不计入Supervisor或Executor预算。
-        "max_retries": 2,
+        "max_retries": max_retries,
     }
 
     if normalized_provider == "deepseek":
@@ -177,29 +105,68 @@ def _build_chat_model(
             }
         }
 
-    return init_chat_model(
-        **model_options,
+    if normalized_provider == "openai" and normalized_model_name.startswith("gpt-5-nano"):
+        model_options["reasoning_effort"] = "low" if thinking_enabled else "minimal"
+        model_options["max_completion_tokens"] = model_options.pop("max_tokens")
+
+    if normalized_provider in {"compatible", "qwen"}:
+        if not base_url:
+            raise ValueError("compatible/qwen models require an explicit base_url")
+        model_options["model_provider"] = "openai"
+        # Keep compatible providers on Chat Completions, including unknown model IDs.
+        model_options["use_responses_api"] = False
+    if normalized_provider == "qwen":
+        model_options["extra_body"] = {"enable_thinking": thinking_enabled}
+    if api_key is not None:
+        model_options["api_key"] = api_key
+    if base_url:
+        model_options["base_url"] = base_url
+    if reasoning_effort is not None:
+        if normalized_provider == "qwen":
+            model_options["extra_body"]["reasoning_effort"] = reasoning_effort
+        else:
+            model_options["reasoning_effort"] = reasoning_effort
+    if extra_body:
+        model_options["extra_body"] = {**model_options.get("extra_body", {}), **extra_body}
+
+    if normalized_provider in {"qwen", "compatible"}:
+        from model_clients import CompatibleChatModel
+        model_options.pop("model_provider")
+        model = CompatibleChatModel(**model_options, token_limit_parameter=token_limit_parameter)
+    else:
+        model = init_chat_model(**model_options)
+    profile = dict(getattr(model, "profile", None) or {})
+    if normalized_provider in {"qwen", "compatible"}:
+        model.profile = {**profile, "pdf_inputs": False, "pdf_tool_message": False}
+    elif profile.get("attachment") is False:
+        model.profile = {**profile, "pdf_inputs": False, "pdf_tool_message": False}
+    from langchain_core.language_models.chat_models import BaseChatModel
+    if isinstance(model, BaseChatModel):
+        from trace_callbacks import callbacks
+        model.callbacks = callbacks(model.callbacks)
+        model.metadata = {**(model.metadata or {}), "runtime.model_role": trace_role, "trace.owner": "personalops"}
+    return model
+
+def build_role_model(settings: Settings, role: str):
+    """Construct a role with its own credentials, endpoint, and request settings."""
+    config = settings.role_models[role]
+    return _build_chat_model(
+        model_provider=config.provider, model_name=config.model,
+        max_tokens=config.max_tokens, timeout_seconds=config.timeout_seconds,
+        thinking_enabled=config.thinking_enabled, api_key=config.api_key,
+        base_url=config.base_url or None, reasoning_effort=config.reasoning_effort,
+        extra_body=config.extra_body, max_retries=config.max_retries,
+        token_limit_parameter=config.token_limit_parameter,
+        trace_role=role,
     )
+
 
 def build_model(
     settings: Settings,
 ):
-    """构造Simple Executor使用的普通云端模型。
-
-    当前演示项目中的以下调用共用这个模型：
-
-    - Simple Executor；
-    - Step Reporter；
-    - Conversation Summary；
-    - Conversation Title；
-    - 云端记忆提取和判断。
-
-    普通云端模型默认开启Thinking。
-
-    Thinking不会被当成额外业务模型轮次：
-    一次模型请求无论内部思考多长，
-    仍然只计算一次逻辑模型调用。
-    """
+    """Build the General model; old settings objects retain their original fallback."""
+    if getattr(settings, "role_models", None):
+        return build_role_model(settings, "general")
 
     return _build_chat_model(
         model_provider=(
@@ -219,24 +186,42 @@ def build_model(
         # 给Thinking和较长结构化输出更多时间。
         timeout_seconds=120,
 
-        thinking_enabled=True,
+        thinking_enabled=settings.llm_thinking_enabled,
+    )
+
+
+def build_summary_model(settings: Settings):
+    """Build the dedicated conversation/Worker summarization model."""
+    if getattr(settings, "role_models", None):
+        return build_role_model(settings, "summary")
+    return _build_chat_model(
+        model_provider=settings.summary_llm_provider,
+        model_name=settings.summary_llm_model,
+        max_tokens=settings.cloud_llm_max_tokens,
+        timeout_seconds=120,
+        thinking_enabled=False,
+    )
+
+
+def build_memory_model(settings: Settings):
+    """Build the dedicated low-cost typed memory extraction model."""
+
+    if getattr(settings, "role_models", None):
+        return build_role_model(settings, "extraction")
+    return _build_chat_model(
+        model_provider=settings.extraction_llm_provider,
+        model_name=settings.extraction_llm_model,
+        max_tokens=settings.memory_extraction_max_tokens,
+        timeout_seconds=120,
+        thinking_enabled=False,
     )
 
 def build_hard_model(
     settings: Settings,
 ):
-    """构造Hard Supervisor系列节点使用的模型。
-
-    这个模型负责：
-
-    - 初始Hard Supervisor；
-    - 全局唯一一次Hard Replanner；
-    - Hard Final Reviewer。
-
-    当前演示项目不再为三个Hard职责
-    分别创建不同的模型配置，
-    它们统一使用全局云端输出上限。
-    """
+    """Build the Scheduler model; other production roles have independent settings."""
+    if getattr(settings, "role_models", None):
+        return build_role_model(settings, "scheduler")
 
     return _build_chat_model(
         model_provider=(
@@ -256,87 +241,7 @@ def build_hard_model(
         # Hard Thinking也可能需要更长时间。
         timeout_seconds=180,
 
-        thinking_enabled=True,
-    )
-
-def build_agent(
-    model,
-    *,
-    planning: PlanningSettings,
-    tools: list | None = None,
-    middleware: list | None = None,
-    checkpointer=None,
-    store=None,
-    retrieval_models=None,
-):
-    """组装唯一的Simple Executor Agent。
-
-    所有用户请求先经过Hard Supervisor。
-
-    Hard Supervisor输出FINAL时，
-    不会调用这个Agent。
-
-    只有输出PLAN时，
-    Planning Graph才会使用这个Agent
-    执行当前Step和调用业务工具。
-    """
-
-    context_middlewares = (
-        build_context_middlewares(
-            model,
-            planning,
-        )
-    )
-
-    execution_middlewares = (
-        build_middlewares(
-            retrieval_models=(
-                retrieval_models
-            )
-        )
-
-        if middleware is None
-
-        else list(
-            middleware
-        )
-    )
-
-    # 动态模型/工具预算不再在这里写死。
-    #
-    # Planning Graph会把当前Attempt的剩余额度写入
-    # ConversationState；执行层Middleware再按本次State
-    # 实际限制模型和工具调用。
-    resolved_middlewares = [
-        *context_middlewares,
-        *execution_middlewares,
-    ]
-
-    return create_agent(
-        model=model,
-
-        tools=list(
-            tools
-            or []
-        ),
-
-        middleware=(
-            resolved_middlewares
-        ),
-
-        system_prompt=load_prompt(
-            "assistant"
-        ),
-
-        state_schema=(
-            ConversationState
-        ),
-
-        checkpointer=(
-            checkpointer
-        ),
-
-        store=store,
+        thinking_enabled=settings.scheduler_thinking_enabled,
     )
 
 def _content_to_text(
@@ -436,6 +341,9 @@ def _read_message_role(
     message: Any,
 ) -> str:
     """统一读取消息角色。"""
+    metadata = message.get("additional_kwargs", {}) if isinstance(message, dict) else getattr(message, "additional_kwargs", {})
+    if metadata.get("personalops_runtime_event"):
+        return "system"
 
     if isinstance(
         message,
@@ -828,6 +736,48 @@ def _extract_current_turn_messages(
     )
 
 
+def _extract_handoff_source_messages(result: Any, messages: list) -> list:
+    """Keep only Tool results explicitly referenced by structured API handoff.
+
+    Compaction may move early documentation results out of the current turn.
+    The planning trace needs these few records to validate handoff entries, but
+    it does not need the Worker's full archived conversation.
+    """
+    if not isinstance(result, dict):
+        return []
+
+    source_ids: set[str] = set()
+
+    def visit(value: Any, *, inside_apis: bool = False) -> None:
+        if hasattr(value, "model_dump"):
+            value = value.model_dump(mode="json")
+        if isinstance(value, dict):
+            for key, item in value.items():
+                active = inside_apis or key == "handoff_apis"
+                if active and key == "tool_call_id" and isinstance(item, str):
+                    source_ids.add(item)
+                else:
+                    visit(item, inside_apis=active)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                visit(item, inside_apis=inside_apis)
+
+    for key in ("general_result", "worker_submission", "code_worker_submission"):
+        visit(result.get(key))
+    if not source_ids:
+        return []
+
+    candidates = [*result.get("worker_archived_messages", []), *messages]
+    selected = []
+    seen: set[str] = set()
+    for message in candidates:
+        call_id = _read_tool_call_id(message)
+        if call_id in source_ids and call_id not in seen:
+            selected.append(message)
+            seen.add(call_id)
+    return selected
+
+
 def _build_agent_execution_summary(
     messages: list,
 ) -> dict[
@@ -1003,7 +953,7 @@ async def generate_conversation_title(
                     "role": "system",
 
                     "content": load_prompt(
-                        "conversation_title"
+                        "conversation/title"
                     ),
                 },
                 {
@@ -1116,7 +1066,7 @@ async def generate_conversation_title(
         return final_title
 
 
-async def ask_agent(
+async def ask_worker(
     agent,
     user_text: str,
     *,
@@ -1125,12 +1075,14 @@ async def ask_agent(
         str,
         Any,
     ] | None = None,
+    runtime_configurable: dict[str, Any] | None = None,
     return_details: bool = False,
+    trace_role: str = "general",
 ) -> str | dict[
     str,
     Any,
 ]:
-    """调用主Agent，并记录完整执行根节点。
+    """调用 General Worker，并记录完整执行根节点。
 
     默认只返回最终文字，保持现有调用兼容。
 
@@ -1164,6 +1116,14 @@ async def ask_agent(
             resolved_state_update
         )
 
+    # The outer runtime grants a fresh per-invocation budget, including on
+    # Code repair. Keep the role's skill snapshot/history, not old counters.
+    for counter in (
+        "executor_model_calls_used", "executor_tool_calls_used",
+        "show_all_toolsets_calls_used", "skill_preparation_calls_used", "worker_compaction_calls_used",
+    ):
+        input_state.setdefault(counter, 0)
+
     memory_context = (
         resolved_state_update.get(
             "memory_context",
@@ -1177,8 +1137,17 @@ async def ask_agent(
     ):
         memory_context = ""
 
+    from runtime_tracing import ROLE_NAMES, TRACE_IDS, identities
+    trace_name = "Code Agent" if trace_role == "code_agent" else ROLE_NAMES.get(trace_role, trace_role)
+    trace_identity = {**TRACE_IDS.get(), **identities(resolved_state_update)}
+    from trace_presentation import role_badge
+    display_name = role_badge(trace_name)
+    if trace_identity.get("step_id") is not None:
+        display_name += f" / Step {trace_identity['step_id']}"
+    if trace_identity.get("candidate_revision") is not None:
+        display_name += f" / Revision {trace_identity['candidate_revision']}"
     with trace_span(
-        "main_agent.run",
+        display_name,
 
         # AGENT表示一个由LLM驱动、
         # 可以循环调用工具的推理单元。
@@ -1220,9 +1189,9 @@ async def ask_agent(
                     )
                 ),
 
-                "request_toolset_run_limit": (
+                "show_all_toolsets_run_limit": (
                     resolved_state_update.get(
-                        "request_toolset_run_limit"
+                        "show_all_toolsets_run_limit"
                     )
                 ),
             },
@@ -1230,7 +1199,7 @@ async def ask_agent(
 
         attributes={
             "agent.name": (
-                "main_agent"
+                trace_name
             ),
 
             "conversation.thread_id": (
@@ -1240,6 +1209,7 @@ async def ask_agent(
             "agent.input_chars": len(
                 user_text
             ),
+            **{"runtime." + key: value for key, value in {**TRACE_IDS.get(), **identities(resolved_state_update)}.items()},
 
             "memory.context_present": bool(
                 memory_context
@@ -1264,26 +1234,40 @@ async def ask_agent(
                 )
             ),
 
-            "agent.request_toolset_run_limit": (
+            "agent.show_all_toolsets_run_limit": (
                 resolved_state_update.get(
-                    "request_toolset_run_limit",
+                    "show_all_toolsets_run_limit",
                     0,
                 )
             ),
         },
     ) as span:
 
-        result = await agent.ainvoke(
-            input_state,
+        from knowledge_rag.runtime import automatic_rag, shared_code_scope, SHARED_CODE
+        from knowledge_rag.query import retrieval_query as task_query
+        shared_owner = SHARED_CODE.get() if trace_role in {"code", "reviewer", "code_reviewer"} else None
+        if trace_role == "code_agent":
+            shared_owner = "code-task:" + thread_id
+            query = task_query(user_text, input_state.get("code_task"))
+            await automatic_rag(query, "Code Agent", key=shared_owner, agent=shared_owner)
 
-            config={
-                "configurable": {
-                    "thread_id": (
-                        thread_id
-                    ),
-                }
-            },
-        )
+        worker_configurable = dict(runtime_configurable or {})
+        # The stable Worker identity is owned by this boundary. Callers may
+        # forward pause/recovery controls, but cannot redirect the checkpoint.
+        worker_configurable["thread_id"] = thread_id
+        from trace_callbacks import callbacks
+        from workers.history_archive import history_scope
+        with shared_code_scope(shared_owner), history_scope(thread_id.split(':step_', 1)[0], thread_id):
+            result = await agent.ainvoke(
+                input_state,
+
+                config={
+                    "configurable": worker_configurable,
+                    "callbacks": callbacks(),
+                    "metadata": {"runtime.model_role": trace_role, "trace.owner": "personalops",
+                                 **{"runtime." + k: v for k, v in identities(resolved_state_update).items()}},
+                },
+            )
 
         if isinstance(
             result,
@@ -1334,6 +1318,8 @@ async def ask_agent(
         else:
             answer = ""
 
+        if isinstance(result, dict) and result.get("general_result"):
+            answer = str(result["general_result"].get("summary") or answer)
         if not answer:
             answer = (
                 "模型已返回结果，"
@@ -1357,10 +1343,23 @@ async def ask_agent(
                 "executor_tool_calls_used"
             )
 
-            request_toolset_calls_used = (
+            show_all_toolsets_calls_used = (
                 result.get(
-                    "request_toolset_calls_used"
+                    "show_all_toolsets_calls_used"
                 )
+            )
+
+            leadership_model_rounds = result.get(
+                "worker_leadership_model_rounds_used",
+                0,
+            )
+            finalization_model_rounds = result.get(
+                "worker_finalization_model_calls_used",
+                0,
+            )
+            finalization_tool_calls = result.get(
+                "worker_finalization_tool_calls_used",
+                0,
             )
 
             if (
@@ -1375,7 +1374,41 @@ async def ask_agent(
             ):
                 execution_summary[
                     "model_call_count"
-                ] = model_calls_used
+                ] = (
+                    model_calls_used
+                    + (
+                        leadership_model_rounds
+                        if isinstance(leadership_model_rounds, int)
+                        and not isinstance(leadership_model_rounds, bool)
+                        else 0
+                    )
+                )
+
+            preparation_calls = int(result.get("skill_preparation_calls_used", 0) or 0)
+            execution_summary["skill_preparation_call_count"] = preparation_calls
+            execution_summary["model_call_count"] += preparation_calls
+            compression_calls = int(result.get("worker_compaction_calls_used", 0) or 0)
+            execution_summary["compaction_call_count"] = compression_calls
+            execution_summary["model_call_count"] += compression_calls
+
+            execution_summary["leadership_model_call_count"] = (
+                leadership_model_rounds
+                if isinstance(leadership_model_rounds, int)
+                and not isinstance(leadership_model_rounds, bool)
+                else 0
+            )
+            execution_summary["finalization_model_call_count"] = (
+                finalization_model_rounds
+                if isinstance(finalization_model_rounds, int)
+                and not isinstance(finalization_model_rounds, bool)
+                else 0
+            )
+            execution_summary["finalization_tool_call_count"] = (
+                finalization_tool_calls
+                if isinstance(finalization_tool_calls, int)
+                and not isinstance(finalization_tool_calls, bool)
+                else 0
+            )
 
             if (
                 isinstance(
@@ -1393,18 +1426,18 @@ async def ask_agent(
 
             if (
                 isinstance(
-                    request_toolset_calls_used,
+                    show_all_toolsets_calls_used,
                     int,
                 )
                 and not isinstance(
-                    request_toolset_calls_used,
+                    show_all_toolsets_calls_used,
                     bool,
                 )
             ):
                 execution_summary[
-                    "request_toolset_call_count"
+                    "show_all_toolsets_call_count"
                 ] = (
-                    request_toolset_calls_used
+                    show_all_toolsets_calls_used
                 )
 
         set_span_attributes(
@@ -1450,7 +1483,8 @@ async def ask_agent(
         )
 
         if return_details:
-            return {
+            details = {
+                "general_result": result.get("general_result") if isinstance(result, dict) else None,
                 "final_answer": (
                     answer
                 ),
@@ -1461,9 +1495,76 @@ async def ask_agent(
                     )
                 ),
 
+                "handoff_source_messages": (
+                    _extract_handoff_source_messages(result, result_messages)
+                ),
+
                 "execution_summary": (
                     execution_summary
                 ),
+
+                "worker_terminal_action": (
+                    result.get("worker_terminal_action")
+                    if isinstance(result, dict)
+                    else None
+                ),
+
+                "worker_leadership_decisions": (
+                    list(result.get("worker_leadership_decisions", []))
+                    if isinstance(result, dict)
+                    else []
+                ),
+
+                "worker_submission": (
+                    result.get("worker_submission")
+                    if isinstance(result, dict)
+                    else None
+                ),
             }
+
+            if (
+                isinstance(result, dict)
+                and result.get("worker_terminal_action") == "CANCEL"
+            ):
+                decisions = list(result.get("worker_leadership_decisions", []))
+                reason = "Worker was cancelled by leadership."
+                if decisions:
+                    decision = decisions[-1].get("decision", {})
+                    if isinstance(decision, dict):
+                        reason = str(decision.get("reason") or reason)
+                details["worker_cancellation_record"] = (
+                    build_worker_cancellation_record(
+                        result,
+                        reason=reason,
+                    ).model_dump(mode="json")
+                )
+
+            # Dedicated CODE runtimes return control-plane records in
+            # addition to ordinary messages.  Keep this adapter generic, but
+            # explicitly preserve the bounded records that the Planning Graph
+            # is allowed to consume.  Hidden model reasoning and the complete
+            # checkpoint are deliberately not forwarded.
+            if isinstance(result, dict):
+                for key in (
+                    "code_worker_submission",
+                    "code_review_loop",
+                    "code_review_report",
+                    "code_artifact_manifest",
+                    "code_publication_receipt",
+                    "code_handoff_publication_receipts",
+                    "code_integration_commit",
+                    "code_integration_status",
+                    "code_attempt_archive",
+                    "code_attempt_final_record",
+                    "code_runtime_session_id",
+                    "code_scheduler_decision_applied",
+                    "role_skill_snapshot",
+                    "skill_preparation_calls_used",
+                    "code_superseded_attempt_records",
+                ):
+                    if key in result:
+                        details[key] = result[key]
+
+            return details
 
         return answer

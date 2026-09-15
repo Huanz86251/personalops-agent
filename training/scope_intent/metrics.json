@@ -1,0 +1,140 @@
+{
+  "created_at_utc": "2026-09-13T01:07:41.048508+00:00",
+  "base_model": "distilbert/distilbert-base-multilingual-cased",
+  "developer": "Hugging Face DistilBERT team",
+  "classifier": "AutoModelForSequenceClassification",
+  "encoder_frozen": false,
+  "device": "cuda",
+  "epochs": 2,
+  "batch_size": 32,
+  "rows": {
+    "train": 14000,
+    "validation": 3000,
+    "test": 3000
+  },
+  "seed_counts": {
+    "train": 56,
+    "validation": 12,
+    "test": 12
+  },
+  "threshold_selection": "minimize validation false positives subject to positive recall >= 0.98",
+  "history": [
+    {
+      "epoch": 1,
+      "train_loss": 0.15874837685406173,
+      "validation": {
+        "threshold": 0.241228,
+        "accuracy": 0.8703333333333333,
+        "roc_auc": 0.9755315555555556,
+        "per_label": {
+          "DIRECT_RESPONSE": {
+            "precision": 0.9743808710503843,
+            "recall": 0.7606666666666667,
+            "f1": 0.8543616622987645
+          },
+          "REQUIRES_SCOPE_CONTRACT": {
+            "precision": 0.8037178786221979,
+            "recall": 0.98,
+            "f1": 0.8831480925202763
+          }
+        },
+        "confusion_matrix": [
+          [
+            1141,
+            359
+          ],
+          [
+            30,
+            1470
+          ]
+        ]
+      }
+    },
+    {
+      "epoch": 2,
+      "train_loss": 0.04603701834521707,
+      "validation": {
+        "threshold": 0.047092,
+        "accuracy": 0.8723333333333333,
+        "roc_auc": 0.9797506666666667,
+        "per_label": {
+          "DIRECT_RESPONSE": {
+            "precision": 0.9745114698385726,
+            "recall": 0.7646666666666667,
+            "f1": 0.8569293985805005
+          },
+          "REQUIRES_SCOPE_CONTRACT": {
+            "precision": 0.8063631376851343,
+            "recall": 0.98,
+            "f1": 0.8847427023773698
+          }
+        },
+        "confusion_matrix": [
+          [
+            1147,
+            353
+          ],
+          [
+            30,
+            1470
+          ]
+        ]
+      }
+    }
+  ],
+  "validation": {
+    "threshold": 0.047092,
+    "accuracy": 0.8723333333333333,
+    "roc_auc": 0.9797506666666667,
+    "per_label": {
+      "DIRECT_RESPONSE": {
+        "precision": 0.9745114698385726,
+        "recall": 0.7646666666666667,
+        "f1": 0.8569293985805005
+      },
+      "REQUIRES_SCOPE_CONTRACT": {
+        "precision": 0.8063631376851343,
+        "recall": 0.98,
+        "f1": 0.8847427023773698
+      }
+    },
+    "confusion_matrix": [
+      [
+        1147,
+        353
+      ],
+      [
+        30,
+        1470
+      ]
+    ]
+  },
+  "test": {
+    "threshold": 0.047092,
+    "accuracy": 0.848,
+    "roc_auc": 0.9741755555555556,
+    "per_label": {
+      "DIRECT_RESPONSE": {
+        "precision": 0.9860335195530726,
+        "recall": 0.706,
+        "f1": 0.8228438228438228
+      },
+      "REQUIRES_SCOPE_CONTRACT": {
+        "precision": 0.7710280373831776,
+        "recall": 0.99,
+        "f1": 0.8669001751313485
+      }
+    },
+    "confusion_matrix": [
+      [
+        1059,
+        441
+      ],
+      [
+        15,
+        1485
+      ]
+    ]
+  },
+  "limitation": "Synthetic held-out seed families measure generator-domain generalization, not production accuracy."
+}

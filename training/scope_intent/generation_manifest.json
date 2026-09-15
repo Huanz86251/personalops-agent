@@ -1,0 +1,33 @@
+{
+  "created_at_utc": "2026-09-13T00:24:30.772541+00:00",
+  "model": "qwen3.7-flash",
+  "thinking_enabled": false,
+  "rows": 4000,
+  "labels": {
+    "DIRECT_RESPONSE": 2000,
+    "REQUIRES_SCOPE_CONTRACT": 2000
+  },
+  "splits": {
+    "train": 2800,
+    "validation": 600,
+    "test": 600
+  },
+  "languages": {
+    "zh": 1908,
+    "en": 2092
+  },
+  "usage": {
+    "input_tokens": 43900,
+    "output_tokens": 216284,
+    "cache_read_tokens": 0
+  },
+  "cost": {
+    "status": "estimated",
+    "currency": "CNY",
+    "known_total_cny": 0.1818072,
+    "missing_requests": 0,
+    "priced_requests": 79
+  },
+  "elapsed_seconds": 1650.266,
+  "output": "training\\scope_intent\\scope_intent_4000.jsonl"
+}

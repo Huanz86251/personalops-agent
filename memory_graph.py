@@ -9,6 +9,7 @@ from threading import (
 from typing import (
     Any,
 )
+import unicodedata
 
 import networkx as nx
 
@@ -75,7 +76,10 @@ class MemoryGraphIndex:
             return ""
 
         return " ".join(
-            value
+            unicodedata.normalize(
+                "NFC",
+                value,
+            )
             .strip()
             .split()
         )
@@ -372,6 +376,13 @@ class MemoryGraphIndex:
                     importance=(
                         value.get(
                             "importance",
+                            2,
+                        )
+                    ),
+
+                    confidence=(
+                        value.get(
+                            "confidence",
                             2,
                         )
                     ),
@@ -749,6 +760,11 @@ class MemoryGraphIndex:
                 int,
             ] = {}
 
+            memory_confidence: dict[
+                str,
+                int,
+            ] = {}
+
             for (
                 source,
                 target,
@@ -833,6 +849,28 @@ class MemoryGraphIndex:
                     ),
                 )
 
+                confidence = edge_data.get(
+                    "confidence",
+                    2,
+                )
+
+                if not isinstance(
+                    confidence,
+                    int,
+                ):
+                    confidence = 2
+
+                memory_confidence[
+                    memory_id
+                ] = max(
+                    confidence,
+
+                    memory_confidence.get(
+                        memory_id,
+                        1,
+                    ),
+                )
+
             ranked_memory_ids = sorted(
                 memory_distances,
 
@@ -840,6 +878,11 @@ class MemoryGraphIndex:
                     memory_distances[
                         memory_id
                     ],
+
+                    -memory_confidence.get(
+                        memory_id,
+                        2,
+                    ),
 
                     -memory_importance.get(
                         memory_id,

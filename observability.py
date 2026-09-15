@@ -32,7 +32,7 @@ logger = logging.getLogger(
 
 
 DEFAULT_PHOENIX_PROJECT_NAME = (
-    "agentnew"
+    "Agent Tasks"
 )
 
 DEFAULT_PHOENIX_UI_URL = (
@@ -44,6 +44,10 @@ DEFAULT_PHOENIX_COLLECTOR_ENDPOINT = (
 )
 DEFAULT_PHOENIX_PROTOCOL = (
     "http/protobuf"
+)
+
+DEFAULT_PHOENIX_TRACE_PROFILE = (
+    "curated"
 )
 
 
@@ -323,6 +327,87 @@ def get_phoenix_collector_endpoint() -> str:
     )
 
 
+def get_phoenix_trace_profile() -> str:
+    """Return the selected Phoenix trace detail profile.
+
+    curated is the default. The legacy full value remains accepted, but both
+    use the same application-owned model/tool leaves and semantic boundaries.
+    Framework/SDK auto-instrumentation is not enabled in either profile.
+    """
+
+    profile = (
+        os.getenv(
+            "PHOENIX_TRACE_PROFILE",
+            DEFAULT_PHOENIX_TRACE_PROFILE,
+        )
+        .strip()
+        .lower()
+    )
+
+    if profile not in {
+        "full",
+        "curated",
+    }:
+        logger.warning(
+                "Invalid PHOENIX_TRACE_PROFILE: %s; using curated.",
+            profile,
+        )
+        return DEFAULT_PHOENIX_TRACE_PROFILE
+
+    return profile
+
+
+def _curated_span_name(name: str) -> str:
+    """Stable role/stage names shared by every supported trace profile."""
+
+    aliases = {
+        "hard_supervisor": "Scheduler / Plan Decision",
+        "main_agent.run": "General Agent",
+        "hard_replanner": "Scheduler / Replan Decision",
+        "hard_final_reviewer": "Scheduler / Final Decision",
+        "hard_code_scheduler": "Scheduler / Code Recovery Decision",
+        "hard_worker_leader": "Scheduler / Worker Guidance",
+        "conversation_turn": "Conversation / Turn",
+        "conversation_title_generation": "Conversation / Title",
+        "memory_retrieval": "Memory / Recall",
+        "memory_write_buffer": "Memory / Buffer User Message",
+        "memory.write_gate": "Memory / Write Eligibility",
+        "memory.write_gate.memoperator": "Memory / Local Write Classifier",
+        "memory.read_gate": "Memory / Read Eligibility",
+        "memory.dense_retrieval": "Memory / Dense Search",
+        "memory.bm25_retrieval": "Memory / Lexical Search",
+        "memory.graph_expansion": "Memory / Graph Expansion",
+        "memory.seed_ranking": "Memory / Rank Seeds",
+        "memory.final_ranking": "Memory / Rank Results",
+        "memory.duplicate_check": "Memory / Check Duplicates",
+        "memory.store_new": "Memory / Save Record",
+        "memory.apply_resolution": "Memory / Apply Resolution",
+        "memory.retire_old": "Memory / Retire Record",
+        "memory.cloud_resolution": "Memory / Resolve Conflict",
+        "memory.relation_gate": "Memory / Check Relation",
+        "memory.resolution_retrieval": "Memory / Retrieve Conflict Evidence",
+        "toolset_routing": "Tool Router / Rank Capabilities",
+        "toolset_selection": "Tool Router / Select Capabilities",
+        "local_router": "Local Model / Tool Router",
+        "local_embedding.encode": "Local Model / Embedding",
+        "local_cross_encoder.predict": "Local Model / Reranker Scores",
+        "execution_budget.model_limit": "Budget / Model Limit",
+        "execution_budget.tool_filter": "Budget / Filter Tools",
+        "message_history.repair": "Context / Repair Message History",
+        "conversation_summary.update": "Conversation Summary / Update",
+    }
+    if name in aliases:
+        return aliases[name]
+    prefix = "step_report.step_"
+    if name.startswith(prefix):
+        return "Step Reporter / Step " + name[len(prefix):]
+    if name.startswith("model_call.round_"):
+        return "Agent / Model Round " + name.removeprefix("model_call.round_")
+    if name.startswith("memory."):
+        return "Memory / " + name.removeprefix("memory.").replace("_", " ").replace(".", " / ").title()
+    return name
+
+
 def setup_observability() -> Any | None:
     """注册Phoenix和LangChain/LangGraph自动追踪。
 
@@ -407,6 +492,14 @@ def setup_observability() -> Any | None:
             get_phoenix_project_name()
         )
 
+        trace_profile = (
+            get_phoenix_trace_profile()
+        )
+
+        # One application-owned callback records model/tool leaves. Framework
+        # plus SDK auto-instrumentation would duplicate the same request.
+        auto_instrument = False
+
         try:
             use_direct_local_exporter = (
                     protocol
@@ -443,7 +536,7 @@ def setup_observability() -> Any | None:
 
                     batch=False,
 
-                    auto_instrument=True,
+                    auto_instrument=auto_instrument,
 
                     verbose=False,
                 )
@@ -516,7 +609,7 @@ def setup_observability() -> Any | None:
 
                     batch=True,
 
-                    auto_instrument=True,
+                    auto_instrument=auto_instrument,
 
                     verbose=False,
                 )
@@ -549,13 +642,15 @@ def setup_observability() -> Any | None:
         logger.info(
             "Phoenix观测已启用 | "
             "project=%s | ui=%s | "
-            "network=%s | processor=batch",
+            "network=%s | processor=batch | profile=%s",
 
             project_name,
 
             get_phoenix_ui_url(),
 
             network_mode,
+
+            trace_profile,
         )
 
         return _TRACER_PROVIDER
@@ -697,7 +792,7 @@ def trace_span(
         return
 
     with tracer.start_as_current_span(
-        name,
+        _curated_span_name(name),
 
         openinference_span_kind=(
             kind
@@ -728,9 +823,12 @@ def trace_span(
                 )
 
         try:
-            yield span
+            from usage_accounting import usage_scope
+            from trace_presentation import timing_scope
+            with timing_scope(span), usage_scope(span):
+                yield span
 
-        except Exception as error:
+        except BaseException as error:
             # 记录业务异常，
             # 但绝对不能吞掉或改变异常类型。
             span.record_exception(
@@ -786,6 +884,18 @@ def set_span_output(
             value
         )
     )
+
+    # RAG reading view is a separate attribute; canonical output is untouched.
+    if isinstance(value, dict) and (
+        (isinstance(value.get("injected_context"), str) and value["injected_context"].startswith("[文档检索资料"))
+        or (isinstance(value.get("results"), list) and any(
+            isinstance(row, dict) and "source" in row and "text" in row
+            for row in value["results"]))
+    ):
+        from trace_chat import readable_content
+        span.set_attribute("llm.output_messages.0.message.role", "assistant")
+        span.set_attribute("llm.output_messages.0.message.content", readable_content(value))
+        span.set_attribute("rag.presentation_only", True)
 
 
 def set_span_attributes(

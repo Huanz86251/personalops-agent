@@ -45,9 +45,9 @@ from observability import (
 from dataclasses import (
     dataclass,
 )
-from tools.request_toolset import (
-    REQUEST_TOOLSET_NAME,
-    TOOLSET_REQUEST_PREFIX,
+from tools.show_all_toolsets import (
+    SHOW_ALL_TOOLSETS_NAME,
+    SHOW_ALL_TOOLSETS_PREFIX,
 )
 
 logger = logging.getLogger("agent")
@@ -62,11 +62,27 @@ GIT_INSTALL_COMMAND = (
 # 这里仍然主动压缩文本，
 # 避免极长用户消息或极长MCP描述
 # 占满单个Pair的上下文。
-TOOL_SELECTOR_QUERY_MAX_CHARS = 480
+TOOL_SELECTOR_QUERY_MAX_CHARS = 1600
 
 # 单用户应用只保存少量Conversation的
 # 最近一次工具组路由结果。
 TOOLSET_ROUTE_CACHE_MAX_CONVERSATIONS = 32
+TOOLSET_ROUTE_STEP_WEIGHT = 0.4
+TOOLSET_ROUTE_USER_WEIGHT = 0.6
+
+# Scheduler关闭工具访问时仍需允许角色提交结果或进入既有审核协议。
+# 检索、历史、文件和业务工具都不在此集合中。
+NO_ACCESS_CONTROL_TOOL_NAMES = frozenset({
+    "report_general_result",
+    "publish_worker_progress",
+    "submit_for_review",
+    "submit_code_for_review",
+    "respond_to_code_review",
+    "submit_continued_code_for_review",
+    "request_code_worker_repair",
+    "publish_reviewed_candidate",
+    "submit_code_review",
+})
 
 @dataclass(
     frozen=True,
@@ -77,6 +93,10 @@ class ToolsetRouteCacheEntry:
     user_turn_number: int
 
     routing_task: str
+
+    fallback_routing_task: str
+
+    tool_access_enabled: bool
 
     tool_signature: tuple[
         str,
@@ -92,6 +112,12 @@ class ToolsetRouteCacheEntry:
         str,
         ...,
     ]
+
+    # 本地加权路由和同Worker模型都失败时缓存控制面结果，避免每轮
+    # 重复付费；不会把全部业务工具暴露给模型。
+    routing_failed: bool = False
+
+    fallback_reason: str | None = None
 
 def _message_content_to_text(
     content: Any,
@@ -273,7 +299,7 @@ def _read_message_fields(
         )
 
     return (
-        role,
+        "system" if (message.get("additional_kwargs", {}) if isinstance(message, dict) else getattr(message, "additional_kwargs", {})).get("personalops_runtime_event") else role,
         name,
         content,
     )
@@ -341,7 +367,7 @@ def _get_current_toolset_route(
 
     # 只检查最近用户消息之后的ToolMessage。
     #
-    # 旧Turn中的request_toolset结果
+    # 旧Turn中的show_all_toolsets结果
     # 不能影响当前用户请求。
     for message in reversed(
         messages[
@@ -360,7 +386,7 @@ def _get_current_toolset_route(
             role != "tool"
 
             or name
-            != REQUEST_TOOLSET_NAME
+            != SHOW_ALL_TOOLSETS_NAME
         ):
             continue
 
@@ -371,7 +397,7 @@ def _get_current_toolset_route(
         if not (
             normalized_content
             .startswith(
-                TOOLSET_REQUEST_PREFIX
+                SHOW_ALL_TOOLSETS_PREFIX
             )
         ):
             continue
@@ -379,7 +405,7 @@ def _get_current_toolset_route(
         requested_task = (
             normalized_content[
                 len(
-                    TOOLSET_REQUEST_PREFIX
+                    SHOW_ALL_TOOLSETS_PREFIX
                 ):
             ]
             .strip()
@@ -399,7 +425,7 @@ def _get_current_toolset_route(
                 ),
             ),
 
-            "toolset_request",
+            "show_all_toolsets",
         )
 
     return (
@@ -871,9 +897,21 @@ class ExecutionBudgetState(
         int
     ]
 
-    request_toolset_calls_used: NotRequired[
+    show_all_toolsets_calls_used: NotRequired[
         int
     ]
+    skill_preparation_calls_used: NotRequired[int]
+    worker_compaction_calls_used: NotRequired[int]
+    worker_archived_messages: NotRequired[list[Any]]
+    worker_control_fingerprint: NotRequired[str]
+    worker_finalize_requested: NotRequired[bool]
+    worker_finalize_reason: NotRequired[str]
+    worker_review_requested: NotRequired[bool]
+    worker_finalization_model_run_limit: NotRequired[int]
+    worker_finalization_model_calls_used: NotRequired[int]
+    worker_finalization_tool_calls_used: NotRequired[int]
+    worker_schema_repair_model_run_limit: NotRequired[int]
+    worker_schema_repair_model_calls_used: NotRequired[int]
 
 
 class DynamicExecutionBudgetMiddleware(
@@ -896,11 +934,22 @@ class DynamicExecutionBudgetMiddleware(
         ExecutionBudgetState
     )
 
-    @hook_config(
-        can_jump_to=[
-            "end",
-        ]
-    )
+    def __init__(
+        self,
+        *,
+        enable_worker_finalization: bool = False,
+        finalization_model_rounds: int = 1,
+        schema_repair_max_rounds: int = 3,
+    ) -> None:
+        if finalization_model_rounds < 1:
+            raise ValueError("finalization_model_rounds must be positive.")
+        if schema_repair_max_rounds < 1:
+            raise ValueError("schema_repair_max_rounds must be positive.")
+        self.enable_worker_finalization = enable_worker_finalization
+        self.finalization_model_rounds = finalization_model_rounds
+        self.schema_repair_max_rounds = schema_repair_max_rounds
+
+    @hook_config(can_jump_to=["end"])
     def before_model(
         self,
         state: ExecutionBudgetState,
@@ -925,10 +974,54 @@ class DynamicExecutionBudgetMiddleware(
             )
         )
 
-        if (
-            model_calls_used
-            < model_limit
-        ):
+        finalizing = bool(state.get("worker_finalize_requested")) and not bool(
+            state.get("worker_review_requested")
+        )
+        model_calls_used += int(state.get("skill_preparation_calls_used", 0) or 0)
+        model_calls_used += int(state.get("worker_compaction_calls_used", 0) or 0)
+        finalization_used = max(
+            int(state.get("worker_finalization_model_calls_used", 0) or 0),
+            0,
+        )
+        finalization_limit = max(
+            int(
+                state.get(
+                    "worker_finalization_model_run_limit",
+                    self.finalization_model_rounds,
+                )
+                or self.finalization_model_rounds
+            ),
+            1,
+        )
+
+        schema_repairing = (
+            finalizing and state.get("worker_finalize_reason") == "SCHEMA_REPAIR"
+        )
+        if schema_repairing:
+            repair_used = max(
+                int(state.get("worker_schema_repair_model_calls_used", 0) or 0),
+                0,
+            )
+            repair_limit = max(
+                int(
+                    state.get(
+                        "worker_schema_repair_model_run_limit",
+                        self.schema_repair_max_rounds,
+                    )
+                    or self.schema_repair_max_rounds
+                ),
+                1,
+            )
+            if repair_used < repair_limit:
+                return None
+            return {"jump_to": "end"}
+
+        if self.enable_worker_finalization and finalizing:
+            if finalization_used < finalization_limit:
+                return None
+            return {"jump_to": "end"}
+
+        if model_calls_used < model_limit:
             return None
 
         with trace_span(
@@ -972,13 +1065,14 @@ class DynamicExecutionBudgetMiddleware(
                 },
             )
 
-        # 不额外伪造一条AIMessage。
-        # 这样ask_agent统计到的模型轮次，
-        # 就等于真正发生的模型调用次数。
-        return {
-            "jump_to": "end",
-        }
+        if self.enable_worker_finalization:
+            return {
+                "worker_finalize_requested": True,
+                "worker_finalize_reason": "MODEL_BUDGET_EXHAUSTED",
+            }
+        return {"jump_to": "end"}
 
+    @hook_config(can_jump_to=["model"])
     def after_model(
         self,
         state: ExecutionBudgetState,
@@ -996,10 +1090,10 @@ class DynamicExecutionBudgetMiddleware(
             )
         )
 
-        request_toolset_limit = (
+        show_all_toolsets_limit = (
             _read_dynamic_limit(
                 state,
-                "request_toolset_run_limit",
+                "show_all_toolsets_run_limit",
             )
         )
 
@@ -1040,9 +1134,9 @@ class DynamicExecutionBudgetMiddleware(
             )
         )
 
-        request_toolset_used_before = int(
+        show_all_toolsets_used_before = int(
             state.get(
-                "request_toolset_calls_used",
+                "show_all_toolsets_calls_used",
                 0,
             )
         )
@@ -1052,6 +1146,40 @@ class DynamicExecutionBudgetMiddleware(
                 last_message
             )
         )
+
+        finalizing = bool(state.get("worker_finalize_requested")) and not bool(
+            state.get("worker_review_requested")
+        )
+        if self.enable_worker_finalization and finalizing:
+            allowed_tool_calls = [
+                tool_call
+                for tool_call in current_tool_calls
+                if _read_tool_call_name(tool_call) == "submit_for_review"
+            ][:1]
+            blocked_tool_calls = [
+                tool_call
+                for tool_call in current_tool_calls
+                if tool_call not in allowed_tool_calls
+            ]
+            updates: dict[str, Any] = {}
+            if blocked_tool_calls:
+                updates["messages"] = [
+                    RemoveMessage(id=REMOVE_ALL_MESSAGES),
+                    *messages[:-1],
+                    _replace_ai_tool_calls(
+                        last_message,
+                        tool_calls=allowed_tool_calls,
+                        fallback_content=(
+                            "Worker finalization only permits submit_for_review."
+                        ),
+                    ),
+                ]
+            if state.get("worker_finalize_reason") == "SCHEMA_REPAIR":
+                updates["worker_schema_repair_model_calls_used"] = (
+                    int(state.get("worker_schema_repair_model_calls_used", 0) or 0)
+                    + 1
+                )
+            return updates or None
 
         if not current_tool_calls:
             return {
@@ -1067,10 +1195,10 @@ class DynamicExecutionBudgetMiddleware(
             - total_used_before,
         )
 
-        request_toolset_remaining = max(
+        show_all_toolsets_remaining = max(
             0,
-            request_toolset_limit
-            - request_toolset_used_before,
+            show_all_toolsets_limit
+            - show_all_toolsets_used_before,
         )
 
         allowed_tool_calls: list[
@@ -1110,8 +1238,8 @@ class DynamicExecutionBudgetMiddleware(
 
             if (
                 tool_name
-                == REQUEST_TOOLSET_NAME
-                and request_toolset_remaining
+                == SHOW_ALL_TOOLSETS_NAME
+                and show_all_toolsets_remaining
                 <= 0
             ):
                 blocked_tool_calls.append(
@@ -1121,7 +1249,7 @@ class DynamicExecutionBudgetMiddleware(
                         ),
 
                         "reason": (
-                            "request_toolset_run_limit"
+                            "show_all_toolsets_run_limit"
                         ),
                     }
                 )
@@ -1136,11 +1264,11 @@ class DynamicExecutionBudgetMiddleware(
 
             if (
                 tool_name
-                == REQUEST_TOOLSET_NAME
+                == SHOW_ALL_TOOLSETS_NAME
             ):
-                request_toolset_remaining -= 1
+                show_all_toolsets_remaining -= 1
 
-        allowed_request_toolset_calls = sum(
+        allowed_show_all_toolsets_calls = sum(
             1
 
             for tool_call
@@ -1149,7 +1277,7 @@ class DynamicExecutionBudgetMiddleware(
             if _read_tool_call_name(
                 tool_call
             )
-            == REQUEST_TOOLSET_NAME
+            == SHOW_ALL_TOOLSETS_NAME
         )
 
         counter_updates = {
@@ -1165,9 +1293,9 @@ class DynamicExecutionBudgetMiddleware(
                 )
             ),
 
-            "request_toolset_calls_used": (
-                request_toolset_used_before
-                + allowed_request_toolset_calls
+            "show_all_toolsets_calls_used": (
+                show_all_toolsets_used_before
+                + allowed_show_all_toolsets_calls
             ),
         }
 
@@ -1217,16 +1345,16 @@ class DynamicExecutionBudgetMiddleware(
                     tool_limit
                 ),
 
-                "request_toolset_limit": (
-                    request_toolset_limit
+                "show_all_toolsets_limit": (
+                    show_all_toolsets_limit
                 ),
 
                 "used_before": (
                     total_used_before
                 ),
 
-                "request_toolset_used_before": (
-                    request_toolset_used_before
+                "show_all_toolsets_used_before": (
+                    show_all_toolsets_used_before
                 ),
 
                 "requested_tool_names": [
@@ -1256,8 +1384,8 @@ class DynamicExecutionBudgetMiddleware(
                     blocked_tool_calls
                 ),
 
-                "budget.request_toolset.limit": (
-                    request_toolset_limit
+                "budget.show_all_toolsets.limit": (
+                    show_all_toolsets_limit
                 ),
             },
         ) as span:
@@ -1284,13 +1412,22 @@ class DynamicExecutionBudgetMiddleware(
                 },
             )
 
-        return {
+        result = {
             **counter_updates,
 
             "messages": (
                 updated_messages
             ),
         }
+        if self.enable_worker_finalization and not allowed_tool_calls:
+            result.update(
+                {
+                    "worker_finalize_requested": True,
+                    "worker_finalize_reason": "TOOL_BUDGET_EXHAUSTED",
+                    "jump_to": "model",
+                }
+            )
+        return result
 
 
 class ToolsetRouterMiddleware(
@@ -1303,15 +1440,26 @@ class ToolsetRouterMiddleware(
         retrieval_models: (
             RetrievalModelManager
         ),
+        *,
+        baseline_tool_names: Sequence[str] = (),
+        minimum_score: float = 0.4,
     ) -> None:
         super().__init__()
 
         self.toolset_router = (
             ToolsetRouter(
-                retrieval_models=(
-                    retrieval_models
-                ),
+                retrieval_models=retrieval_models,
+                minimum_score=minimum_score,
             )
+        )
+
+        # 控制面、报告和按需读取工具不参与业务能力竞争。它们先从
+        # Cross-Encoder候选池移除，再在结果后确定性加回；后续各工具
+        # Middleware仍可执行自己的条件门控。
+        self.baseline_tool_names = frozenset(
+            str(name).strip()
+            for name in baseline_tool_names
+            if str(name).strip()
         )
 
         # 单用户应用：
@@ -1377,15 +1525,50 @@ class ToolsetRouterMiddleware(
             current_messages
         )
 
+        explicit_step_query = str(
+            request_state.get("toolset_route_query") or ""
+        ).strip()
+        raw_tool_access = request_state.get("step_tool_access", "ENABLED")
+        if isinstance(raw_tool_access, bool):
+            tool_access_enabled = raw_tool_access
+        else:
+            normalized_tool_access = str(raw_tool_access or "").strip().upper()
+            tool_access_enabled = normalized_tool_access not in {
+                "DISABLED", "FALSE", "NO", "N", "0", "OFF",
+            }
+        fallback_route_query = _compact_tool_selector_text(
+            str(request_state.get("toolset_route_fallback_query") or "").strip(),
+            max_chars=TOOL_SELECTOR_QUERY_MAX_CHARS,
+        )
+        full_user_request = str(
+            request_state.get("toolset_route_full_user_request")
+            or request_state.get("toolset_route_fallback_query")
+            or ""
+        ).strip()
+        if explicit_step_query:
+            routing_task = _compact_tool_selector_text(
+                explicit_step_query,
+                max_chars=TOOL_SELECTOR_QUERY_MAX_CHARS,
+            )
+            query_source = "scheduler_step_query"
+
+        # Worker在同一个Step里会因为工具结果、运行时提示等新增
+        # HumanMessage；这些消息不代表业务路由目标改变。显式的
+        # Scheduler Step query已经是稳定路由键，因此不再让消息计数
+        # 把同一Step的Cross Encoder缓存击穿。
+        route_cache_turn_number = (
+            0 if explicit_step_query else user_turn_number
+        )
+
         conversation_key = (
             _get_conversation_key(
                 request
             )
         )
 
-        # request_toolset属于控制面工具，
+        # show_all_toolsets属于控制面工具，
         # 不交给本地Router参与业务工具组展开。
-        request_toolset_tool = next(
+        show_all_toolsets_tool = next(
             (
                 current_tool
 
@@ -1396,12 +1579,18 @@ class ToolsetRouterMiddleware(
                     _read_tool_name(
                         current_tool
                     )
-                    == REQUEST_TOOLSET_NAME
+                    == SHOW_ALL_TOOLSETS_NAME
                 )
             ),
 
             None,
         )
+
+        always_visible_tools = [
+            current_tool
+            for current_tool in available_tools
+            if _read_tool_name(current_tool) in self.baseline_tool_names
+        ]
 
         business_tools = [
             current_tool
@@ -1413,7 +1602,9 @@ class ToolsetRouterMiddleware(
                 _read_tool_name(
                     current_tool
                 )
-                != REQUEST_TOOLSET_NAME
+                != SHOW_ALL_TOOLSETS_NAME
+                and _read_tool_name(current_tool)
+                not in self.baseline_tool_names
             )
         ]
 
@@ -1496,6 +1687,8 @@ class ToolsetRouterMiddleware(
                 "routing_task": (
                     routing_task
                 ),
+                "step_tool_access": "ENABLED" if tool_access_enabled else "DISABLED",
+                "fallback_routing_task": fallback_route_query,
 
                 "available_tools": (
                     available_tool_items
@@ -1541,10 +1734,10 @@ class ToolsetRouterMiddleware(
 
                     "control_tool": (
                         _tool_to_trace_item(
-                            request_toolset_tool
+                            show_all_toolsets_tool
                         )
 
-                        if request_toolset_tool
+                        if show_all_toolsets_tool
                         is not None
 
                         else None
@@ -1561,6 +1754,16 @@ class ToolsetRouterMiddleware(
 
                     selected_tools = []
 
+                elif not tool_access_enabled:
+                    # Scheduler已经声明该Step只依赖当前上下文。报告工具仍需保留，
+                    # 使Worker能够提交结果；业务工具和show_all均不挂载。
+                    selection_mode = "scheduler_tools_disabled"
+                    selected_tools = [
+                        current_tool
+                        for current_tool in always_visible_tools
+                        if _read_tool_name(current_tool) in NO_ACCESS_CONTROL_TOOL_NAMES
+                    ]
+
                 elif not available_tools:
                     selection_mode = (
                         "no_tools"
@@ -1569,32 +1772,18 @@ class ToolsetRouterMiddleware(
                     selected_tools = []
 
                 elif not routing_task:
-                    # 无法得到可靠请求时，
-                    # 安全回退为LangChain提供的全部工具。
-                    selection_mode = (
-                        "fallback_all_tools"
-                    )
-
-                    fallback_reason = (
-                        "没有找到有效的工具组路由请求"
-                    )
-
-                    selected_tools = list(
-                        available_tools
-                    )
-
+                    selection_mode = "routing_context_missing"
+                    fallback_reason = "没有找到有效的工具组路由请求"
+                    selected_tools = [
+                        current_tool
+                        for current_tool in always_visible_tools
+                        if _read_tool_name(current_tool) in NO_ACCESS_CONTROL_TOOL_NAMES
+                    ]
                     logger.warning(
-                        "工具组路由没有找到有效请求，"
-                        "本次回退为全部工具。"
+                        "工具组路由没有找到有效请求，本次只保留提交控制工具。"
                     )
 
                 else:
-                    if request_toolset_tool is None:
-                        logger.warning(
-                            "没有发现request_toolset，"
-                            "主模型将无法主动刷新工具组。"
-                        )
-
                     # 工具池发生变化时，
                     # 旧缓存不能继续使用。
                     tool_signature = tuple(
@@ -1630,7 +1819,7 @@ class ToolsetRouterMiddleware(
                         and (
                             cached_entry
                             .user_turn_number
-                            == user_turn_number
+                            == route_cache_turn_number
                         )
 
                         and (
@@ -1638,6 +1827,14 @@ class ToolsetRouterMiddleware(
                             .routing_task
                             == routing_task
                         )
+
+                        and (
+                            cached_entry
+                            .fallback_routing_task
+                            == fallback_route_query
+                        )
+
+                        and cached_entry.tool_access_enabled == tool_access_enabled
 
                         and (
                             cached_entry
@@ -1675,55 +1872,93 @@ class ToolsetRouterMiddleware(
                         )
 
                     if cache_is_usable:
-                        selection_mode = (
-                            "turn_cache"
-                        )
-
                         cache_hit = True
 
-                        selected_toolset_names = list(
-                            cached_entry
-                            .selected_toolset_names
-                        )
+                        if cached_entry.routing_failed:
+                            selection_mode = "turn_cache_model_routing_failed"
+                            fallback_reason = (
+                                cached_entry.fallback_reason
+                                or "本地工具组路由失败（缓存）"
+                            )
+                            selected_tools = [
+                                current_tool
+                                for current_tool in always_visible_tools
+                                if _read_tool_name(current_tool) in NO_ACCESS_CONTROL_TOOL_NAMES
+                            ]
+                        else:
+                            selection_mode = (
+                                "turn_cache"
+                            )
+
+                            selected_toolset_names = list(
+                                cached_entry
+                                .selected_toolset_names
+                            )
 
                     else:
                         router_called = True
 
-                        route_decision = await (
-                            self.toolset_router
-                            .route(
-                                task_text=(
-                                    routing_task
-                                ),
-
-                                available_tools=(
-                                    business_tools
-                                ),
-                            )
+                        route_decision = await self.toolset_router.route(
+                            task_text=routing_task,
+                            available_tools=business_tools,
+                            allow_no_tool=False,
+                            user_request_text=fallback_route_query,
+                            step_weight=TOOLSET_ROUTE_STEP_WEIGHT,
+                            user_weight=TOOLSET_ROUTE_USER_WEIGHT,
                         )
+                        route_stage = "weighted_cross_encoder"
 
                         if route_decision is None:
-                            selection_mode = (
-                                "fallback_all_tools"
+                            route_decision = await self.toolset_router.route_with_model(
+                                getattr(request, "model", None),
+                                primary_task=routing_task,
+                                user_request_window=full_user_request,
+                                available_tools=business_tools,
+                                allow_no_tool=False,
                             )
+                            route_stage = "same_worker_model"
 
-                            fallback_reason = (
-                                "本地工具组路由失败"
-                            )
+                        if route_decision is None:
+                            selection_mode = "model_routing_failed"
+                            fallback_reason = "加权本地路由和同Worker模型均未形成合法工具组"
 
-                            selected_tools = list(
-                                available_tools
-                            )
+                            selected_tools = [
+                                current_tool
+                                for current_tool in always_visible_tools
+                                if _read_tool_name(current_tool) in NO_ACCESS_CONTROL_TOOL_NAMES
+                            ]
 
                             logger.warning(
                                 "本地工具组路由失败，"
-                                "本次回退为全部工具。"
+                                "本次只保留提交控制工具。"
+                            )
+
+                            if (
+                                conversation_key not in self._route_cache
+                                and len(self._route_cache)
+                                >= TOOLSET_ROUTE_CACHE_MAX_CONVERSATIONS
+                            ):
+                                self._route_cache.clear()
+                                cache_reset = True
+
+                            self._route_cache[conversation_key] = (
+                                ToolsetRouteCacheEntry(
+                                    user_turn_number=route_cache_turn_number,
+                                    routing_task=routing_task,
+                                    fallback_routing_task=fallback_route_query,
+                                    tool_access_enabled=tool_access_enabled,
+                                    tool_signature=tool_signature,
+                                    selected_toolset_names=(),
+                                    # 保存完整业务工具签名，使缓存只在真实工具池
+                                    # 完全一致时命中。
+                                    selected_tool_names=(),
+                                    routing_failed=True,
+                                    fallback_reason=fallback_reason,
+                                )
                             )
 
                         else:
-                            selection_mode = (
-                                "toolset_router"
-                            )
+                            selection_mode = route_stage
 
                             selected_toolset_names = list(
                                 route_decision
@@ -1760,12 +1995,18 @@ class ToolsetRouterMiddleware(
                             ] = (
                                 ToolsetRouteCacheEntry(
                                     user_turn_number=(
-                                        user_turn_number
+                                        route_cache_turn_number
                                     ),
 
                                     routing_task=(
                                         routing_task
                                     ),
+
+                                    fallback_routing_task=(
+                                        fallback_route_query
+                                    ),
+
+                                    tool_access_enabled=tool_access_enabled,
 
                                     tool_signature=(
                                         tool_signature
@@ -1791,27 +2032,18 @@ class ToolsetRouterMiddleware(
                             selected_business_tools
                         )
 
-                        # request_toolset始终可见。
-                        #
-                        # 它是控制工具，
-                        # 不属于任何业务工具组。
-                        if request_toolset_tool is not None:
-                            selected_name_set = {
-                                _read_tool_name(
-                                    current_tool
-                                )
+                        selected_name_set = {
+                            _read_tool_name(current_tool)
+                            for current_tool in selected_tools
+                        }
+                        for current_tool in always_visible_tools:
+                            current_name = _read_tool_name(current_tool)
+                            if current_name not in selected_name_set:
+                                selected_tools.append(current_tool)
+                                selected_name_set.add(current_name)
 
-                                for current_tool
-                                in selected_tools
-                            }
-
-                            if (
-                                REQUEST_TOOLSET_NAME
-                                not in selected_name_set
-                            ):
-                                selected_tools.append(
-                                    request_toolset_tool
-                                )
+                        # 工具组一经选中会由Step级缓存持续复用。Worker不再
+                        # 获得动态展开全部工具的入口，避免工具Schema来回变化。
 
                 final_visible_tool_names = [
                     _read_tool_name(
@@ -1842,6 +2074,10 @@ class ToolsetRouterMiddleware(
                             router_called
                         ),
 
+                        "toolset.cache_turn_number": (
+                            route_cache_turn_number
+                        ),
+
                         "toolset.selected_count": len(
                             selected_toolset_names
                         ),
@@ -1854,11 +2090,11 @@ class ToolsetRouterMiddleware(
                             selected_tools
                         ),
 
-                        "tools.request_toolset_visible": (
-                            request_toolset_tool
+                        "tools.show_all_toolsets_visible": (
+                            show_all_toolsets_tool
                             is not None
 
-                            and REQUEST_TOOLSET_NAME
+                            and SHOW_ALL_TOOLSETS_NAME
                             in final_visible_tool_names
                         ),
                     },
@@ -1901,31 +2137,26 @@ class ToolsetRouterMiddleware(
                             in selected_business_tools
                         ],
 
-                        "request_toolset_always_visible": (
-                            request_toolset_tool
+                        "show_all_toolsets_always_visible": (
+                            show_all_toolsets_tool
                             is not None
 
-                            and REQUEST_TOOLSET_NAME
+                            and SHOW_ALL_TOOLSETS_NAME
                             in final_visible_tool_names
                         ),
 
                         "final_visible_tool_names": (
                             final_visible_tool_names
                         ),
+
+                        "visibility_stage": (
+                            "post_route_pre_tool_gates"
+                        ),
                     },
                 )
 
-            # 只有发生正常工具裁剪时才override。
-            #
-            # 路由失败时保留原request，
-            # 相当于回退为全部工具。
+            # 工具列表未变化时避免创建多余request对象。
             if (
-                selection_mode
-                == "fallback_all_tools"
-            ):
-                selected_request = request
-
-            elif (
                 selected_tools
                 == available_tools
             ):

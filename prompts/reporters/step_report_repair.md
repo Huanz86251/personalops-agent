@@ -1,0 +1,3 @@
+上一次报告未通过结构化校验。保留已经完成的审核判断，只修表，不重新执行Worker业务。criterion_results必须用当前C编号逐项覆盖；证据只使用登记的E/A编号。错误：{{validation_error}}
+
+最小形状按判断顺序填写：step_id、summary、stop_reason、status、criterion_results。每个criterion_results项填写criterion_id、criterion、evidence、status；先给证据再下结论，不要自造c1_conclusion之类字段。若请求重规划，先填写replan_reason，再填写request_replan。

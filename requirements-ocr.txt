@@ -1,0 +1,8 @@
+# Short-lived CPU OCR worker. Kept separate from the running Agent environment.
+rapidocr==3.9.2
+onnxruntime==1.29.0
+pdfplumber==0.11.10
+python-pptx==1.0.2
+pillow==12.3.0
+filetype==1.2.0
+markitdown[pdf,docx,xlsx,pptx]==0.1.7

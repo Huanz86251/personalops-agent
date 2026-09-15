@@ -1,3 +1,4 @@
+from runtime_tracing import operation
 from dataclasses import (
     dataclass,
 )
@@ -9,19 +10,35 @@ from langgraph.store.base import (
 from retrieval_models import (
     RetrievalModelManager,
 )
+from memory_write_gate import MemOperatorWriteGate
+from memory_extraction_models import (
+    MemoryFramePlan,
+    PersonRelationRecord,
+    PreferenceRecord,
+    ProfileRecord,
+    ProjectRecord,
+    TaskRecord,
+    TypedRecordBase,
+    compact_schema,
+    selected_output_schema,
+    validate_typed_records,
+)
 import asyncio
 
 from memory_graph import (
     GraphMemoryHit,
     MemoryGraphIndex,
 )
+from memory_lexical import MemoryBM25Index
 from prompt_loader import (
-    load_prompt,
+    render_structured_prompt,
     render_prompt,
 )
 import logging
+import hashlib
 import json
 import re
+import unicodedata
 from datetime import (
     datetime,
     timezone,
@@ -52,16 +69,36 @@ from zoneinfo import (
 MEMORY_NAMESPACE = (
     "memories",
 )
+MEMORY_WRITE_INBOX_NAMESPACE = (
+    "memory_write_inbox",
+)
+MEMORY_WRITE_CANDIDATE_NAMESPACE = (
+    "memory_write_candidates",
+)
+MEMORY_CONFLICT_NAMESPACE = (
+    "memory_conflict_groups",
+)
 MemoryType = Literal[
     "profile",
     "preference",
-    "routine",
+    "relationship",
+    "task",
     "project",
-    "episode",
 ]
 logger = logging.getLogger(
     "agent"
 )
+
+
+def _normalize_memory_key_part(value: Any) -> str:
+    """Normalize one typed key component without translating its meaning."""
+
+    normalized = unicodedata.normalize(
+        "NFC",
+        str(value or ""),
+    ).casefold()
+    normalized = " ".join(normalized.split())
+    return unicodedata.normalize("NFC", normalized)
 
 
 MemoryAction = Literal[
@@ -139,12 +176,6 @@ MEMORY_EXPLICIT_WRITE_PATTERNS = tuple(
             r"保存下来|存下来)"
         ),
 
-        # 明确要求删除或修改记忆。
-        (
-            r"(?:请|帮我|给我)?"
-            r"(?:忘记|忘掉|删除)"
-        ),
-
         r"以后请",
         r"今后请",
         r"从现在开始",
@@ -162,6 +193,25 @@ MEMORY_EXPLICIT_WRITE_PATTERNS = tuple(
 )
 MEMORY_EXPLICIT_WRITE_PATTERNS = tuple(
     MEMORY_EXPLICIT_WRITE_PATTERNS
+)
+
+
+# 明确的秘密值不是长期记忆候选。
+# 这里匹配“字段 + 具体值”，而不是仅匹配“密码”一词，
+# 避免误伤“我习惯使用密码管理器”这类正常偏好。
+MEMORY_SENSITIVE_VALUE_PATTERNS = tuple(
+    re.compile(
+        pattern,
+        flags=re.IGNORECASE,
+    )
+    for pattern in (
+        r"(?:密码|口令|验证码|支付密码)\s*(?:是|为|[:：=])\s*\S+",
+        r"(?:password|passcode|otp|verification[ _-]?code)\s*[:=]\s*\S+",
+        r"(?:api[ _-]?key|access[ _-]?token|refresh[ _-]?token|secret)\s*[:=]\s*\S+",
+        r"\bsk-[A-Za-z0-9_-]{12,}\b",
+        r"\bAKIA[A-Z0-9]{16}\b",
+        r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
+    )
 )
 def _message_content_to_text(
     content: Any,
@@ -340,6 +390,46 @@ def _normalize_memory_timestamp(
         )
 
     return parsed_time.isoformat()
+
+
+def _memory_intervals_overlap(
+    left: dict[str, Any],
+    right: dict[str, Any],
+) -> bool:
+    """Treat missing bounds as open and compare two validity intervals."""
+
+    left_start = _parse_memory_timestamp(left.get("valid_from"))
+    left_end = _parse_memory_timestamp(left.get("expires_at"))
+    right_start = _parse_memory_timestamp(right.get("valid_from"))
+    right_end = _parse_memory_timestamp(right.get("expires_at"))
+    if left_end is not None and right_start is not None and left_end < right_start:
+        return False
+    if right_end is not None and left_start is not None and right_end < left_start:
+        return False
+    return True
+
+
+def _typed_memory_values_conflict(
+    left: dict[str, Any],
+    right: dict[str, Any],
+) -> bool:
+    """Hard conflict rule: same slot/confidence, different fact, overlapping time."""
+
+    left_data = left.get("structured_data", {})
+    right_data = right.get("structured_data", {})
+    if not isinstance(left_data, dict) or not isinstance(right_data, dict):
+        return False
+    left_key = str(left_data.get("conflict_key", "") or "")
+    right_key = str(right_data.get("conflict_key", "") or "")
+    if not left_key or left_key != right_key:
+        return False
+    if left.get("confidence") != right.get("confidence"):
+        return False
+    left_dedupe = str(left_data.get("dedupe_key", "") or "")
+    right_dedupe = str(right_data.get("dedupe_key", "") or "")
+    if not left_dedupe or left_dedupe == right_dedupe:
+        return False
+    return _memory_intervals_overlap(left, right)
 class MemoryTripleCandidate(
     BaseModel
 ):
@@ -409,6 +499,12 @@ class MemoryCandidate(
         default_factory=list,
     )
 
+    # 新版渐进式抽取保留规范化记录和本地回填的证据。
+    # 旧调用不提供时仍保持完全兼容。
+    record_type: str | None = None
+    structured_data: dict[str, Any] = Field(default_factory=dict)
+    evidence: list[dict[str, Any]] = Field(default_factory=list)
+
     @field_validator(
         "valid_from",
         "expires_at",
@@ -452,20 +548,15 @@ class MemoryCandidate(
             )
 
         return self
-class MemoryExtractionResult(
-    BaseModel
-):
-    """表示一次对话轮次的记忆提取结果。"""
-
-    memories: list[
-        MemoryCandidate
-    ] = Field(
-        default_factory=list,
-    )
 class MemoryResolution(
     BaseModel
 ):
     """表示新旧记忆之间的处理决定。"""
+
+    reason: str = Field(
+        default="",
+        description="先说明候选与既有记忆的关系和选择依据，再填写action。",
+    )
 
     action: MemoryAction
 
@@ -493,13 +584,6 @@ class MemoryResolution(
         str
         | None
     ) = None
-    final_triples: list[
-        MemoryTripleCandidate
-    ] = Field(
-        default_factory=list,
-    )
-
-    reason: str = ""
     @field_validator(
         "final_valid_from",
         "final_expires_at",
@@ -522,6 +606,7 @@ class RetrievedMemory:
 
     memory_type: str
     importance: int
+    confidence: int = 2
 
     valid_from: (
         str
@@ -538,7 +623,19 @@ class RetrievedMemory:
         | None
     ) = None
 
+    lexical_score: (
+        float
+        | None
+    ) = None
+
     rerank_score: (
+        float
+        | None
+    ) = None
+
+    # Cross-Encoder分数乘以本地置信度权重后的最终排序分。
+    # 原始相关性仍保留在rerank_score中，便于审计阈值行为。
+    retrieval_score: (
         float
         | None
     ) = None
@@ -549,6 +646,17 @@ class RetrievedMemory:
         int
         | None
     ) = None
+
+
+@dataclass(frozen=True)
+class MemoryConflictPair:
+    """One deterministic, user-resolvable pair inside a conflict group."""
+
+    group_id: str
+    conflict_key: str
+    left: dict[str, Any]
+    right: dict[str, Any]
+    remaining_pair_count: int
 def _retrieved_memory_to_trace_item(
     memory: RetrievedMemory,
 ) -> dict[
@@ -572,6 +680,10 @@ def _retrieved_memory_to_trace_item(
 
         "importance": (
             memory.importance
+        ),
+
+        "confidence": (
+            memory.confidence
         ),
 
         "valid_from": (
@@ -601,6 +713,30 @@ def _retrieved_memory_to_trace_item(
             )
 
             if memory.rerank_score
+            is not None
+
+            else None
+        ),
+
+        "lexical_score": (
+            round(
+                memory.lexical_score,
+                6,
+            )
+
+            if memory.lexical_score
+            is not None
+
+            else None
+        ),
+
+        "retrieval_score": (
+            round(
+                memory.retrieval_score,
+                6,
+            )
+
+            if memory.retrieval_score
             is not None
 
             else None
@@ -670,10 +806,16 @@ class MemoryService:
                     "Asia/Shanghai"
             ),
             dense_limit: int = 8,
+            lexical_limit: int = 8,
             final_limit: int = 2,
             resolution_limit: int = 3,
             graph_hops: int = 2,
             graph_limit: int = 6,
+            reranker_threshold: float = 0.4,
+            write_gate: MemOperatorWriteGate | None = None,
+            write_gate_batch_size: int = 3,
+            extraction_enabled: bool = False,
+            extraction_batch_size: int = 10,
     ) -> None:
         self.store = store
 
@@ -702,6 +844,15 @@ class MemoryService:
             dense_limit
         )
 
+        if lexical_limit < 1:
+            raise ValueError(
+                "lexical_limit必须大于等于1。"
+            )
+
+        self.lexical_limit = (
+            lexical_limit
+        )
+
         self.final_limit = (
             final_limit
         )
@@ -718,8 +869,34 @@ class MemoryService:
             graph_limit
         )
 
+        if not 0.0 <= reranker_threshold <= 1.0:
+            raise ValueError(
+                "reranker_threshold必须在0到1之间。"
+            )
+
+        self.reranker_threshold = (
+            reranker_threshold
+        )
+
+        if not 1 <= write_gate_batch_size <= 32:
+            raise ValueError(
+                "write_gate_batch_size必须在1到32之间。"
+            )
+
+        self.write_gate = write_gate
+        self.write_gate_batch_size = write_gate_batch_size
+        self._write_gate_lock = asyncio.Lock()
+        if not 1 <= extraction_batch_size <= 32:
+            raise ValueError("extraction_batch_size必须在1到32之间。")
+        self.extraction_enabled = extraction_enabled
+        self.extraction_batch_size = extraction_batch_size
+        self._extraction_lock = asyncio.Lock()
+
         self.graph_index = (
             MemoryGraphIndex()
+        )
+        self.lexical_index = (
+            MemoryBM25Index()
         )
     async def retire_expired_memories(
         self,
@@ -863,16 +1040,14 @@ class MemoryService:
             )
 
         return expired_memory_ids
-
-
-        return expired_memory_ids
     async def rebuild_graph_index(
             self,
             page_size: int = 200,
     ) -> None:
-        """从SQLite Store中的active记忆重建NetworkX图。"""
+        """从SQLite Store中的active记忆重建图与BM25辅助索引。"""
 
         self.graph_index.clear()
+        self.lexical_index.clear()
 
         offset = 0
 
@@ -940,6 +1115,11 @@ class MemoryService:
                     )
                 )
 
+                self.lexical_index.add_memory(
+                    memory_id,
+                    value,
+                )
+
                 if edge_count:
                     indexed_memory_count += 1
 
@@ -965,6 +1145,10 @@ class MemoryService:
             ],
             *,
             dense_score: (
+                    float
+                    | None
+            ) = None,
+            lexical_score: (
                     float
                     | None
             ) = None,
@@ -1039,6 +1223,17 @@ class MemoryService:
         ):
             importance = 2
 
+        confidence = value.get(
+            "confidence",
+            2,
+        )
+
+        if not isinstance(
+            confidence,
+            int,
+        ) or confidence not in {1, 2, 3, 4}:
+            confidence = 2
+
         valid_from = value.get(
             "valid_from"
         )
@@ -1072,6 +1267,10 @@ class MemoryService:
                 importance
             ),
 
+            confidence=(
+                confidence
+            ),
+
             valid_from=(
                 valid_from
             ),
@@ -1082,6 +1281,10 @@ class MemoryService:
 
             dense_score=(
                 dense_score
+            ),
+
+            lexical_score=(
+                lexical_score
             ),
 
             graph_distance=(
@@ -1210,6 +1413,10 @@ class MemoryService:
         ):
             return "NOT_RECORD"
 
+        for pattern in MEMORY_SENSITIVE_VALUE_PATTERNS:
+            if pattern.search(user_text):
+                return "NOT_RECORD"
+
         for pattern in (
                 MEMORY_EXPLICIT_WRITE_PATTERNS
         ):
@@ -1321,7 +1528,7 @@ class MemoryService:
             )
 
             prompt = render_prompt(
-                "memory_write_gate",
+                "memory/write_gate",
 
                 user_message=(
                     compact_text
@@ -1657,7 +1864,7 @@ class MemoryService:
             )
 
             prompt = render_prompt(
-                "memory_resolution_gate",
+                "memory/resolution_gate",
 
                 candidate_memory=(
                     compact_candidate
@@ -1835,7 +2042,7 @@ class MemoryService:
     async def warmup_router_cache(
             self,
     ) -> None:
-        """启动时预热三个长期记忆Gate的Prompt缓存。"""
+        """启动时仅预热仍位于活跃路径上的长期记忆Gate。"""
 
         if not (
                 self.retrieval_models
@@ -1853,7 +2060,7 @@ class MemoryService:
                 "记忆写入门控",
 
                 render_prompt(
-                    "memory_write_gate",
+                    "memory/write_gate",
 
                     user_message=(
                         "我最近开始学习游泳。"
@@ -1864,29 +2071,10 @@ class MemoryService:
             ),
 
             (
-                "记忆关系门控",
-
-                render_prompt(
-                    "memory_resolution_gate",
-
-                    candidate_memory=(
-                        "用户最近开始学习游泳。"
-                    ),
-
-                    existing_memories=(
-                        "1. [preference] "
-                        "用户喜欢进行体育活动。"
-                    ),
-                ),
-
-                MEMORY_RESOLUTION_GATE_LABELS,
-            ),
-
-            (
                 "记忆读取门控",
 
                 render_prompt(
-                    "memory_read_gate",
+                    "memory/read_gate",
 
                     user_message=(
                         "给我推荐适合初学者的运动。"
@@ -2020,225 +2208,271 @@ class MemoryService:
             ),
         )
 
-    async def extract_candidates(
-            self,
-            user_text: str,
-            assistant_text: str,
-    ) -> list[MemoryCandidate]:
-        """从一轮成功对话中提取长期记忆候选。"""
+    @staticmethod
+    def _typed_record_to_candidate(
+            record: TypedRecordBase,
+            source_value: dict[str, Any],
+    ) -> MemoryCandidate:
+        """Convert a validated typed record to the compatible memory store model."""
 
-        current_time = datetime.now(
-            self.timezone
+        importance_values = {"low": 1, "medium": 2, "high": 3, "urgent": 4}
+        confidence_values = {"low": 1, "medium": 2, "high": 4}
+        triples: list[MemoryTripleCandidate] = []
+        valid_from: str | None = None
+        valid_to: str | None = None
+        memory_type: MemoryType
+
+        if isinstance(record, ProfileRecord):
+            memory_type = "profile"
+            valid_from, valid_to = record.valid_from, record.valid_to
+            triples.append(MemoryTripleCandidate(
+                subject="用户", subject_type="person",
+                relation=f"profile_{record.field}",
+                object=record.value, object_type="profile_value",
+            ))
+        elif isinstance(record, PreferenceRecord):
+            memory_type = "preference"
+            valid_from, valid_to = record.valid_from, record.valid_to
+            triples.append(MemoryTripleCandidate(
+                subject="用户", subject_type="person",
+                relation=record.preference,
+                object=record.topic, object_type="preference_topic",
+            ))
+        elif isinstance(record, PersonRelationRecord):
+            memory_type = "relationship"
+            valid_from, valid_to = record.valid_from, record.valid_to
+            relation_names = {
+                "mentor": "mentor_of",
+                "friend": "friend_of",
+                "coworker": "coworker_of",
+                "leader": "leader_of",
+                "team_member": "team_member_of",
+                "family": "family_of",
+                "partner": "partner_of",
+                "client": "client_of",
+                "service_provider": "service_provider_for",
+                "acquaintance": "acquaintance_of",
+                "other": "related_to",
+            }
+            triples.append(MemoryTripleCandidate(
+                subject=record.person_name, subject_type="person",
+                relation=relation_names[record.relation],
+                object="用户", object_type="person",
+            ))
+        elif isinstance(record, ProjectRecord):
+            memory_type = "project"
+            valid_from, valid_to = record.valid_from, record.valid_to
+            triples.append(MemoryTripleCandidate(
+                subject=record.project_name, subject_type="project",
+                relation=f"project_{record.fact}",
+                object=record.value, object_type="project_value",
+            ))
+        elif isinstance(record, TaskRecord):
+            memory_type = "task"
+            valid_to = record.due_at
+            if record.from_person:
+                triples.append(MemoryTripleCandidate(
+                    subject=record.from_person, subject_type="person",
+                    relation={
+                        "request": "requested_task",
+                        "order": "ordered_task",
+                        "promise": "promised_task",
+                        "reminder": "reminded_task",
+                        "update": "updated_task",
+                        "cancel": "cancelled_task",
+                    }[record.event],
+                    object=record.object or record.action,
+                    object_type="task",
+                ))
+        else:  # pragma: no cover - protected by typed validation dispatch.
+            raise TypeError(f"Unsupported typed memory record: {type(record).__name__}")
+
+        evidence = {
+            "candidate_id": record.candidate_id,
+            "source_text": str(source_value.get("raw_user_text", "")),
+            "source_time": str(source_value.get("queued_at", "")),
+            "source_platform": str(source_value.get("source_platform", "")),
+            "source_conversation_id": str(
+                source_value.get("source_conversation_id", "")
+            ),
+            "source_thread_id": str(source_value.get("source_thread_id", "")),
+        }
+        data = record.model_dump(mode="json")
+        if isinstance(record, ProfileRecord):
+            dedupe_parts = [record.record_type, record.field, record.value]
+            conflict_parts = [record.record_type, record.field]
+        elif isinstance(record, PreferenceRecord):
+            dedupe_parts = [
+                record.record_type, record.preference, record.topic,
+                record.scope, record.scope_name,
+            ]
+            conflict_parts = [
+                record.record_type, record.topic, record.scope, record.scope_name,
+            ]
+        elif isinstance(record, PersonRelationRecord):
+            dedupe_parts = [
+                record.record_type, record.person_name, record.relation,
+                record.other_relation, record.state,
+            ]
+            conflict_parts = [
+                record.record_type, record.person_name, record.relation,
+                record.other_relation,
+            ]
+        elif isinstance(record, ProjectRecord):
+            dedupe_parts = [
+                record.record_type, record.project_name, record.fact, record.value,
+            ]
+            conflict_parts = [record.record_type, record.project_name, record.fact]
+        else:
+            dedupe_parts = [
+                record.record_type, record.event, record.from_person, record.to_person,
+                record.action, record.object, record.project_name, record.status,
+                record.due_at,
+            ]
+            conflict_parts = [
+                record.record_type, record.from_person, record.to_person,
+                record.action, record.object, record.project_name,
+            ]
+        data["dedupe_key"] = "|".join(
+            _normalize_memory_key_part(value) for value in dedupe_parts
         )
+        data["conflict_key"] = "|".join(
+            _normalize_memory_key_part(value) for value in conflict_parts
+        )
+        return MemoryCandidate(
+            content=record.summary,
+            memory_type=memory_type,
+            importance=importance_values[record.importance],
+            confidence=confidence_values[record.confidence],
+            valid_from=valid_from,
+            expires_at=valid_to,
+            triples=triples,
+            record_type=record.record_type,
+            structured_data=data,
+            evidence=[evidence],
+        )
+
+    @staticmethod
+    def _validate_frame_plan(
+            plan: MemoryFramePlan,
+            candidate_ids: list[str],
+    ) -> dict[tuple[str, str], str]:
+        """Reject missing, invented, or duplicate candidate/frame identifiers."""
+
+        expected = set(candidate_ids)
+        returned = [item.candidate_id for item in plan.candidates]
+        if len(returned) != len(set(returned)) or set(returned) != expected:
+            raise RuntimeError("第一轮必须逐个返回输入中的candidate_id，且不能新增或遗漏。")
+
+        frames: dict[tuple[str, str], str] = {}
+        for item in plan.candidates:
+            for frame in item.frames:
+                key = (item.candidate_id, frame.frame_id)
+                if key in frames:
+                    raise RuntimeError("同一candidate中的frame_id必须唯一。")
+                frames[key] = frame.frame_type
+        return frames
+
+    @operation('Memory Extractor / Extract Typed Records', fields=('batch_values',))
+    async def extract_progressive_batch(
+            self,
+            batch_values: list[tuple[str, dict[str, Any]]],
+    ) -> tuple[MemoryFramePlan, list[TypedRecordBase]]:
+        """Run cache-friendly frame planning followed by selected typed schemas."""
 
         payload = {
-            "current_time": (
-                current_time.isoformat(
-                    timespec="seconds"
-                )
-            ),
-
-            "timezone": (
-                self.timezone_name
-            ),
-
-            "user_message": (
-                user_text
-            ),
-
-            "assistant_reply": (
-                assistant_text
-            ),
-        }
-
-        system_prompt = load_prompt(
-            "memory_extraction"
-        )
-
-        with trace_span(
-                "memory.extraction",
-
-                # 外层还负责JSON提取、Pydantic校验、
-                # 最多保留三条候选等业务处理。
-                #
-                # 真正的模型调用由自动Instrumentation
-                # 生成LLM子节点。
-                kind="chain",
-
-                input_value={
-                    "system_prompt": (
-                            system_prompt
-                    ),
-
-                    "user_payload": (
-                            payload
-                    ),
-
-                    "candidate_limit": 3,
-                },
-
-                attributes={
-                    "memory.extraction.user_chars": len(
-                        user_text
-                    ),
-
-                    "memory.extraction.assistant_chars": len(
-                        assistant_text
-                    ),
-
-                    "memory.extraction.candidate_limit": 3,
-                },
-        ) as span:
-
-            response = await self.model.ainvoke(
-                [
-                    {
-                        "role": "system",
-
-                        "content": (
-                            system_prompt
-                        ),
-                    },
-                    {
-                        "role": "user",
-
-                        "content": json.dumps(
-                            payload,
-                            ensure_ascii=False,
-                        ),
-                    },
-                ]
-            )
-
-            response_text = (
-                _message_content_to_text(
-                    response.content
-                )
-            )
-
-            json_text: (
-                    str
-                    | None
-            ) = None
-
-            try:
-                json_text = (
-                    _extract_json_object(
-                        response_text
-                    )
-                )
-
-                result = (
-                    MemoryExtractionResult
-                    .model_validate_json(
-                        json_text
-                    )
-                )
-
-            except (
-                    RuntimeError,
-                    ValidationError,
-            ) as error:
-                set_span_attributes(
-                    span,
-
-                    **{
-                        "memory.extraction.parse_status": (
-                            "failed"
-                        ),
-                    },
-                )
-
-                set_span_output(
-                    span,
-
-                    {
-                        "parse_status": (
-                            "failed"
-                        ),
-
-                        "raw_model_output": (
-                            response_text
-                        ),
-
-                        "extracted_json": (
-                            json_text
-                        ),
-
-                        "error": (
-                            f"{type(error).__name__}: "
-                            f"{error}"
-                        ),
-                    },
-                )
-
-                raise RuntimeError(
-                    "记忆提取结果不符合结构要求。"
-                ) from error
-
-            candidates = (
-                result.memories[:3]
-            )
-
-            candidate_items = [
-                _memory_candidate_to_trace_item(
-                    candidate
-                )
-
-                for candidate
-                in candidates
-            ]
-
-            set_span_attributes(
-                span,
-
-                **{
-                    "memory.extraction.parse_status": (
-                        "success"
-                    ),
-
-                    "memory.extraction.candidate_count": (
-                        len(
-                            candidates
-                        )
-                    ),
-                },
-            )
-
-            set_span_output(
-                span,
-
+            "timezone": self.timezone_name,
+            "candidates": [
                 {
-                    "parse_status": (
-                        "success"
-                    ),
+                    "candidate_id": candidate_id,
+                    "source_time": value.get("queued_at"),
+                    "user_text": value.get("raw_user_text", ""),
+                }
+                for candidate_id, value in batch_values
+            ],
+        }
+        system_prompt = render_prompt(
+            "memory/frame_detection",
+            schema=json.dumps(
+                compact_schema(MemoryFramePlan.model_json_schema()),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+        initial_messages = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            },
+        ]
+        with trace_span("Memory Extractor / Frame Plan", input_value={"candidate_count": len(batch_values)}) as frame_span:
+            first_response = await self.model.ainvoke(initial_messages)
+            set_span_output(frame_span, {"response": _message_content_to_text(first_response.content)})
+        first_text = _message_content_to_text(first_response.content)
+        with trace_span("Memory Extractor / Validate Frame Plan") as validation_span:
+            try:
+                first_json = _extract_json_object(first_text)
+                plan = MemoryFramePlan.model_validate_json(first_json)
+                frame_map = self._validate_frame_plan(
+                    plan, [candidate_id for candidate_id, _ in batch_values]
+                )
+                set_span_output(validation_span, plan)
+            except (RuntimeError, ValidationError) as error:
+                raise RuntimeError("记忆第一轮分帧结果不符合结构要求。") from error
 
-                    "raw_model_output": (
-                        response_text
-                    ),
+        selected_types = set(frame_map.values())
+        if not selected_types:
+            return plan, []
 
-                    "extracted_json": (
-                        json_text
-                    ),
-
-                    "candidate_count": (
-                        len(
-                            candidates
-                        )
-                    ),
-
-                    "parsed_candidates": (
-                        candidate_items
-                    ),
-                },
+        typed_schema = selected_output_schema(selected_types)
+        typed_prompt = render_prompt(
+            "memory/typed_extraction",
+            schema=json.dumps(typed_schema, ensure_ascii=False, separators=(",", ":")),
+        )
+        # Preserve the exact first request as the prefix. DeepSeek remains stateless,
+        # but this layout makes the repeated prefix eligible for provider caching.
+        second_messages = [
+            *initial_messages,
+            {"role": "assistant", "content": first_text},
+            {"role": "user", "content": typed_prompt},
+        ]
+        with trace_span("Memory Extractor / Typed Fields", input_value={"selected_types": sorted(selected_types)}) as typed_span:
+            second_response = await self.model.ainvoke(second_messages)
+            set_span_output(typed_span, {"response": _message_content_to_text(second_response.content)})
+        second_text = _message_content_to_text(second_response.content)
+        try:
+            second_json = _extract_json_object(second_text)
+            raw_payload = json.loads(second_json)
+            records = validate_typed_records(
+                raw_payload, allowed_frame_types=selected_types,
             )
+        except (RuntimeError, ValueError, ValidationError, json.JSONDecodeError) as error:
+            raise RuntimeError("记忆第二轮详细抽取结果不符合结构要求。") from error
 
-            return candidates
+        returned_frames: set[tuple[str, str]] = set()
+        for record in records:
+            key = (record.candidate_id, record.frame_id)
+            if key in returned_frames or frame_map.get(key) != record.record_type:
+                raise RuntimeError("第二轮记录必须与第一轮frame逐项且同类型对应。")
+            returned_frames.add(key)
+        if returned_frames != set(frame_map):
+            raise RuntimeError("第二轮不得遗漏第一轮选择的frame。")
+        return plan, records
+
     async def _dense_retrieve(
         self,
         query: str,
     ) -> list[RetrievedMemory]:
         """通过LangGraph Store执行Dense语义召回。"""
+
+        # 无 query 的限量查询不触发 embedding；空库无需计算请求向量。
+        # 直接查持久 Store，不能把尚未重建的内存索引为空误当作数据库为空。
+        existing = await self.store.asearch(
+            MEMORY_NAMESPACE, filter={"status": "active"}, limit=1,
+        )
+        if not existing:
+            return []
 
         items = await self.store.asearch(
             MEMORY_NAMESPACE,
@@ -2272,13 +2506,64 @@ class MemoryService:
 
         return memories
 
+    async def _bm25_retrieve(
+        self,
+        query: str,
+    ) -> list[RetrievedMemory]:
+        """从本地BM25索引召回精确词项候选。"""
+
+        hits = self.lexical_index.search(
+            query,
+            limit=self.lexical_limit,
+        )
+        if not hits:
+            return []
+
+        items = await asyncio.gather(
+            *[
+                self.store.aget(
+                    MEMORY_NAMESPACE,
+                    hit.memory_id,
+                )
+                for hit in hits
+            ]
+        )
+        memories: list[RetrievedMemory] = []
+        for hit, item in zip(hits, items):
+            if item is None:
+                self.lexical_index.remove_memory(
+                    hit.memory_id
+                )
+                continue
+
+            value = getattr(item, "value", None)
+            if not isinstance(value, dict):
+                self.lexical_index.remove_memory(
+                    hit.memory_id
+                )
+                continue
+
+            memory = self._value_to_memory(
+                memory_id=hit.memory_id,
+                value=value,
+                lexical_score=hit.score,
+            )
+            if memory is None:
+                self.lexical_index.remove_memory(
+                    hit.memory_id
+                )
+                continue
+            memories.append(memory)
+
+        return memories
+
     async def _retrieve_graph_memories(
             self,
             seed_memories: list[
                 RetrievedMemory
             ],
     ) -> list[RetrievedMemory]:
-        """从向量种子记忆出发执行多跳图扩展。"""
+        """从混合召回种子记忆出发执行多跳图扩展。"""
 
         seed_memory_items = (
             _retrieved_memories_to_trace_items(
@@ -2608,7 +2893,7 @@ class MemoryService:
                 RetrievedMemory
             ],
     ) -> list[RetrievedMemory]:
-        """按memory_id合并向量候选和图候选。"""
+        """按memory_id合并Dense、BM25和图候选。"""
 
         merged: dict[
             str,
@@ -2641,6 +2926,21 @@ class MemoryService:
                     if existing.dense_score
                        is not None
                     else memory.dense_score
+                )
+
+                lexical_scores = [
+                    score
+                    for score in (
+                        existing.lexical_score,
+                        memory.lexical_score,
+                    )
+                    if score is not None
+                ]
+
+                lexical_score = (
+                    max(lexical_scores)
+                    if lexical_scores
+                    else None
                 )
 
                 graph_distances = [
@@ -2677,6 +2977,21 @@ class MemoryService:
                     else None
                 )
 
+                retrieval_scores = [
+                    score
+                    for score in (
+                        existing.retrieval_score,
+                        memory.retrieval_score,
+                    )
+                    if score is not None
+                ]
+
+                retrieval_score = (
+                    max(retrieval_scores)
+                    if retrieval_scores
+                    else None
+                )
+
                 merged[
                     memory.memory_id
                 ] = RetrievedMemory(
@@ -2696,6 +3011,10 @@ class MemoryService:
                         existing.importance,
                         memory.importance,
                     ),
+                    confidence=max(
+                        existing.confidence,
+                        memory.confidence,
+                    ),
                     valid_from=(
                         existing.valid_from
                     ),
@@ -2707,8 +3026,16 @@ class MemoryService:
                         dense_score
                     ),
 
+                    lexical_score=(
+                        lexical_score
+                    ),
+
                     rerank_score=(
                         rerank_score
+                    ),
+
+                    retrieval_score=(
+                        retrieval_score
                     ),
 
                     graph_distance=(
@@ -2756,10 +3083,9 @@ class MemoryService:
                 query=query,
                 documents=documents,
 
-                top_k=min(
-                    resolved_limit,
-                    len(memories),
-                ),
+                # 先取回全部语义候选，再由宿主叠加置信度权重。
+                # 否则低置信候选可能在本地加权前就占满top_k。
+                top_k=len(memories),
             )
         )
 
@@ -2768,9 +3094,22 @@ class MemoryService:
         ] = []
 
         for result in ranked_results:
+            # BCE Reranker输出经过Sigmoid归一化后的
+            # 相关性分数。低于阈值的候选不再作为图种子、
+            # 冲突候选或最终注入记忆。
+            if result.score < self.reranker_threshold:
+                continue
+
             original = memories[
                 result.index
             ]
+
+            confidence_weight = {
+                1: 0.80,
+                2: 0.90,
+                3: 1.00,
+                4: 1.00,
+            }.get(original.confidence, 0.90)
 
             reranked_memories.append(
                 RetrievedMemory(
@@ -2789,6 +3128,9 @@ class MemoryService:
                     importance=(
                         original.importance
                     ),
+                    confidence=(
+                        original.confidence
+                    ),
                     valid_from=(
                         original.valid_from
                     ),
@@ -2800,8 +3142,16 @@ class MemoryService:
                         original.dense_score
                     ),
 
+                    lexical_score=(
+                        original.lexical_score
+                    ),
+
                     rerank_score=(
                         result.score
+                    ),
+                    retrieval_score=(
+                        result.score
+                        * confidence_weight
                     ),
                     graph_distance=(
                         original.graph_distance
@@ -2810,18 +3160,61 @@ class MemoryService:
 
             )
 
-        return reranked_memories
+        reranked_memories.sort(
+            key=lambda memory: (
+                memory.retrieval_score
+                if memory.retrieval_score is not None
+                else -1.0,
+                memory.rerank_score
+                if memory.rerank_score is not None
+                else -1.0,
+                memory.importance,
+            ),
+            reverse=True,
+        )
+        selected = reranked_memories[:resolved_limit]
+        ranks = {m.memory_id:i+1 for i,m in enumerate(reranked_memories)}
+        selected_ids = {m.memory_id for m in selected}
+        rows = []
+        for ce_rank,result in enumerate(ranked_results,1):
+            original = memories[result.index]
+            weight = {1:.80,2:.90,3:1.,4:1.}.get(original.confidence,.90)
+            rows.append({'candidate_index':result.index,'memory_id':original.memory_id,
+                'content':original.content,'confidence':original.confidence,'importance':original.importance,'confidence_weight':weight,
+                'cross_encoder_score':float(result.score),'cross_encoder_rank':ce_rank,
+                'weighted_score':float(result.score)*weight,'final_rank':ranks.get(original.memory_id),
+                'selected':original.memory_id in selected_ids,
+                'decision':'below_threshold' if result.score < self.reranker_threshold else
+                    'selected' if original.memory_id in selected_ids else 'outside_top_k'})
+        with trace_span('Memory / Ranking Decisions',kind='reranker',input_value={
+            'threshold':self.reranker_threshold,'top_k':resolved_limit,
+            'rule':'Filter raw CE score, then sort by CE*confidence_weight, CE score, importance descending',
+            'score_meaning':'CE relevance score is not calibrated correctness probability; confidence is stored memory reliability'}) as audit_span:
+            set_span_output(audit_span,{'candidates':rows,'selected_memory_ids':[m.memory_id for m in selected]})
+        return selected
 
     async def resolve_candidate(
             self,
             candidate: MemoryCandidate,
     ) -> MemoryResolution:
-        """判断候选应新增、合并、替代、共存或忽略。"""
+        """Legacy entry point kept deterministic; the write path groups conflicts."""
 
         candidate_item = (
             _memory_candidate_to_trace_item(
                 candidate
             )
+        )
+
+        duplicate_memory_ids = await self._find_typed_duplicate_ids(candidate)
+        if duplicate_memory_ids:
+            return MemoryResolution(
+                action="IGNORE",
+                target_memory_ids=duplicate_memory_ids,
+                reason="deterministic_typed_duplicate",
+            )
+        return MemoryResolution(
+            action="ADD",
+            reason="deterministic_conflict_grouping_handles_disagreement_after_write",
         )
 
         candidate_triples = [
@@ -3148,8 +3541,8 @@ class MemoryService:
             ],
         }
 
-        system_prompt = load_prompt(
-            "memory_resolution"
+        system_prompt = render_structured_prompt(
+            "memory/resolution", MemoryResolution,
         )
 
         with trace_span(
@@ -3401,7 +3794,7 @@ class MemoryService:
 
         try:
             prompt = render_prompt(
-                "memory_read_gate",
+                "memory/read_gate",
 
                 user_message=(
                     compact_user_text
@@ -3790,10 +4183,9 @@ class MemoryService:
                     or candidate.memory_type
             )
 
-            final_triples = (
-                    resolution.final_triples
-                    or candidate.triples
-            )
+            # Relations are emitted only by the host's typed mapping.  The
+            # resolver may choose lifecycle actions but cannot invent graph edges.
+            final_triples = candidate.triples
 
             final_valid_from = (
                 candidate.valid_from
@@ -3854,9 +4246,13 @@ class MemoryService:
                     candidate.importance
                 ),
 
+                "importance_label": candidate.structured_data.get("importance"),
+
                 "confidence": (
                     candidate.confidence
                 ),
+
+                "confidence_label": candidate.structured_data.get("confidence"),
 
                 "triples": [
                     triple.model_dump(
@@ -3866,6 +4262,12 @@ class MemoryService:
                     for triple
                     in final_triples
                 ],
+
+                "record_type": candidate.record_type,
+
+                "structured_data": candidate.structured_data,
+
+                "evidence": candidate.evidence,
 
                 "created_at": (
                     now
@@ -3956,6 +4358,20 @@ class MemoryService:
                     memory_id,
                 )
 
+            lexical_sync_status = "success"
+            try:
+                self.lexical_index.add_memory(
+                    memory_id,
+                    value,
+                )
+            except Exception:
+                lexical_sync_status = "failed"
+                logger.exception(
+                    "长期记忆已写入Store，但同步到BM25索引失败 | "
+                    "memory_id=%s",
+                    memory_id,
+                )
+
             set_span_attributes(
                 span,
 
@@ -3978,6 +4394,10 @@ class MemoryService:
 
                     "memory.graph_edge_count": (
                         graph_edge_count
+                    ),
+
+                    "memory.lexical_sync_status": (
+                        lexical_sync_status
                     ),
                 },
             )
@@ -4205,6 +4625,10 @@ class MemoryService:
                     memory_id,
                 )
 
+            self.lexical_index.remove_memory(
+                memory_id
+            )
+
             results.append(
                 {
                     "memory_id": (
@@ -4284,33 +4708,6 @@ class MemoryService:
                     ),
                 },
         ) as span:
-
-            if candidate.confidence < 3:
-                set_span_attributes(
-                    span,
-
-                    **{
-                        "memory.apply.status": (
-                            "skipped_low_confidence"
-                        ),
-                    },
-                )
-
-                set_span_output(
-                    span,
-
-                    {
-                        "status": (
-                            "skipped_low_confidence"
-                        ),
-
-                        "stored_memory_id": None,
-
-                        "retirement_results": [],
-                    },
-                )
-
-                return None
 
             if resolution.action == "IGNORE":
                 set_span_attributes(
@@ -4499,230 +4896,668 @@ class MemoryService:
 
             return memory_id
 
+    async def _put_write_candidate(
+            self,
+            *,
+            candidate_id: str,
+            user_text: str,
+            source_platform: str,
+            source_conversation_id: str,
+            source_thread_id: str,
+            decision_source: str,
+            gate_model: str | None,
+            queued_at: str,
+    ) -> str:
+        """Persist an admitted raw user utterance for later extraction."""
+
+        await self.store.aput(
+            MEMORY_WRITE_CANDIDATE_NAMESPACE,
+            candidate_id,
+            {
+                "status": "pending_extraction",
+                "raw_user_text": user_text,
+                "source_platform": source_platform,
+                "source_conversation_id": source_conversation_id,
+                "source_thread_id": source_thread_id,
+                "queued_at": queued_at,
+                "admitted_at": datetime.now(timezone.utc).isoformat(),
+                "decision": "SAVE",
+                "decision_source": decision_source,
+                "gate_model": gate_model,
+            },
+            index=False,
+        )
+        return candidate_id
+
+    @operation('Memory / Process Write Queue', fields=())
+    async def _process_write_gate_batch(self) -> list[str]:
+        """Process one durable FIFO batch without blocking the user response."""
+
+        if self.write_gate is None:
+            return []
+
+        async with self._write_gate_lock:
+            pending_items = await self.store.asearch(
+                MEMORY_WRITE_INBOX_NAMESPACE,
+                limit=max(100, self.write_gate_batch_size * 4),
+            )
+            pending_items.sort(
+                key=lambda item: str(
+                    getattr(item, "value", {}).get("queued_at", "")
+                )
+            )
+
+            if len(pending_items) < self.write_gate_batch_size:
+                return []
+
+            batch = pending_items[:self.write_gate_batch_size]
+            batch_values = [getattr(item, "value", {}) for item in batch]
+            user_messages = [str(value.get("raw_user_text", "")) for value in batch_values]
+
+            try:
+                decisions = await self.write_gate.aclassify(user_messages)
+            except Exception as error:
+                logger.exception(
+                    "MemOperator Write Gate批次失败；原始用户消息保留在待处理队列。"
+                )
+                for item, value in zip(batch, batch_values):
+                    updated_value = dict(value)
+                    updated_value["attempt_count"] = int(
+                        updated_value.get("attempt_count", 0) or 0
+                    ) + 1
+                    updated_value["last_error"] = (
+                        f"{type(error).__name__}: {error}"
+                    )[:500]
+                    updated_value["last_attempt_at"] = datetime.now(
+                        timezone.utc
+                    ).isoformat()
+                    await self.store.aput(
+                        MEMORY_WRITE_INBOX_NAMESPACE,
+                        item.key,
+                        updated_value,
+                        index=False,
+                    )
+                return []
+
+            admitted_ids: list[str] = []
+            for item, value, decision in zip(batch, batch_values, decisions):
+                if decision.label == "SAVE":
+                    admitted_ids.append(
+                        await self._put_write_candidate(
+                            candidate_id=item.key,
+                            user_text=str(value["raw_user_text"]),
+                            source_platform=str(value["source_platform"]),
+                            source_conversation_id=str(
+                                value["source_conversation_id"]
+                            ),
+                            source_thread_id=str(value["source_thread_id"]),
+                            decision_source="memoperator_batch_gate",
+                            gate_model=self.write_gate.model_name,
+                            queued_at=str(value["queued_at"]),
+                        )
+                    )
+
+                # Candidate uses the same key as the inbox item.  If the process
+                # crashes between put and delete, retrying is idempotent.
+                await self.store.adelete(
+                    MEMORY_WRITE_INBOX_NAMESPACE,
+                    item.key,
+                )
+
+            return admitted_ids
+
+    async def _append_candidate_evidence(
+            self,
+            memory_ids: list[str],
+            evidence: list[dict[str, Any]],
+    ) -> None:
+        """Attach new source evidence to an existing fact without duplicating it."""
+
+        for memory_id in memory_ids:
+            item = await self.store.aget(MEMORY_NAMESPACE, memory_id)
+            if item is None:
+                continue
+            value = dict(getattr(item, "value", {}) or {})
+            existing = list(value.get("evidence", []) or [])
+            known_ids = {
+                entry.get("candidate_id")
+                for entry in existing
+                if isinstance(entry, dict)
+            }
+            for entry in evidence:
+                if entry.get("candidate_id") not in known_ids:
+                    existing.append(entry)
+            value["evidence"] = existing
+            value["updated_at"] = datetime.now(timezone.utc).isoformat()
+            await self.store.aput(MEMORY_NAMESPACE, memory_id, value)
+
+    async def _find_typed_duplicate_ids(
+            self,
+            candidate: MemoryCandidate,
+    ) -> list[str]:
+        """Find exact typed facts without depending on generated summary wording."""
+
+        dedupe_key = candidate.structured_data.get("dedupe_key")
+        if not dedupe_key:
+            return []
+        items = await self.store.asearch(
+            MEMORY_NAMESPACE,
+            filter={"status": "active"},
+            limit=1000,
+        )
+        return sorted(
+            item.key for item in items
+            if (
+                getattr(item, "value", {}).get("structured_data", {})
+                .get("dedupe_key") == dedupe_key
+            )
+        )
+
+    @staticmethod
+    def _conflict_group_id(value: dict[str, Any]) -> str:
+        data = value.get("structured_data", {})
+        conflict_key = str(data.get("conflict_key", "") or "")
+        confidence = str(value.get("confidence", 2))
+        digest = hashlib.sha256(
+            f"{conflict_key}|confidence={confidence}".encode("utf-8")
+        ).hexdigest()[:20]
+        return f"cg_{digest}"
+
+    async def _active_memory_items(self) -> list[Any]:
+        """Read the small personal-memory corpus without semantic search."""
+
+        return await self.store.asearch(
+            MEMORY_NAMESPACE,
+            filter={"status": "active"},
+            limit=1000,
+        )
+
+    async def _write_conflict_group(
+        self,
+        group_id: str,
+        memory_items: list[Any],
+    ) -> None:
+        """Persist one derived conflict group and annotate its active members."""
+
+        pairs: list[tuple[str, str]] = []
+        for index, left_item in enumerate(memory_items):
+            left_value = dict(getattr(left_item, "value", {}) or {})
+            for right_item in memory_items[index + 1:]:
+                right_value = dict(getattr(right_item, "value", {}) or {})
+                if _typed_memory_values_conflict(left_value, right_value):
+                    pairs.append((left_item.key, right_item.key))
+
+        now = datetime.now(timezone.utc).isoformat()
+        participating_ids = sorted({memory_id for pair in pairs for memory_id in pair})
+        group_item = await self.store.aget(MEMORY_CONFLICT_NAMESPACE, group_id)
+        previous = dict(getattr(group_item, "value", {}) or {}) if group_item else {}
+        previous_ids = set(previous.get("memory_ids", []) or [])
+        if participating_ids:
+            values_by_id = {
+                item.key: dict(getattr(item, "value", {}) or {})
+                for item in memory_items
+                if item.key in participating_ids
+            }
+            conflict_key = str(
+                values_by_id[participating_ids[0]]
+                .get("structured_data", {})
+                .get("conflict_key", "")
+            )
+            await self.store.aput(
+                MEMORY_CONFLICT_NAMESPACE,
+                group_id,
+                {
+                    "status": "open",
+                    "conflict_key": conflict_key,
+                    "confidence": values_by_id[participating_ids[0]].get("confidence", 2),
+                    "memory_ids": participating_ids,
+                    "pair_count": len(pairs),
+                    "created_at": previous.get("created_at", now),
+                    "updated_at": now,
+                },
+                index=False,
+            )
+            for memory_id in participating_ids:
+                value = values_by_id[memory_id]
+                value["conflict_group_id"] = group_id
+                value["conflict_status"] = "open"
+                value["conflicts_with"] = sorted({
+                    right if left == memory_id else left
+                    for left, right in pairs
+                    if memory_id in {left, right}
+                })
+                value["updated_at"] = now
+                await self.store.aput(MEMORY_NAMESPACE, memory_id, value)
+            for stale_id in previous_ids - set(participating_ids):
+                stale_item = await self.store.aget(MEMORY_NAMESPACE, stale_id)
+                if stale_item is None or stale_item.value.get("status") != "active":
+                    continue
+                stale_value = dict(stale_item.value)
+                stale_value.pop("conflict_group_id", None)
+                stale_value["conflict_status"] = "resolved"
+                stale_value["conflicts_with"] = []
+                stale_value["updated_at"] = now
+                await self.store.aput(MEMORY_NAMESPACE, stale_id, stale_value)
+            return
+
+        await self.store.aput(
+            MEMORY_CONFLICT_NAMESPACE,
+            group_id,
+            {
+                **previous,
+                "status": "resolved",
+                "memory_ids": [],
+                "pair_count": 0,
+                "updated_at": now,
+            },
+            index=False,
+        )
+        for stale_id in previous_ids:
+            stale_item = await self.store.aget(MEMORY_NAMESPACE, stale_id)
+            if stale_item is None or stale_item.value.get("status") != "active":
+                continue
+            stale_value = dict(stale_item.value)
+            stale_value.pop("conflict_group_id", None)
+            stale_value["conflict_status"] = "resolved"
+            stale_value["conflicts_with"] = []
+            stale_value["updated_at"] = now
+            await self.store.aput(MEMORY_NAMESPACE, stale_id, stale_value)
+
+    async def _refresh_conflict_group(self, group_id: str) -> None:
+        group_item = await self.store.aget(MEMORY_CONFLICT_NAMESPACE, group_id)
+        if group_item is None:
+            return
+        group_value = dict(getattr(group_item, "value", {}) or {})
+        memory_items = await asyncio.gather(*[
+            self.store.aget(MEMORY_NAMESPACE, memory_id)
+            for memory_id in group_value.get("memory_ids", [])
+        ])
+        active_items = [
+            item for item in memory_items
+            if item is not None
+            and getattr(item, "value", {}).get("status") == "active"
+        ]
+        await self._write_conflict_group(group_id, active_items)
+
+    async def _register_typed_conflicts(self, memory_id: str) -> str | None:
+        """Create/update a deterministic group without calling any model."""
+
+        new_item = await self.store.aget(MEMORY_NAMESPACE, memory_id)
+        if new_item is None:
+            return None
+        new_value = dict(getattr(new_item, "value", {}) or {})
+        conflict_items = []
+        for item in await self._active_memory_items():
+            if item.key == memory_id:
+                continue
+            value = dict(getattr(item, "value", {}) or {})
+            if _typed_memory_values_conflict(new_value, value):
+                conflict_items.append(item)
+        if not conflict_items:
+            return None
+
+        group_id = self._conflict_group_id(new_value)
+        existing_group = await self.store.aget(MEMORY_CONFLICT_NAMESPACE, group_id)
+        known_ids = list(
+            dict(getattr(existing_group, "value", {}) or {}).get("memory_ids", [])
+        ) if existing_group else []
+        item_by_id = {item.key: item for item in conflict_items}
+        item_by_id[memory_id] = new_item
+        for item in await asyncio.gather(*[
+            self.store.aget(MEMORY_NAMESPACE, known_id)
+            for known_id in known_ids
+            if known_id not in item_by_id
+        ]):
+            if item is not None and getattr(item, "value", {}).get("status") == "active":
+                item_by_id[item.key] = item
+        await self._write_conflict_group(group_id, list(item_by_id.values()))
+        return group_id
+
+    async def rebuild_conflict_groups(self) -> int:
+        """Rebuild derived groups from active typed memories after startup."""
+
+        buckets: dict[str, list[Any]] = {}
+        for item in await self._active_memory_items():
+            value = dict(getattr(item, "value", {}) or {})
+            data = value.get("structured_data", {})
+            if not isinstance(data, dict) or not data.get("conflict_key"):
+                continue
+            buckets.setdefault(self._conflict_group_id(value), []).append(item)
+        open_count = 0
+        for group_id, items in buckets.items():
+            await self._write_conflict_group(group_id, items)
+            group = await self.store.aget(MEMORY_CONFLICT_NAMESPACE, group_id)
+            if group and getattr(group, "value", {}).get("status") == "open":
+                open_count += 1
+        return open_count
+
+    @staticmethod
+    def _conflict_choice(memory_id: str, value: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "memory_id": memory_id,
+            "content": str(value.get("content", "")),
+            "memory_type": str(value.get("memory_type", "")),
+            "importance": int(value.get("importance", 2) or 2),
+            "confidence": int(value.get("confidence", 2) or 2),
+            "valid_from": value.get("valid_from"),
+            "expires_at": value.get("expires_at"),
+            "created_at": value.get("created_at"),
+        }
+
+    async def next_conflict_pair(
+        self,
+        *,
+        excluded_group_ids: set[str] | None = None,
+    ) -> MemoryConflictPair | None:
+        """Return the highest-priority unresolved pair for interactive cleanup."""
+
+        excluded = excluded_group_ids or set()
+        groups = await self.store.asearch(MEMORY_CONFLICT_NAMESPACE, limit=1000)
+        ranked: list[tuple[tuple[int, int, str], MemoryConflictPair]] = []
+        for group_item in groups:
+            if group_item.key in excluded:
+                continue
+            await self._refresh_conflict_group(group_item.key)
+            refreshed = await self.store.aget(MEMORY_CONFLICT_NAMESPACE, group_item.key)
+            group_value = dict(getattr(refreshed, "value", {}) or {}) if refreshed else {}
+            if group_value.get("status") != "open":
+                continue
+            memory_items = await asyncio.gather(*[
+                self.store.aget(MEMORY_NAMESPACE, memory_id)
+                for memory_id in group_value.get("memory_ids", [])
+            ])
+            active = [item for item in memory_items if item is not None]
+            conflict_pairs = []
+            for index, left in enumerate(active):
+                for right in active[index + 1:]:
+                    if _typed_memory_values_conflict(left.value, right.value):
+                        conflict_pairs.append((left, right))
+            if not conflict_pairs:
+                continue
+            conflict_pairs.sort(
+                key=lambda pair: (
+                    -max(int(pair[0].value.get("importance", 2)), int(pair[1].value.get("importance", 2))),
+                    str(min(pair[0].value.get("created_at", ""), pair[1].value.get("created_at", ""))),
+                    pair[0].key,
+                    pair[1].key,
+                )
+            )
+            left, right = conflict_pairs[0]
+            pair_view = MemoryConflictPair(
+                group_id=group_item.key,
+                conflict_key=str(group_value.get("conflict_key", "")),
+                left=self._conflict_choice(left.key, left.value),
+                right=self._conflict_choice(right.key, right.value),
+                remaining_pair_count=len(conflict_pairs),
+            )
+            priority = (
+                -int(group_value.get("confidence", 2) or 2),
+                -max(pair_view.left["importance"], pair_view.right["importance"]),
+                str(group_value.get("updated_at", "")),
+            )
+            ranked.append((priority, pair_view))
+        ranked.sort(key=lambda item: item[0])
+        return ranked[0][1] if ranked else None
+
+    async def conflict_summary(self) -> dict[str, int]:
+        """Return group/pair counts used by /clean and /help."""
+
+        groups = await self.store.asearch(MEMORY_CONFLICT_NAMESPACE, limit=1000)
+        open_groups = 0
+        open_pairs = 0
+        high_priority_groups = 0
+        for item in groups:
+            await self._refresh_conflict_group(item.key)
+            refreshed = await self.store.aget(MEMORY_CONFLICT_NAMESPACE, item.key)
+            value = dict(getattr(refreshed, "value", {}) or {}) if refreshed else {}
+            if value.get("status") != "open":
+                continue
+            open_groups += 1
+            open_pairs += int(value.get("pair_count", 0) or 0)
+            if int(value.get("confidence", 2) or 2) >= 4:
+                high_priority_groups += 1
+        return {
+            "open_groups": open_groups,
+            "open_pairs": open_pairs,
+            "high_priority_groups": high_priority_groups,
+        }
+
+    async def resolve_conflict_pair(
+        self,
+        *,
+        group_id: str,
+        keep_memory_id: str,
+        retire_memory_id: str,
+    ) -> dict[str, Any]:
+        """Apply one explicit user choice; no model decides which fact wins."""
+
+        group_item = await self.store.aget(MEMORY_CONFLICT_NAMESPACE, group_id)
+        group = dict(getattr(group_item, "value", {}) or {}) if group_item else {}
+        if group.get("status") != "open":
+            raise ValueError("这组冲突已经处理或不存在。")
+        if {keep_memory_id, retire_memory_id} - set(group.get("memory_ids", [])):
+            raise ValueError("选择与当前冲突组不匹配，请重新打开 /clean。")
+        keep_item, retire_item = await asyncio.gather(
+            self.store.aget(MEMORY_NAMESPACE, keep_memory_id),
+            self.store.aget(MEMORY_NAMESPACE, retire_memory_id),
+        )
+        if (
+            keep_item is None
+            or retire_item is None
+            or not _typed_memory_values_conflict(keep_item.value, retire_item.value)
+        ):
+            raise ValueError("这两条记忆已不再构成当前冲突，请重新打开 /clean。")
+        await self._retire_memories(
+            [retire_memory_id],
+            replaced_by=keep_memory_id,
+            reason="user_resolved_conflict",
+        )
+        await self._refresh_conflict_group(group_id)
+        refreshed = await self.store.aget(MEMORY_CONFLICT_NAMESPACE, group_id)
+        refreshed_value = dict(getattr(refreshed, "value", {}) or {}) if refreshed else {}
+        return {
+            "group_id": group_id,
+            "kept_memory_id": keep_memory_id,
+            "retired_memory_id": retire_memory_id,
+            "group_status": refreshed_value.get("status", "resolved"),
+            "remaining_pair_count": int(refreshed_value.get("pair_count", 0) or 0),
+        }
+
+    async def _store_typed_candidate(
+        self,
+        candidate: MemoryCandidate,
+        *,
+        source_platform: str,
+        source_conversation_id: str,
+        source_thread_id: str,
+    ) -> tuple[str, str | None]:
+        """Write a validated fact and run only deterministic conflict grouping."""
+
+        memory_id = await self._store_new_memory(
+            candidate=candidate,
+            resolution=MemoryResolution(
+                action="ADD",
+                reason="deterministic_typed_write",
+            ),
+            source_platform=source_platform,
+            source_conversation_id=source_conversation_id,
+            source_thread_id=source_thread_id,
+        )
+        group_id = await self._register_typed_conflicts(memory_id)
+        return memory_id, group_id
+
+    @operation('Memory Extractor / Process Queue', fields=())
+    async def _process_extraction_batch(self) -> list[str]:
+        """Process one durable progressive-extraction batch when explicitly enabled."""
+
+        if not self.extraction_enabled or self.model is None:
+            return []
+
+        async with self._extraction_lock:
+            items = await self.store.asearch(
+                MEMORY_WRITE_CANDIDATE_NAMESPACE,
+                limit=max(100, self.extraction_batch_size * 4),
+            )
+            pending = [
+                item for item in items
+                if getattr(item, "value", {}).get("status") == "pending_extraction"
+            ]
+            pending.sort(
+                key=lambda item: str(getattr(item, "value", {}).get("queued_at", ""))
+            )
+            if len(pending) < self.extraction_batch_size:
+                return []
+
+            batch = pending[:self.extraction_batch_size]
+            batch_values = [
+                (item.key, dict(getattr(item, "value", {}) or {}))
+                for item in batch
+            ]
+            try:
+                plan, records = await self.extract_progressive_batch(batch_values)
+            except Exception as error:
+                logger.exception(
+                    "渐进式记忆提取失败；候选原文保留，下一批次可安全重试。"
+                )
+                for item, (_, value) in zip(batch, batch_values):
+                    value["extraction_attempt_count"] = int(
+                        value.get("extraction_attempt_count", 0) or 0
+                    ) + 1
+                    value["last_extraction_error"] = (
+                        f"{type(error).__name__}: {error}"
+                    )[:500]
+                    value["last_extraction_attempt_at"] = datetime.now(
+                        timezone.utc
+                    ).isoformat()
+                    await self.store.aput(
+                        MEMORY_WRITE_CANDIDATE_NAMESPACE,
+                        item.key,
+                        value,
+                        index=False,
+                    )
+                return []
+
+            source_by_id = dict(batch_values)
+            results_by_candidate: dict[str, list[dict[str, Any]]] = {
+                candidate_id: [] for candidate_id, _ in batch_values
+            }
+            stored_ids: list[str] = []
+            for record in records:
+                candidate = self._typed_record_to_candidate(
+                    record, source_by_id[record.candidate_id]
+                )
+                typed_duplicate_ids = await self._find_typed_duplicate_ids(candidate)
+                if typed_duplicate_ids:
+                    await self._append_candidate_evidence(
+                        typed_duplicate_ids, candidate.evidence
+                    )
+                    memory_id = typed_duplicate_ids[0]
+                    record_status = "evidence_attached"
+                    conflict_group_id = None
+                else:
+                    source = source_by_id[record.candidate_id]
+                    memory_id, conflict_group_id = await self._store_typed_candidate(
+                        candidate=candidate,
+                        source_platform=str(source.get("source_platform", "")),
+                        source_conversation_id=str(
+                            source.get("source_conversation_id", "")
+                        ),
+                        source_thread_id=str(source.get("source_thread_id", "")),
+                    )
+                    record_status = "stored" if memory_id else "not_stored"
+                if memory_id and memory_id not in stored_ids:
+                    stored_ids.append(memory_id)
+                results_by_candidate[record.candidate_id].append({
+                    "frame_id": record.frame_id,
+                    "record_type": record.record_type,
+                    "summary": record.summary,
+                    "importance": record.importance,
+                    "confidence": record.confidence,
+                    "typed_data": record.model_dump(mode="json"),
+                    "status": record_status,
+                    "memory_id": memory_id,
+                    "conflict_group_id": conflict_group_id,
+                })
+
+            frames_by_candidate = {
+                item.candidate_id: [frame.model_dump(mode="json") for frame in item.frames]
+                for item in plan.candidates
+            }
+            for item, (candidate_id, value) in zip(batch, batch_values):
+                result_rows = results_by_candidate[candidate_id]
+                value["status"] = "extracted" if result_rows else "no_memory"
+                value["frames"] = frames_by_candidate.get(candidate_id, [])
+                value["records"] = result_rows
+                value["extracted_at"] = datetime.now(timezone.utc).isoformat()
+                value.pop("last_extraction_error", None)
+                await self.store.aput(
+                    MEMORY_WRITE_CANDIDATE_NAMESPACE,
+                    item.key,
+                    value,
+                    index=False,
+                )
+            return stored_ids
+
     async def consolidate_turn(
             self,
             user_text: str,
-            assistant_text: str,
             source_platform: str,
             source_conversation_id: str,
             source_thread_id: str,
     ) -> list[str]:
-        """从一轮成功对话中巩固跨Conversation长期记忆。"""
+        """Stage only original user text; do not extract or write formal memory."""
 
-        # memory_consolidation根Span已经由
-        # ConversationRuntime创建。
-        #
-        # 这里不再创建重复根节点。
-        write_level = await (
-            self.classify_memory_write_level(
-                user_text
-            )
-        )
-
-        if write_level == "NOT_RECORD":
+        normalized_user_text = user_text.strip()
+        if not normalized_user_text:
             return []
 
-        # write_level为None表示本地Gate失败，
-        # 按当前策略仍然进入云端提取。
-        candidates = await (
-            self.extract_candidates(
-                user_text=(
-                    user_text
-                ),
-
-                assistant_text=(
-                    assistant_text
-                ),
-            )
-        )
-
-        if not candidates:
+        rule_label = self._route_memory_write_by_rule(normalized_user_text)
+        if rule_label == "NOT_RECORD":
             return []
 
-        stored_memory_ids: list[
-            str
-        ] = []
+        queued_at = datetime.now(timezone.utc).isoformat()
+        queue_id = str(uuid4())
 
-        for (
-                candidate_index,
-                candidate,
-        ) in enumerate(
-            candidates,
-            start=1,
-        ):
-            with trace_span(
-                    (
-                            "memory.candidate_"
-                            f"{candidate_index}"
-                    ),
-
-                    kind="chain",
-
-                    input_value={
-                        "candidate_index": (
-                                candidate_index
-                        ),
-
-                        "candidate": (
-                                _memory_candidate_to_trace_item(
-                                    candidate
-                                )
-                        ),
-                    },
-
-                    attributes={
-                        "memory.candidate.index": (
-                                candidate_index
-                        ),
-
-                        "memory.candidate.type": (
-                                candidate.memory_type
-                        ),
-
-                        "memory.candidate.importance": (
-                                candidate.importance
-                        ),
-
-                        "memory.candidate.confidence": (
-                                candidate.confidence
-                        ),
-                    },
-            ) as candidate_span:
-
-                if candidate.confidence < 3:
-                    set_span_attributes(
-                        candidate_span,
-
-                        **{
-                            "memory.candidate.status": (
-                                "skipped_low_confidence"
-                            ),
-                        },
-                    )
-
-                    set_span_output(
-                        candidate_span,
-
-                        {
-                            "status": (
-                                "skipped_low_confidence"
-                            ),
-
-                            "candidate": (
-                                _memory_candidate_to_trace_item(
-                                    candidate
-                                )
-                            ),
-
-                            "resolution": None,
-
-                            "stored_memory_id": None,
-                        },
-                    )
-
-                    continue
-
-                resolution = await (
-                    self.resolve_candidate(
-                        candidate
-                    )
+        if rule_label == "RECORD":
+            admitted_ids = [
+                await self._put_write_candidate(
+                    candidate_id=queue_id,
+                    user_text=normalized_user_text,
+                    source_platform=source_platform,
+                    source_conversation_id=source_conversation_id,
+                    source_thread_id=source_thread_id,
+                    decision_source="deterministic_explicit_rule",
+                    gate_model=None,
+                    queued_at=queued_at,
                 )
+            ]
+            await self._process_extraction_batch()
+            return admitted_ids
 
-                memory_id = await (
-                    self.apply_resolution(
-                        candidate=(
-                            candidate
-                        ),
+        await self.store.aput(
+            MEMORY_WRITE_INBOX_NAMESPACE,
+            queue_id,
+            {
+                "status": "pending_gate",
+                "raw_user_text": normalized_user_text,
+                "source_platform": source_platform,
+                "source_conversation_id": source_conversation_id,
+                "source_thread_id": source_thread_id,
+                "queued_at": queued_at,
+                "attempt_count": 0,
+            },
+            index=False,
+        )
 
-                        resolution=(
-                            resolution
-                        ),
-
-                        source_platform=(
-                            source_platform
-                        ),
-
-                        source_conversation_id=(
-                            source_conversation_id
-                        ),
-
-                        source_thread_id=(
-                            source_thread_id
-                        ),
-                    )
-                )
-
-                if memory_id is not None:
-                    stored_memory_ids.append(
-                        memory_id
-                    )
-
-                    candidate_status = (
-                        "stored"
-                    )
-
-                elif resolution.action == "IGNORE":
-                    candidate_status = (
-                        "ignored"
-                    )
-
-                else:
-                    candidate_status = (
-                        "not_stored"
-                    )
-
-                set_span_attributes(
-                    candidate_span,
-
-                    **{
-                        "memory.candidate.status": (
-                            candidate_status
-                        ),
-
-                        "memory.candidate.action": (
-                            resolution.action
-                        ),
-
-                        "memory.candidate.stored": (
-                                memory_id
-                                is not None
-                        ),
-                    },
-                )
-
-                set_span_output(
-                    candidate_span,
-
-                    {
-                        "status": (
-                            candidate_status
-                        ),
-
-                        "candidate": (
-                            _memory_candidate_to_trace_item(
-                                candidate
-                            )
-                        ),
-
-                        "resolution": (
-                            _memory_resolution_to_trace_item(
-                                resolution
-                            )
-                        ),
-
-                        "stored_memory_id": (
-                            memory_id
-                        ),
-                    },
-                )
-
-        return stored_memory_ids
+        admitted_ids = await self._process_write_gate_batch()
+        await self._process_extraction_batch()
+        return admitted_ids
 
     async def retrieve_for_turn(
             self,
             user_text: str,
     ) -> list[RetrievedMemory]:
-        """使用向量、图扩展、重排和读取门控召回记忆。"""
+        """使用Dense、BM25、图扩展和Cross-Encoder召回记忆。"""
 
         query = (
             user_text.strip()
@@ -4803,8 +5638,33 @@ class MemoryService:
                 },
             )
 
+        with trace_span(
+                "memory.bm25_retrieval",
+                kind="retriever",
+                input_value={
+                    "query": query,
+                    "limit": self.lexical_limit,
+                    "index_stats": self.lexical_index.stats(),
+                },
+        ) as bm25_span:
+            lexical_memories = await self._bm25_retrieve(query)
+            set_span_output(
+                bm25_span,
+                {
+                    "result_count": len(lexical_memories),
+                    "candidates": _retrieved_memories_to_trace_items(
+                        lexical_memories
+                    ),
+                },
+            )
+
+        hybrid_candidates = self._merge_retrieval_candidates(
+            dense_memories,
+            lexical_memories,
+        )
+
         # 第二阶段：
-        # 从Dense候选中选择可靠的图扩展种子。
+        # 从Dense与BM25候选并集中选择可靠的图扩展种子。
         with trace_span(
                 "memory.seed_ranking",
 
@@ -4817,24 +5677,24 @@ class MemoryService:
 
                     "candidate_count": (
                             len(
-                                dense_memories
+                                hybrid_candidates
                             )
                     ),
 
                     "candidates": (
                             _retrieved_memories_to_trace_items(
-                                dense_memories
+                                hybrid_candidates
                             )
                     ),
                 },
         ) as seed_stage_span:
 
-            if dense_memories:
+            if hybrid_candidates:
                 seed_top_k = min(
                     self.final_limit,
 
                     len(
-                        dense_memories
+                        hybrid_candidates
                     ),
                 )
 
@@ -4857,7 +5717,7 @@ class MemoryService:
 
                             "documents": (
                                     _retrieved_memories_to_trace_items(
-                                        dense_memories
+                                        hybrid_candidates
                                     )
                             ),
                         },
@@ -4869,7 +5729,7 @@ class MemoryService:
 
                             "reranker.input_count": (
                                     len(
-                                        dense_memories
+                                        hybrid_candidates
                                     )
                             ),
 
@@ -4886,7 +5746,7 @@ class MemoryService:
                             ),
 
                             memories=(
-                                dense_memories
+                                hybrid_candidates
                             ),
 
                             top_k=(
@@ -4917,7 +5777,7 @@ class MemoryService:
                 seed_memories = []
 
                 seed_status = (
-                    "skipped_no_dense_candidates"
+                    "skipped_no_hybrid_candidates"
                 )
 
             set_span_attributes(
@@ -4983,6 +5843,12 @@ class MemoryService:
                             )
                     ),
 
+                    "bm25_candidates": (
+                            _retrieved_memories_to_trace_items(
+                                lexical_memories
+                            )
+                    ),
+
                     "graph_candidates": (
                             _retrieved_memories_to_trace_items(
                                 graph_memories
@@ -4995,7 +5861,7 @@ class MemoryService:
                 combined_candidates = (
                     self
                     ._merge_retrieval_candidates(
-                        dense_memories,
+                        hybrid_candidates,
 
                         graph_memories,
                     )
@@ -5075,12 +5941,12 @@ class MemoryService:
                 )
 
             else:
-                # 没有图候选时，Dense候选集没有发生变化。
+                # 没有图候选时，Hybrid候选集没有发生变化。
                 #
                 # 直接复用Seed Reranker结果，
                 # 避免对同一批候选重复运行CE。
                 combined_candidates = (
-                    dense_memories
+                    hybrid_candidates
                 )
 
                 final_reranked_memories = (
@@ -5135,21 +6001,9 @@ class MemoryService:
                 },
             )
 
-        # 第五阶段：
-        # 本地Memory Router进行最终逐条读取门控。
-        filtered_memories = await (
-            self.filter_memories_for_turn(
-                user_text=(
-                    query
-                ),
-
-                memories=(
-                    final_reranked_memories
-                ),
-            )
-        )
-
-        return filtered_memories
+        # CrossEncoder阈值已经是最终Read Gate。
+        # 不再使用生成式Memory Router逐条重复判断。
+        return final_reranked_memories
 
     def format_context(
             self,
@@ -5160,6 +6014,8 @@ class MemoryService:
         """把召回结果渲染成带时间的长期记忆上下文。"""
 
         if not memories:
+            with trace_span('Memory / Assemble Context') as assembly_span:
+                set_span_output(assembly_span,{'context':'','memory_ids':[],'status':'no_selected_memories'})
             return ""
 
         memory_items = "\n".join(
@@ -5177,10 +6033,14 @@ class MemoryService:
             )
         )
 
-        return render_prompt(
-            "memory_context",
+        context = render_prompt(
+            "memory/context",
 
             memory_items=(
                 memory_items
             ),
         )
+        with trace_span('Memory / Assemble Context',input_value={
+            'selected_memories':_retrieved_memories_to_trace_items(memories)}) as assembly_span:
+            set_span_output(assembly_span,{'context':context,'memory_ids':[m.memory_id for m in memories]})
+        return context

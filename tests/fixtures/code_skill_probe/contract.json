@@ -1,0 +1,13 @@
+{
+  "delivery_mode": "PATCH",
+  "requirements": [
+    {"requirement_id": "filter", "priority": "MUST", "statement": "Read UTF-8 CSV columns id,category,amount. Keep rows whose decimal amount is greater than OR EQUAL TO minimum_amount and, when category is provided, whose category exactly matches. Preserve input order and original field text, including Chinese, commas and newlines."},
+    {"requirement_id": "schema", "priority": "MUST", "statement": "Config is a JSON object with required finite numeric minimum_amount (zero allowed; bool/null/string rejected), optional string category, and no extra keys. Reject invalid config with exit code 2, a nonempty stderr and no success JSON."},
+    {"requirement_id": "failure", "priority": "MUST", "statement": "Reject malformed CSV headers or non-finite/non-numeric amounts with exit 2, identifying an invalid amount where applicable. Do not change existing output or input files. Refuse overwriting output even on otherwise valid input."},
+    {"requirement_id": "output", "priority": "MUST", "statement": "On success create a UTF-8 CSV with exactly id,category,amount in that order, even for zero matching rows; stdout is only JSON with an integer written count and exit code is zero. Use requested output path including spaces."}
+  ],
+  "interfaces": [{"interface_id": "cli", "kind": "CLI", "description": "Offline CSV filter", "details": {"script": "/workspace/filter_report.py", "arguments": ["--input", "--config", "--output"], "config_format": "JSON file", "input_format": "UTF-8 CSV"}}],
+  "validation_expectations": ["Derive independent cases from the four requirements; exercise the real CLI and reopen the output.", "Exercise equality and zero, Unicode/quoted fields, invalid configs and failure preservation. Separate collection/import errors from behavioral failures."],
+  "implementation_guidance": ["Use the standard library; no network or package installation. Candidate is under /workspace; reviewer tests and output under /review or temporary fixtures."],
+  "non_goals": ["No UI, email, network, real user files, or performance benchmark."]
+}

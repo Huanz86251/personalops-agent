@@ -1,0 +1,86 @@
+{
+  "set": "human-authored blind set",
+  "rows": 60,
+  "threshold": 0.690976,
+  "accuracy": 0.85,
+  "roc_auc": 0.9777777777777779,
+  "per_label": {
+    "SKIP": {
+      "precision": 1.0,
+      "recall": 0.7,
+      "f1": 0.8235294117647058
+    },
+    "SAVE": {
+      "precision": 0.7692307692307693,
+      "recall": 1.0,
+      "f1": 0.8695652173913043
+    }
+  },
+  "confusion_matrix": [
+    [
+      21,
+      9
+    ],
+    [
+      0,
+      30
+    ]
+  ],
+  "errors": [
+    {
+      "id": "blind-002",
+      "label": "SKIP",
+      "prediction": "SAVE",
+      "save_probability": 0.903375
+    },
+    {
+      "id": "blind-012",
+      "label": "SKIP",
+      "prediction": "SAVE",
+      "save_probability": 0.999608
+    },
+    {
+      "id": "blind-022",
+      "label": "SKIP",
+      "prediction": "SAVE",
+      "save_probability": 0.923868
+    },
+    {
+      "id": "blind-024",
+      "label": "SKIP",
+      "prediction": "SAVE",
+      "save_probability": 0.983723
+    },
+    {
+      "id": "blind-034",
+      "label": "SKIP",
+      "prediction": "SAVE",
+      "save_probability": 0.829492
+    },
+    {
+      "id": "blind-048",
+      "label": "SKIP",
+      "prediction": "SAVE",
+      "save_probability": 0.847716
+    },
+    {
+      "id": "blind-052",
+      "label": "SKIP",
+      "prediction": "SAVE",
+      "save_probability": 0.963231
+    },
+    {
+      "id": "blind-054",
+      "label": "SKIP",
+      "prediction": "SAVE",
+      "save_probability": 0.999576
+    },
+    {
+      "id": "blind-060",
+      "label": "SKIP",
+      "prediction": "SAVE",
+      "save_probability": 0.923454
+    }
+  ],
+  "limitation": "Small author-curated diagnostic set; it is not a production benchmark."
+}

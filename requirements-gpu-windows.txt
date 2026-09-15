@@ -1,0 +1,5 @@
+# Windows x86-64 / Python 3.12 NVIDIA runtime wheels.
+# Torch carries its CUDA 13.0 runtime; llama-cpp uses the installed CUDA 12.6 toolkit
+# through the compatible cu125 wheel. Direct URLs avoid global extra package indexes.
+torch @ https://download-r2.pytorch.org/whl/cu130/torch-2.14.0%2Bcu130-cp312-cp312-win_amd64.whl
+llama-cpp-python @ https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.35-cu125/llama_cpp_python-0.3.35-py3-none-win_amd64.whl

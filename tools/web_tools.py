@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+from threading import (
+    BoundedSemaphore,
+    Lock,
+)
 from urllib.parse import (
     urlsplit,
 )
@@ -12,6 +16,9 @@ from dotenv import load_dotenv
 from langchain.tools import tool
 
 from path import PROJECT_ROOT
+from config import (
+    WEB_SEARCH_HARD_MAX_PARALLELISM,
+)
 
 
 # 即使单独运行web_tools.py测试，
@@ -30,6 +37,56 @@ load_dotenv(
 SEARCH_PAGE_SIZE = 5
 SEARCH_TIMEOUT_SECONDS = 15
 SEARCH_SAFESEARCH = "moderate"
+DEFAULT_SEARCH_BACKEND = "google"
+
+
+_web_search_configuration_lock = (
+    Lock()
+)
+_web_search_max_parallelism = (
+    WEB_SEARCH_HARD_MAX_PARALLELISM
+)
+_web_search_capacity = (
+    BoundedSemaphore(
+        _web_search_max_parallelism
+    )
+)
+
+
+def configure_web_search_parallelism(
+    max_parallelism: int,
+) -> None:
+    """在程序接收请求前设置WebSearch进程级并发上限。"""
+
+    if not (
+        1
+        <= max_parallelism
+        <= WEB_SEARCH_HARD_MAX_PARALLELISM
+    ):
+        raise ValueError(
+            "WebSearch并发数必须在"
+            f"1到{WEB_SEARCH_HARD_MAX_PARALLELISM}之间。"
+        )
+
+    global _web_search_capacity
+    global _web_search_max_parallelism
+
+    with _web_search_configuration_lock:
+        _web_search_max_parallelism = (
+            max_parallelism
+        )
+        _web_search_capacity = (
+            BoundedSemaphore(
+                max_parallelism
+            )
+        )
+
+
+def get_web_search_max_parallelism(
+) -> int:
+    """返回当前实际生效的WebSearch并发上限。"""
+
+    return _web_search_max_parallelism
 
 
 def _get_search_backend() -> str:
@@ -37,12 +94,12 @@ def _get_search_backend() -> str:
 
     backend = os.getenv(
         "WEB_SEARCH_BACKEND",
-        "yandex",
+        DEFAULT_SEARCH_BACKEND,
     ).strip()
 
     return (
         backend
-        or "yandex"
+        or DEFAULT_SEARCH_BACKEND
     )
 
 
@@ -72,29 +129,34 @@ def _run_web_search(
 ]:
     """在线程中执行同步DDGS搜索。"""
 
-    return DDGS(
-        timeout=(
-            SEARCH_TIMEOUT_SECONDS
+    # 线程信号量放在真正的同步网络调用外层，
+    # 即使未来调度器漏掉限制，也不会超过硬边界。
+    capacity = _web_search_capacity
+
+    with capacity:
+        return DDGS(
+            timeout=(
+                SEARCH_TIMEOUT_SECONDS
+            )
+        ).text(
+            query=query,
+
+            region=(
+                _get_search_region()
+            ),
+
+            safesearch=(
+                SEARCH_SAFESEARCH
+            ),
+
+            max_results=max_results,
+
+            page=page,
+
+            backend=(
+                _get_search_backend()
+            ),
         )
-    ).text(
-        query=query,
-
-        region=(
-            _get_search_region()
-        ),
-
-        safesearch=(
-            SEARCH_SAFESEARCH
-        ),
-
-        max_results=max_results,
-
-        page=page,
-
-        backend=(
-            _get_search_backend()
-        ),
-    )
 
 
 async def web_search(
@@ -104,13 +166,15 @@ async def web_search(
     """搜索互联网中的公开网页。
 
     每次返回最多5条标题、URL和搜索摘要。
-    当前结果不足时，应保持相同query，
-    并把page增加为2、3、4以继续搜索。
+    结果相关但覆盖不足时，保持query并增加page继续搜索；
+    结果偏题或质量差时，先调整关键词或限定官方域名。
 
     本工具只负责搜索，不会打开、读取或点击网页。
-    需要深入读取网页时，应把选中的URL交给浏览器工具。
+    深入读取时，有fetch_webpage可先读取公开静态正文；
+    动态或交互页面使用实际可用的浏览器工具。
     除非用户明确要求，否则优先选择可直接阅读的文本网页，而非视频网站。
-    如果中文搜索质量差可换用英文关键词。
+    国内地名和机构优先中文全名加地区；技术问题保留API名、
+    版本和关键报错，中文资料不足时再用英文原名检索。
 
     Args:
         query: 清晰具体的中文或英文搜索关键词。

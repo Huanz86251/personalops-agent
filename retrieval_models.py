@@ -37,6 +37,30 @@ logger = logging.getLogger(
 GTE_EMBEDDING_DIMENSIONS = 768
 LOCAL_MODEL_TRACE_PREVIEW_MAX_CHARS = 240
 
+
+def _restore_gte_position_ids(model, model_name: str) -> int:
+    """Restore the deterministic non-persistent GTE buffer after model loading.
+
+    The upstream NewModel embedding defines arange(max_position_embeddings).
+    Some loader combinations materialize this non-checkpoint buffer without its
+    values. Scope the compatibility repair to the known GTE architecture only;
+    never rewrite learned embeddings or unrelated models' position conventions.
+    """
+    if model_name != "Alibaba-NLP/gte-multilingual-base":
+        return 0
+    restored = 0
+    for name, module in model.named_modules():
+        if not name.endswith("embeddings") or type(module).__name__ != "NewEmbeddings":
+            continue
+        positions = getattr(module, "position_ids", None)
+        if positions is None or positions.ndim != 1 or positions.dtype != torch.long:
+            raise RuntimeError("Unexpected GTE position buffer layout")
+        expected = torch.arange(positions.numel(), device=positions.device, dtype=positions.dtype)
+        if not torch.equal(positions, expected):
+            module.register_buffer("position_ids", expected, persistent=False)
+            restored += 1
+    return restored
+
 @dataclass(frozen=True)
 class RerankResult:
     """表示Cross-Encoder重排后的一条结果。"""
@@ -388,6 +412,10 @@ class RetrievalModelManager:
                 self.embedding_max_length
             )
 
+            restored = _restore_gte_position_ids(embedding_model, self.embedding_model_name)
+            if restored:
+                logger.warning("Restored %s GTE deterministic position buffer(s) after loading", restored)
+
             self._embedding_model = (
                 embedding_model
             )
@@ -441,6 +469,8 @@ class RetrievalModelManager:
                 ),
             )
 
+            from reranker_inputs import effective_limit
+            reranker_model.max_seq_length = effective_limit(reranker_model, self.reranker_max_length)
             self._reranker_model = (
                 reranker_model
             )
@@ -1690,6 +1720,37 @@ class RetrievalModelManager:
             )
 
         return self._reranker_model
+    def fit_rerank_query(self, query: str, documents: Sequence[str]) -> str:
+        """Use the real reranker tokenizer to preserve query head and tail."""
+        from reranker_inputs import effective_limit, fit_query_head_tail
+        model = self._require_reranker_model()
+        return fit_query_head_tail(
+            model, query, list(documents),
+            effective_limit(model, self.reranker_max_length),
+        )
+
+    def rerank_windows(self, query, documents, top_k=2, max_windows=2):
+        from reranker_inputs import effective_limit, document_windows
+        docs = list(documents)
+        if not docs: return []
+        model = self._require_reranker_model()
+        q, windows, owners, audit = document_windows(
+            model, query, docs, effective_limit(model, self.reranker_max_length), max_windows)
+        with trace_span("RAG / Rerank Windows", input_value={
+            "query": query, "effective_query": q, "query_truncated": q != query,
+            "windows": audit, "aggregation": "max", "max_windows": max_windows}) as span:
+            scored = self.rerank(q, windows, top_k=len(windows))
+            best = {}
+            for item in scored:
+                owner = owners[item.index]
+                best[owner] = max(best.get(owner, float('-inf')), item.score)
+            results = sorted([RerankResult(index=i, text=docs[i], score=v) for i,v in best.items()],
+                             key=lambda item: item.score, reverse=True)
+            set_span_output(span, {"window_scores": [{"window_index": x.index, "document_index": owners[x.index],
+                "score": x.score} for x in scored], "document_scores": best,
+                "uncovered_tokens": {i: [a['remaining_tokens'] for a in audit if a['document_index']==i][-1] for i in best}})
+            return results[:top_k]
+
     def rerank(
         self,
         query: str,
@@ -1730,6 +1791,10 @@ class RetrievalModelManager:
             for document
             in resolved_documents
         ]
+
+        from reranker_inputs import effective_limit, describe_pairs
+        sequence_limit = effective_limit(model, self.reranker_max_length)
+        pair_details = describe_pairs(model, pairs, sequence_limit)
 
         trace_document_items = [
             {
@@ -1791,6 +1856,10 @@ class RetrievalModelManager:
                     "pair_count": len(
                         pairs
                     ),
+                    "requested_max_length": self.reranker_max_length,
+                    "effective_max_length": sequence_limit,
+                    "truncation_strategy": "longest_first",
+                    "pair_token_details": pair_details,
 
                     "requested_top_k": (
                         top_k
@@ -1805,7 +1874,7 @@ class RetrievalModelManager:
                     ),
 
                     "max_length": (
-                        self.reranker_max_length
+                        sequence_limit
                     ),
                 },
 
@@ -1847,7 +1916,7 @@ class RetrievalModelManager:
                     ),
 
                     "reranker.max_length": (
-                        self.reranker_max_length
+                        sequence_limit
                     ),
                 },
         ) as span:
@@ -1855,6 +1924,9 @@ class RetrievalModelManager:
             # CrossEncoder模型实例
             # 不应同时被多个线程调用。
             with self._reranker_lock:
+                # Also guards callers that inject a preloaded model with max_length=1024.
+                # This changes tokenization only; stored/retrieved documents stay intact.
+                model.max_seq_length = sequence_limit
                 scores = model.predict(
                     pairs,
 
@@ -1865,6 +1937,10 @@ class RetrievalModelManager:
                     show_progress_bar=False,
 
                     convert_to_numpy=True,
+
+                    # BCE模型卡的0.35/0.4推荐阈值
+                    # 对应Sigmoid后的绝对相关性分数。
+                    activation_fn=torch.nn.Sigmoid(),
                 )
 
             flat_scores = (

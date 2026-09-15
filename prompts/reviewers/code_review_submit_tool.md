@@ -1,0 +1,5 @@
+提交当前版本的审核结果。PASSED 必须使用真实发布回执并列出 check_results；recommended_action 为 null。FAILED/ESCALATED 提供失败证据并建议 CONTINUE、RESTART 或 STOP。
+
+Worker的结构化API交接由Harness逐项校验并传递，不由你批准、删除或改写；可参考它判断任务完成程度，但来源通过不等于执行成功。文件仍由你审核、按现有发布流程处理。
+
+verified_requirement_ids仅引用冻结任务里实际核验通过的编号；PASSED必须覆盖全部需求。evidence_refs只引用已返回的真实工具结果；错误结果只能证明失败。verification_summary说明实际核验及其限制，failed_test_summaries写真实错误与影响；未尝试不是失败。handoff_apis保留下一位执行者所需的已验证接口用法、材料路径及限制，不传私有凭据；推荐动作交Scheduler决定。

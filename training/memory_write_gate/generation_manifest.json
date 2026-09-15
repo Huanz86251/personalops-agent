@@ -1,0 +1,67 @@
+{
+  "created_at_utc": "2026-09-15T12:48:44.079700+00:00",
+  "model": "qwen3.7-flash",
+  "thinking_enabled": false,
+  "generation_mode": "8-way concurrent bounded batches",
+  "rows": 10000,
+  "seed_families": 100,
+  "labels": {
+    "SAVE": 5000,
+    "SKIP": 5000
+  },
+  "splits": {
+    "train": 7000,
+    "validation": 1600,
+    "test": 1400
+  },
+  "languages": {
+    "mixed": 769,
+    "en": 4416,
+    "zh": 4815
+  },
+  "categories": {
+    "identity": 500,
+    "greeting": 300,
+    "question": 500,
+    "preference": 500,
+    "one_off": 500,
+    "health": 400,
+    "temporary_preference": 300,
+    "accessibility": 100,
+    "relationship": 500,
+    "temporary_state": 500,
+    "habit": 500,
+    "speculation": 400,
+    "project": 500,
+    "quoted_text": 300,
+    "deletion": 200,
+    "goal": 500,
+    "secret": 300,
+    "assistant_claim": 200,
+    "decision": 500,
+    "correction_context": 100,
+    "generic_fact": 300,
+    "ephemeral_request": 300,
+    "future_task": 500,
+    "current_task": 300,
+    "email": 300,
+    "conditional": 200,
+    "other_person": 200,
+    "privacy": 200,
+    "meta": 100
+  },
+  "usage": {
+    "input_tokens": 152604,
+    "output_tokens": 511231,
+    "cache_read_tokens": 0
+  },
+  "cost": {
+    "status": "estimated",
+    "currency": "CNY",
+    "known_total_cny": 0.4395056,
+    "missing_requests": 0,
+    "priced_requests": 262
+  },
+  "elapsed_seconds": 692.109,
+  "output": "training\\memory_write_gate\\memory_write_gate_10000.jsonl"
+}

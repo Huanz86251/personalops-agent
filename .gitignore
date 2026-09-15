@@ -68,3 +68,18 @@ workspace/
 .huggingface/
 .playwright/
 
+# Generated training corpora are published on Hugging Face, not duplicated here.
+training/**/*.jsonl
+/evals/memory_write_gate_blind.jsonl
+
+# Private continuity/evidence notes stay local. Public docs are committed separately.
+/AGENTS.md
+/APPWORLD_HANDOFF.md
+/RAG_HANDOFF.md
+/POTENTIAL_IMPROVEMENTS.md
+docs/SESSION_HANDOFF.md
+docs/worklogs/
+docs/**/changes.patch
+docs/appworld/
+docs/rag/
+docs/skills/

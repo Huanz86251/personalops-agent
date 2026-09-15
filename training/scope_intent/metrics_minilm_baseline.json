@@ -1,0 +1,72 @@
+{
+  "created_at_utc": "2026-09-13T00:27:35.242091+00:00",
+  "base_model": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+  "classifier": "LogisticRegression",
+  "encoder_frozen": true,
+  "rows": {
+    "train": 2800,
+    "validation": 600,
+    "test": 600
+  },
+  "seed_counts": {
+    "train": 28,
+    "validation": 6,
+    "test": 6
+  },
+  "threshold_selection": "lowest false-positive count subject to validation positive recall >= 0.98",
+  "validation": {
+    "threshold": 0.27607598900794983,
+    "accuracy": 0.7166666666666667,
+    "roc_auc": 0.9088666666666668,
+    "per_label": {
+      "DIRECT_RESPONSE": {
+        "precision": 0.9577464788732394,
+        "recall": 0.4533333333333333,
+        "f1": 0.6153846153846154
+      },
+      "REQUIRES_SCOPE_CONTRACT": {
+        "precision": 0.6419213973799127,
+        "recall": 0.98,
+        "f1": 0.7757255936675461
+      }
+    },
+    "confusion_matrix": [
+      [
+        136,
+        164
+      ],
+      [
+        6,
+        294
+      ]
+    ]
+  },
+  "test": {
+    "threshold": 0.27607598900794983,
+    "accuracy": 0.85,
+    "roc_auc": 0.9823999999999999,
+    "per_label": {
+      "DIRECT_RESPONSE": {
+        "precision": 1.0,
+        "recall": 0.7,
+        "f1": 0.8235294117647058
+      },
+      "REQUIRES_SCOPE_CONTRACT": {
+        "precision": 0.7692307692307693,
+        "recall": 1.0,
+        "f1": 0.8695652173913043
+      }
+    },
+    "confusion_matrix": [
+      [
+        210,
+        90
+      ],
+      [
+        0,
+        300
+      ]
+    ]
+  },
+  "limitation": "Synthetic held-out seed families measure generator-domain generalization, not production accuracy."
+}

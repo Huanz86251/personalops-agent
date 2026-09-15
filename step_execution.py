@@ -26,6 +26,11 @@ from planning_models import (
     StepCriterionResult,
     StepReport,
 )
+from reporting.models import (
+    StepReviewPacket,
+)
+from reporting.criteria import ReferencedStepReport, normalize_report
+from schema_utils import is_schema_repairable_error, schema_repair_feedback
 
 from prompt_loader import (
     render_prompt,
@@ -37,9 +42,8 @@ logger = logging.getLogger(
 )
 
 
-# 第一次StepReport格式错误时，
-# 只额外修复一次。
-MAX_STEP_REPORT_RETRIES = 1
+# StepReport格式错误时，最多额外修复三次。
+MAX_STEP_REPORT_RETRIES = 3
 # Reporter内部使用的简单上下文预算启发式。
 #
 # 当CLOUD_LLM_MAX_TOKENS=5000时：
@@ -72,6 +76,7 @@ class StepReportRunResult:
     model_rounds_used: int
 
     used_fallback: bool
+    skill_snapshot: dict | None = None
 
 
 def _make_json_safe(
@@ -1411,34 +1416,76 @@ def _report_matches_step(
     return (
         reported_criteria
         == expected_criteria
+        and (
+            report.status != "COMPLETED"
+            or all(item.status == "MET" for item in report.criterion_results)
+        )
     )
+
+
+def _reporter_skill_task(review_packet: StepReviewPacket) -> dict[str, Any]:
+    """Expose bounded outcome clues, never raw Worker messages, to selection.
+
+    This is discovery context, not a replacement for the independent review
+    packet. Claims and excerpts remain untrusted data, not instructions.
+    """
+    return {
+        "task_contract": {k: v for k, v in review_packet.task_contract.model_dump(mode="json").items()
+                          if k in {"user_request", "plan_objective", "step_assignment", "success_criteria"}},
+        "recent_attempt_outcomes": [{
+            "finish_reason": attempt.finish_reason,
+            "has_errors": any(row.get("status") == "ERROR" for row in attempt.tool_audit),
+            "has_artifacts": bool(attempt.resolved_artifacts),
+            "has_unresolved_items": bool(attempt.unresolved_items),
+        } for attempt in review_packet.attempts[-2:]],
+    }
 
 
 async def run_step_reporter(
     simple_model,
     *,
-    user_request: str,
-    plan_objective: str,
     current_step: PlanStep,
-    step_execution_trace: Any,
-    stop_reason: str,
-    remaining_budget: Any,
+    review_packet: StepReviewPacket,
     max_model_rounds: int,
     model_output_max_tokens: int,
+    skill_catalog=None,
+    skill_mode=None,
+    skill_fixed_ids=(),
+    saved_skill_snapshot=None,
 ) -> StepReportRunResult:
-    """生成StepReport；超限时压缩轨迹，失败时安全兜底。
+    """Review one bounded packet in a fresh context with registered material reads.
 
     这个函数：
 
     1. 不调用业务工具；
     2. 不修改原Plan；
     3. 不生成最终用户回答；
-    4. 最多额外执行一次结构修复；
+    4. Schema错误最多额外执行三次结构修复；
     5. 每一次真实模型请求都会计入预算；
-    6. 轨迹不超限时原样提供；
-    7. 轨迹超限时执行轻量确定性压缩；
+    6. 只读取StepReviewPacket，不读取Worker原始消息；
+    7. Packet异常超限时执行最后一道确定性长度保护；
     8. 最终失败时返回Python兜底报告。
     """
+
+    step_execution_trace = review_packet.model_dump(
+        mode="json",
+    )
+    from workers.evidence_refs import registry as evidence_registry, display as evidence_display, eligible_evidence
+    reporter_evidence_refs = evidence_registry({'review_packet': step_execution_trace})
+    completed_evidence_ids = eligible_evidence({'review_packet': step_execution_trace})
+    for attempt in review_packet.attempts:
+        for artifact in attempt.resolved_artifacts:
+            if artifact.review_ref and artifact.review_ref not in reporter_evidence_refs:
+                reporter_evidence_refs[artifact.review_ref] = f"A{sum(v.startswith('A') for v in reporter_evidence_refs.values()) + 1}"
+    valid_reporter_refs = {raw: ref for raw, ref in reporter_evidence_refs.items()
+                           if raw in completed_evidence_ids or ref.startswith("A")}
+    step_execution_trace = evidence_display(step_execution_trace, reporter_evidence_refs)
+    stop_reason = (
+        review_packet.attempts[-1].stop_reason
+        if review_packet.attempts
+        else "Step review requested."
+    )
+    remaining_budget = review_packet.remaining_budget
 
     if (
         isinstance(
@@ -1478,81 +1525,47 @@ async def run_step_reporter(
             "model_output_max_tokens不能小于512。"
         )
 
-    allowed_model_rounds = min(
-        max_model_rounds,
-        MAX_STEP_REPORT_RETRIES + 1,
-    )
+    allowed_model_rounds = max_model_rounds
 
     schema_text = json.dumps(
-        StepReport.model_json_schema(),
+        ReferencedStepReport.model_json_schema(),
 
         ensure_ascii=False,
 
         indent=2,
     )
 
-    common_prompt_values = {
-        "user_request": (
-            user_request.strip()
-        ),
-
-        "plan_objective": (
-            plan_objective.strip()
-        ),
-
-        "current_step": (
-            _to_prompt_text(
-                current_step.model_dump(
-                    mode="json",
-                ),
-
-                "当前Step未知。",
-            )
-        ),
-
-        "step_success_criteria": (
-            _to_prompt_text(
-                current_step.success_criteria,
-
-                "没有Step成功标准。",
-            )
-        ),
-
-        "stop_reason": (
-            stop_reason.strip()
-            or "Simple Executor正常结束。"
-        ),
-
-        "remaining_budget": (
-            _to_prompt_text(
-                remaining_budget,
-
-                "没有剩余预算信息。",
-            )
-        ),
-    }
-
     trace_placeholder = (
-        "[STEP_EXECUTION_TRACE_PLACEHOLDER]"
+        "[STEP_REVIEW_PACKET_PLACEHOLDER]"
     )
 
-    prompt_with_placeholder = render_prompt(
-        "step_report",
+    from skill_runtime import prepare_skills, skill_prompt
+    from prompt_loader import split_prompt
+    snapshot = await prepare_skills(
+        simple_model, role="step_reporter",
+        task=_reporter_skill_task(review_packet),
+        catalog=skill_catalog, topics=[*current_step.skill_topics, *(["appworld"] if any(e.tool_name in {"appworld_discover", "appworld_execute", "appworld_verify"} for a in review_packet.attempts for e in a.resolved_evidence) else [])],
+        mode=skill_mode, fixed_ids=skill_fixed_ids, saved=saved_skill_snapshot,
+        allow_model=max_model_rounds > MAX_STEP_REPORT_RETRIES + 1,
+    )
+    preparation_calls = snapshot.model_calls if saved_skill_snapshot is None else 0
+    allowed_model_rounds = min(allowed_model_rounds, max_model_rounds - preparation_calls)
+    selected_methods = skill_prompt(snapshot)
 
-        step_execution_trace=(
+    prompt_with_placeholder = render_prompt(
+        "reporters/step_report",
+
+        review_packet=(
             trace_placeholder
         ),
-
-        **common_prompt_values,
     )
 
     structured_output_suffix = (
         "\n\n"
-        "[结构化输出要求]\n"
-        "必须只输出一个JSON对象；"
-        "不要输出Markdown代码块或额外说明。\n"
-        "JSON Schema：\n"
-        f"{schema_text}"
+        + render_prompt(
+            "reporters/step_report_output",
+            schema=schema_text,
+        )
     )
 
     # 演示项目的简单启发式预算：
@@ -1588,6 +1601,7 @@ async def run_step_reporter(
     fixed_prompt_tokens = _estimate_tokens(
         prompt_with_placeholder
         + structured_output_suffix
+        + selected_methods
     )
 
     trace_budget_tokens = max(
@@ -1615,23 +1629,21 @@ async def run_step_reporter(
     )
 
     prompt = render_prompt(
-        "step_report",
+        "reporters/step_report",
 
-        step_execution_trace=(
+        review_packet=(
             _to_prompt_text(
                 compacted_trace,
 
-                "没有可用执行轨迹。",
+                "没有可用StepReviewPacket。",
             )
         ),
-
-        **common_prompt_values,
     )
 
     structured_model = (
         simple_model
         .with_structured_output(
-            StepReport,
+            ReferencedStepReport,
 
             # 与Hard结构化节点保持一致。
             # Thinking模式下不依赖强制Tool Choice。
@@ -1657,7 +1669,25 @@ async def run_step_reporter(
         }
     ]
 
-    model_rounds_used = 0
+    fixed_prompt, packet_context = split_prompt(prompt)
+    messages = [{"role": "system", "content": fixed_prompt + structured_output_suffix + "\n\n" + selected_methods},
+                {"role": "user", "content": packet_context}]
+    # The contract is never compressed with evidence; validation uses these exact criteria.
+    messages.append({"role": "user", "content": "原始验收契约（逐条原样审核，不得自行拆分或替换）：" + review_packet.task_contract.model_dump_json()})
+    # Publication identities must survive packet compaction; approval uses these exact refs.
+    artifact_manifest = [{"review_ref": reporter_evidence_refs.get(a.review_ref, a.review_ref), "description": a.description[:300],
+                          "size_bytes": a.size_bytes, "sha256": a.sha256}
+                         for attempt in review_packet.attempts for a in attempt.resolved_artifacts]
+    if artifact_manifest:
+        messages.append({"role": "user", "content": "候选文件索引（存在不等于内容已验证）：" + json.dumps(artifact_manifest, ensure_ascii=False)})
+    from reporting.materials import ReviewWithReads, build_reader
+    _, material_refs = build_reader(review_packet)
+    material_refs = evidence_display(material_refs, reporter_evidence_refs)
+    if material_refs and hasattr(simple_model, "bind_tools") and allowed_model_rounds > 1:
+        structured_model = ReviewWithReads(simple_model, structured_model, review_packet, allowed_model_rounds)
+        messages.append({"role": "user", "content": "可按需调用read_review_material读取登记材料，或直接提交StepReport。最后一轮只提交报告。材料引用：" + json.dumps(material_refs, ensure_ascii=False)})
+    material_read_pending = False
+    model_rounds_used = preparation_calls
 
     last_error = (
         "未知StepReport错误。"
@@ -1696,6 +1726,8 @@ async def run_step_reporter(
                 model_output_max_tokens
             ),
 
+            "review_contract_preserved": True,
+            "review_final_submission_reserve": min(2, allowed_model_rounds),
             "reporter_total_budget_tokens": (
                 total_budget_tokens
             ),
@@ -1729,6 +1761,8 @@ async def run_step_reporter(
             "step_report.requested_model_rounds": (
                 max_model_rounds
             ),
+            "evidence.references_json": json.dumps({ref: raw for raw, ref in reporter_evidence_refs.items()}),
+            "review.criteria_json": json.dumps(review_packet.task_contract.criterion_registry, ensure_ascii=False),
 
             "step_report.allowed_model_rounds": (
                 allowed_model_rounds
@@ -1751,21 +1785,24 @@ async def run_step_reporter(
         for attempt_index in range(
             allowed_model_rounds
         ):
-            if attempt_index > 0:
+            if attempt_index > 0 and not material_read_pending:
                 messages.append(
                     {
                         "role": "user",
 
-                        "content": (
-                            "上一次输出被截断或没有通过"
-                            "StepReport结构校验。\n"
-                            "保持已有事实判断不变，"
-                            "重新输出更紧凑、完整且合法的JSON。\n"
-                            "不要重复证据，不要输出额外说明。\n\n"
-                            f"错误：{last_error[:500]}"
+                        "content": schema_repair_feedback(
+                            schema_name="StepReport",
+                            schema=ReferencedStepReport.model_json_schema(),
+                            error_text=last_error[:1000],
+                            instruction=(
+                                "保留审核判断，只修正报告表单；criterion_results必须按C编号覆盖全部标准，"
+                                "证据只引用已登记E/A编号，不要重新执行Worker业务。"
+                            ),
                         ),
                     }
                 )
+
+            material_read_pending = False
 
             # 只要真实发起请求就计入预算。
             #
@@ -1792,9 +1829,8 @@ async def run_step_reporter(
                 )
 
                 if (
-                    attempt_index
-                    + 1
-                    < allowed_model_rounds
+                    attempt_index + 1 < allowed_model_rounds
+                    and is_schema_repairable_error(error)
                 ):
                     continue
 
@@ -1810,6 +1846,10 @@ async def run_step_reporter(
 
                 continue
 
+            if response.get("material_read"):
+                material_read_pending = True
+                continue
+
             parsing_error = response.get(
                 "parsing_error"
             )
@@ -1823,11 +1863,7 @@ async def run_step_reporter(
 
             try:
                 report = (
-                    StepReport.model_validate(
-                        response.get(
-                            "parsed"
-                        )
-                    )
+                    normalize_report(response.get("parsed"), current_step.success_criteria, valid_reporter_refs)
                 )
 
             except Exception as error:
@@ -1842,8 +1878,8 @@ async def run_step_reporter(
                 current_step,
             ):
                 last_error = (
-                    "StepReport没有按原顺序"
-                    "审核当前Step的全部成功标准。"
+                    "StepReport必须匹配当前step_id并按原顺序审核全部成功标准；"
+                    "只有每项criterion_results.status都是MET才允许COMPLETED。"
                 )
 
                 continue
@@ -1899,6 +1935,7 @@ async def run_step_reporter(
             )
 
             return StepReportRunResult(
+                skill_snapshot=snapshot.model_dump(mode="json"),
                 report=(
                     report
                 ),
@@ -2010,6 +2047,7 @@ async def run_step_reporter(
         )
 
         return StepReportRunResult(
+            skill_snapshot=snapshot.model_dump(mode="json"),
             report=(
                 fallback_report
             ),

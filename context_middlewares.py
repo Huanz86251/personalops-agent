@@ -4,19 +4,12 @@ from typing import (
     Any,
 )
 
-from config import (
-    PlanningSettings,
-)
-
 from langchain.agents import (
     AgentState,
 )
 
 from langchain.agents.middleware import (
-    ModelRequest,
-    SummarizationMiddleware,
     before_model,
-    dynamic_prompt,
 )
 
 from langchain.messages import (
@@ -34,7 +27,7 @@ from observability import (
     trace_span,
 )
 from prompt_loader import (
-    load_prompt,
+    render_prompt,
 )
 def _read_message_role(
     message: Any,
@@ -600,150 +593,6 @@ def _infer_model_round(
         + 1
     )
 
-@dynamic_prompt
-def build_runtime_prompt(
-    request: ModelRequest,
-) -> str:
-    """为每次主模型调用生成动态系统提示词并记录上下文。"""
-
-    base_prompt = load_prompt(
-        "assistant"
-    )
-
-    state = (
-        request.state
-        or {}
-    )
-
-    memory_context = state.get(
-        "memory_context",
-        "",
-    )
-
-    if not isinstance(
-        memory_context,
-        str,
-    ):
-        memory_context = ""
-
-    memory_context = (
-        memory_context.strip()
-    )
-
-    # request.messages表示当前这一次
-    # ModelRequest携带的消息快照。
-    #
-    # 与直接读取state["messages"]相比，
-    # 它更接近当前Middleware实际处理的模型请求。
-    current_messages = list(
-        request.messages
-    )
-
-    if not memory_context:
-        runtime_prompt = (
-            base_prompt
-        )
-
-    else:
-        runtime_prompt = (
-            f"{base_prompt}\n\n"
-            f"{memory_context}"
-        )
-
-    model_round = (
-        _infer_model_round(
-            current_messages
-        )
-    )
-
-    span_name = (
-        "main_model_context."
-        f"round_{model_round}"
-    )
-
-    with trace_span(
-        span_name,
-
-        # 这里只是在组织和拼接模型上下文，
-        # 并没有真正调用LLM。
-        #
-        # 因此使用chain，
-        # 不应错误标记为llm。
-        kind="chain",
-
-        input_value={
-            "conversation_id": (
-                state.get(
-                    "conversation_id"
-                )
-            ),
-
-            "conversation_title": (
-                state.get(
-                    "conversation_title"
-                )
-            ),
-
-            "model_round": (
-                model_round
-            ),
-
-            "message_count": len(
-                current_messages
-            ),
-
-            "has_memory_context": bool(
-                memory_context
-            ),
-        },
-
-        attributes={
-            "agent.model_round": (
-                model_round
-            ),
-
-            "agent.message_count": len(
-                current_messages
-            ),
-
-            "memory.context_present": bool(
-                memory_context
-            ),
-
-            "memory.context_chars": len(
-                memory_context
-            ),
-
-            "prompt.system_chars": len(
-                runtime_prompt
-            ),
-        },
-    ) as span:
-
-        set_span_output(
-            span,
-
-            {
-                # 当前这一轮模型调用之前，
-                # ModelRequest中实际携带的消息。
-                "conversation_messages": (
-                    current_messages
-                ),
-
-                # 从长期记忆模块最终允许注入的内容。
-                "injected_memory_context": (
-                    memory_context
-                ),
-
-                # 最终返回给dynamic_prompt的完整系统提示词。
-                "final_system_prompt": (
-                    runtime_prompt
-                ),
-            },
-        )
-
-    return runtime_prompt
-
 def _message_content_to_text(
     content: Any,
 ) -> str:
@@ -932,7 +781,7 @@ async def summarize_conversation_history(
     这个函数不是Agent Middleware：
 
     - 由ConversationRuntime在一次Planning Run开始前调用；
-    - 使用同一个conversation_summary.md提示词；
+    - 使用conversation/summary提示词整理历史进展；
     - 把旧摘要和新进入摘要区的消息合并压缩；
     - 失败时保留旧摘要，并附带确定性压缩的新消息，
       避免因为一次模型异常丢失Conversation上下文。
@@ -976,14 +825,8 @@ async def summarize_conversation_history(
         source_blocks
     )
 
-    summary_template = load_prompt(
-        "conversation_summary"
-    )
-
     summary_prompt = (
-        summary_template.format(
-            messages=source_text
-        )
+        render_prompt("conversation/summary")
         + "\n\n"
         + (
             "最终摘要总长度不得超过"
@@ -1020,7 +863,8 @@ async def summarize_conversation_history(
                     {
                         "role": "system",
                         "content": summary_prompt,
-                    }
+                    },
+                    {"role": "user", "content": source_text},
                 ]
             )
 
@@ -1100,62 +944,3 @@ async def summarize_conversation_history(
             )
 
             return fallback_summary
-
-
-def build_context_middlewares(
-    model,
-    planning: PlanningSettings,
-) -> list:
-    """创建Simple Executor使用的上下文Middleware。
-
-    PlanningSettings是唯一配置来源，
-    本文件不再保留固定摘要阈值。
-    """
-
-    summary_prompt = load_prompt(
-        "conversation_summary"
-    )
-
-    return [
-        # 先修复损坏的AI/Tool消息块，
-        # 后续摘要和主模型只能读取合法历史。
-        repair_incomplete_tool_history,
-
-        # 官方Middleware只负责当前独立Step Thread：
-        # 压缩较早的模型/工具轨迹，保留最近消息。
-        SummarizationMiddleware(
-            model=model,
-
-            trigger=[
-                (
-                    "tokens",
-                    planning
-                    .executor_summary_trigger_tokens,
-                ),
-                (
-                    "messages",
-                    planning
-                    .executor_summary_trigger_messages,
-                ),
-            ],
-
-            keep=(
-                "messages",
-                planning
-                .executor_summary_keep_messages,
-            ),
-
-            summary_prompt=(
-                summary_prompt
-            ),
-
-            trim_tokens_to_summarize=(
-                planning
-                .executor_summary_trigger_tokens
-            ),
-        ),
-
-        # 在摘要完成之后，基于本次真实ModelRequest
-        # 构造最终系统Prompt并记录Phoenix上下文。
-        build_runtime_prompt,
-    ]

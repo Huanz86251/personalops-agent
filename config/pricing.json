@@ -1,0 +1,57 @@
+{
+  "profile": "aliyun-beijing-public-text-2026-09-09",
+  "verified_on": "2026-09-09",
+  "currency": "CNY",
+  "cache_mode": "implicit",
+  "cny_per_usd": 6.7769,
+  "fx_date": "2026-09-09",
+  "fx_source": "https://www.news.cn/20260909/fb91fe4d422a42e7bacb705146897b41/c.html",
+  "models": {
+    "qwen3.7-flash": {
+      "source": "https://help.aliyun.com/zh/model-studio/qwen3-7-flash",
+      "tiers": [
+        [
+          32000,
+          0.2,
+          0.04,
+          0.8
+        ],
+        [
+          256000,
+          0.6,
+          0.12,
+          2.4
+        ],
+        [
+          1000000,
+          1.2,
+          0.24,
+          4.8
+        ]
+      ]
+    },
+    "qwen3.8-flash": {
+      "source": "https://help.aliyun.com/zh/model-studio/qwen3-8-flash",
+      "tiers": [
+        [
+          1000000,
+          0.8,
+          0.1,
+          2.7
+        ]
+      ]
+    },
+    "ZHIPU/GLM-5.3-Flash": {
+      "source": "https://help.aliyun.com/zh/model-studio/glm-5-3-flash-by-zhipu",
+      "verified_on": "2026-09-11",
+      "tiers": [
+        [
+          1048576,
+          0.8,
+          0.23,
+          2.8
+        ]
+      ]
+    }
+  }
+}
