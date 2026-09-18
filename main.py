@@ -395,6 +395,37 @@ def _parse_command(
     )
 
 
+def _resolve_feishu_menu_text(message: Any, text: str) -> tuple[str, bool]:
+    """Map only exact plain-text menu labels to local control commands.
+
+    Feishu's "send text message" menu sends its visible name in clients that
+    do not offer a separate payload field. Never route rich text or attachments
+    through this shortcut table.
+    """
+
+    if (
+        getattr(getattr(message, "content", None), "kind", "") != "text"
+        or getattr(message, "resources", ())
+        or getattr(message, "batched_sources", None)
+    ):
+        return text, False
+    label = "".join(text.strip().split()).replace("／", "/")
+    commands = {
+        "插入任务": "/insert",
+        "替换任务": "/replace",
+        "取消任务": "/cancel",
+        "新建对话": "/new",
+        "查看/切换": "/list",
+        "当前对话": "/current",
+        "提交RAG": "/rag",
+        "清理记忆": "/clean",
+        "帮助": "/help",
+        "退出输入": "/exit",
+    }
+    command = commands.get(label)
+    return (command, True) if command is not None else (text, False)
+
+
 async def _send_text(
     chat_id: str,
     text: str,
@@ -1150,6 +1181,8 @@ async def _handle_command(
     chat_id: str,
     command: str,
     args: list[str],
+    *,
+    sender_id: str = "",
 ) -> bool:
     """处理命令。
 
@@ -1218,7 +1251,9 @@ async def _handle_command(
         return True
 
     if command == "exit":
-        if FEISHU_INTERACTIONS.pop(chat_id, None) is None:
+        interaction_closed = FEISHU_INTERACTIONS.pop(chat_id, None) is not None
+        upload_closed = RAG_UPLOADS.disarm(chat_id, sender_id) if sender_id else False
+        if not interaction_closed and not upload_closed:
             await _send_text(chat_id, "当前没有需要退出的交互模式。")
         else:
             await _send_text(chat_id, "已退出当前交互模式。")
@@ -1852,7 +1887,15 @@ async def handle_feishu_message(
     if not FEISHU_EXPORTS.admit_message(message):
         await _send_text(chat_id, "当前个人助手仅对本机配置的授权用户和会话开放。")
         return
+    sender_id = str(getattr(getattr(message, "sender", None), "open_id", "") or "")
+    user_text, from_menu = _resolve_feishu_menu_text(message, user_text)
     command, _ = _parse_command(user_text)
+    if from_menu and command not in {"rag", "exit"}:
+        # Choosing a different menu action must not leave an earlier one-shot
+        # RAG upload or text-input mode waiting for an unrelated next message.
+        FEISHU_INTERACTIONS.pop(chat_id, None)
+        if sender_id:
+            RAG_UPLOADS.disarm(chat_id, sender_id)
     control_only = (
         command in {
             "start", "help", "new", "list", "switch", "current",
@@ -1920,7 +1963,6 @@ async def handle_feishu_message(
         if args:
             await _send_text(chat_id, "用法：/rag（下一条资料只进入 RAG）")
             return
-        sender_id = str(getattr(getattr(message, "sender", None), "open_id", "") or "")
         if not sender_id:
             await _send_text(chat_id, "无法识别发送者，未开启 RAG 上传。")
             return
@@ -1977,7 +2019,9 @@ async def handle_feishu_message(
 
     if command is not None:
         async with OWNER_MESSAGE_LOCK:
-            command_handled = await _handle_command(chat_id, command, args)
+            command_handled = await _handle_command(
+                chat_id, command, args, sender_id=sender_id,
+            )
         if command_handled:
             return
 

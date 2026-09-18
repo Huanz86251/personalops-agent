@@ -24,6 +24,14 @@ class RagUploadInbox:
         with closing(self._db()) as db, db:
             db.execute("INSERT OR IGNORE INTO pending VALUES (?,?)", (chat, sender))
 
+    def disarm(self, chat, sender):
+        with closing(self._db()) as db, db:
+            return bool(
+                db.execute(
+                    "DELETE FROM pending WHERE chat=? AND sender=?", (chat, sender)
+                ).rowcount
+            )
+
     def claim(self, chat, sender, message):
         key = key_for(chat, sender, message)
         with closing(self._db()) as db, db:

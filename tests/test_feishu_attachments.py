@@ -124,6 +124,7 @@ def adapter_namespace(store, runtime, channel, pump):
     source = Path(__file__).resolve().parents[1] / "main.py"
     wanted = {
         "_parse_command",
+        "_resolve_feishu_menu_text",
         "_enqueue_feishu_event",
         "_enqueue_feishu_replace",
         "_cancel_running_task",
@@ -383,7 +384,9 @@ class FeishuIngressTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(event.payload_text.startswith("读取图片\n"))
         self.assertIn("/handoff/inbound/", event.payload_text)
         await self.ns["handle_feishu_message"](incoming("new", "/new 新对话"))
-        self.ns["_handle_command"].assert_awaited_once_with("chat", "new", ["新对话"])
+        self.ns["_handle_command"].assert_awaited_once_with(
+            "chat", "new", ["新对话"], sender_id="owner"
+        )
         self.pump.notify.assert_called_once()
 
     async def test_rag_menu_command_arms_next_message_without_queueing_agent(self):
@@ -398,11 +401,65 @@ class FeishuIngressTests(unittest.IsolatedAsyncioTestCase):
     async def test_menu_command_is_control_only(self):
         self.ns["RAG_UPLOADS"].arm("chat", "owner")
         await self.ns["handle_feishu_message"](incoming("menu-command", "/menu"))
-        self.ns["_handle_command"].assert_awaited_once_with("chat", "menu", [])
+        self.ns["_handle_command"].assert_awaited_once_with(
+            "chat", "menu", [], sender_id="owner"
+        )
         self.assertIsNotNone(
             self.ns["RAG_UPLOADS"].claim("chat", "owner", "following-upload")[0]
         )
         self.pump.notify.assert_not_called()
+
+    async def test_visible_menu_label_routes_without_entering_agent_queue(self):
+        await self.ns["handle_feishu_message"](incoming("menu-new", "新建对话"))
+        self.ns["_handle_command"].assert_awaited_once_with(
+            "chat", "new", [], sender_id="owner"
+        )
+        self.pump.notify.assert_not_called()
+
+    async def test_menu_choice_clears_pending_rag_before_other_action(self):
+        self.ns["RAG_UPLOADS"].arm("chat", "owner")
+        await self.ns["handle_feishu_message"](incoming("menu-list", "查看／切换"))
+        self.ns["_handle_command"].assert_awaited_once_with(
+            "chat", "list", [], sender_id="owner"
+        )
+        self.assertIsNone(
+            self.ns["RAG_UPLOADS"].claim("chat", "owner", "following-upload")[0]
+        )
+        self.pump.notify.assert_not_called()
+
+    async def test_menu_upload_arms_rag_without_entering_agent_queue(self):
+        await self.ns["handle_feishu_message"](incoming("menu-rag", "提交 RAG"))
+        self.assertIsNotNone(
+            self.ns["RAG_UPLOADS"].claim("chat", "owner", "following-upload")[0]
+        )
+        self.pump.notify.assert_not_called()
+
+    async def test_menu_resolver_ignores_rich_text_and_unrecognized_labels(self):
+        resolver = self.ns["_resolve_feishu_menu_text"]
+        for label, command in {
+            "插入任务": "/insert",
+            "替换任务": "/replace",
+            "取消任务": "/cancel",
+            "新建对话": "/new",
+            "查看 / 切换": "/list",
+            "当前对话": "/current",
+            "提交 RAG": "/rag",
+            "清理记忆": "/clean",
+            "帮助": "/help",
+            "退出输入": "/exit",
+        }.items():
+            with self.subTest(label=label):
+                self.assertEqual(
+                    resolver(incoming("label", label), label), (command, True)
+                )
+        self.assertEqual(
+            resolver(incoming("rich", "插入任务", kind="post"), "插入任务"),
+            ("插入任务", False),
+        )
+        self.assertEqual(
+            resolver(incoming("unknown", "未命名"), "未命名"),
+            ("未命名", False),
+        )
 
     async def test_inspection_never_loads_ocr_model(self):
         source = self.root / "inspect.pdf"
@@ -496,7 +553,9 @@ class FeishuIngressTests(unittest.IsolatedAsyncioTestCase):
             await self.ns["handle_feishu_message"](incoming("cancel-now", "/cancel"))
             await self.ns["handle_feishu_message"](incoming("new-now", "/new next"))
         self.ns["_enqueue_feishu_cancel"].assert_awaited_once_with(chat_id="chat")
-        self.ns["_handle_command"].assert_awaited_once_with("chat", "new", ["next"])
+        self.ns["_handle_command"].assert_awaited_once_with(
+            "chat", "new", ["next"], sender_id="owner"
+        )
 
     async def test_button_started_insert_consumes_next_plain_message_locally(self):
         self.ns["FEISHU_INTERACTIONS"]["chat"] = SimpleNamespace(

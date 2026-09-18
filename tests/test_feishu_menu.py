@@ -6,10 +6,12 @@ import ast
 import logging
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from lark_channel import new_card
+from knowledge_rag.ingress import RagUploadInbox
 
 
 def card_namespace():
@@ -59,3 +61,31 @@ class FeishuMenuTests(unittest.IsolatedAsyncioTestCase):
             await namespace["_send_control_panel"]("chat")
         self.assertIn("230001", logs.output[0])
         namespace["_send_text"].assert_awaited_once()
+
+    async def test_exit_command_cancels_pending_rag_upload(self):
+        source = Path(__file__).resolve().parents[1] / "main.py"
+        function = next(
+            node
+            for node in ast.parse(source.read_text(encoding="utf-8")).body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_handle_command"
+        )
+        module = ast.Module(
+            body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), function],
+            type_ignores=[],
+        )
+        with TemporaryDirectory() as root:
+            uploads = RagUploadInbox(Path(root) / "uploads")
+            uploads.arm("chat", "owner")
+            namespace = {
+                "RAG_UPLOADS": uploads,
+                "FEISHU_INTERACTIONS": {},
+                "_send_text": AsyncMock(),
+            }
+            exec(compile(ast.fix_missing_locations(module), str(source), "exec"), namespace)  # noqa: S102
+            self.assertTrue(
+                await namespace["_handle_command"](
+                    "chat", "exit", [], sender_id="owner"
+                )
+            )
+            self.assertIsNone(uploads.claim("chat", "owner", "later-message")[0])
+            self.assertIn("已退出", namespace["_send_text"].call_args.args[1])

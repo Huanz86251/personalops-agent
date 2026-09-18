@@ -102,7 +102,7 @@ Toolset Router 先用本地 Cross Encoder 在用户请求与当前 Step 上选�
 
 ### 飞书一键提交 RAG
 
-在单聊的机器人自定义菜单点击 **“提交 RAG”**（配置为发送 `/rag`），或直接发送 `/rag`；也可用 `/menu` 调出消息内卡片并点击同名按钮。随后下一条消息只进入本地知识库，不会触发 Agent 执行。支持 TXT、Markdown、JSON/JSONL、CSV、HTML、PDF、DOCX、XLSX 和 PPTX：普通文档保留标题与章节结构；API JSON/OpenAPI 自动建立“应用—资源—读写—接口”目录；扫描版 PDF 在直接解析无文字时才进入隔离 OCR 进程。格式错误、无可读文字或不支持的文件会收到明确拒绝消息。
+在单聊的机器人自定义菜单点击 **“提交 RAG”**（响应动作选「发送文字消息」，本地将该菜单名称映射为 `/rag`），或直接发送 `/rag`；也可用 `/menu` 调出消息内卡片并点击同名按钮。随后下一条消息只进入本地知识库，不会触发 Agent 执行。支持 TXT、Markdown、JSON/JSONL、CSV、HTML、PDF、DOCX、XLSX 和 PPTX：普通文档保留标题与章节结构；API JSON/OpenAPI 自动建立“应用—资源—读写—接口”目录；扫描版 PDF 在直接解析无文字时才进入隔离 OCR 进程。格式错误、无可读文字或不支持的文件会收到明确拒绝消息。
 
 所有上传内容、向量库和解析回执均保存在 Git 忽略的 `.agent/rag/`，不会进入仓库。
 
