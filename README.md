@@ -44,7 +44,7 @@ PersonalOps Agent 通过飞书长连接接收消息，使用可独立配置的�
 - 普通消息按 FIFO 等待；`/insert` 在安全节点暂停当前任务并优先执行
 - `/replace 新要求` 在安全节点替换旧 Run，只继承已验收 handoff 与干净的 Git integration，再由新 Scheduler 完整规划
 - `/cancel` 在安全节点终止当前任务，保留 Trace、Checkpoint 和归档证据
-- 正常答复后附带紧凑的飞书卡片操作栏；可点击“提交 RAG”让下一条文本或文档只进入知识库，也可使用帮助、插入、替换、取消和记忆清理，卡片失败时仍可使用文本命令
+- 支持在飞书开放平台配置机器人自定义菜单，将常用命令固定在单聊输入区；普通答复不再追加“快捷操作”文字气泡。`/menu` 可按需显示消息内卡片按钮，菜单与卡片都不可用时仍可输入命令。配置见 [飞书机器人菜单](docs/feishu-bot-menu.md)
 - Code Reviewer 或 Web Step Reporter 批准的用户交付物会生成同一张独立交付请求；human 模式等待批准，auto 模式按同一确定性流程交付
 - 每个 Conversation 使用独立的正式 workspace，并为最终交付创建本地 Git commit
 - 支持创建、查看和切换独立对话
@@ -54,6 +54,8 @@ PersonalOps Agent 通过飞书长连接接收消息，使用可独立配置的�
 
 ```text
 /help               查看使用说明
+/rag                下一条文本或文档只进入 RAG，不执行任务
+/menu               按需显示消息内快捷按钮卡片
 /new [标题]         创建并切换到新对话
 /list               查看最近对话
 /switch 编号或短ID  切换对话
@@ -100,7 +102,7 @@ Toolset Router 先用本地 Cross Encoder 在用户请求与当前 Step 上选�
 
 ### 飞书一键提交 RAG
 
-点击飞书控制卡片中的 **“提交 RAG”** 后，下一条消息只进入本地知识库，不会触发 Agent 执行。支持 TXT、Markdown、JSON/JSONL、CSV、HTML、PDF、DOCX、XLSX 和 PPTX：普通文档保留标题与章节结构；API JSON/OpenAPI 自动建立“应用—资源—读写—接口”目录；扫描版 PDF 在直接解析无文字时才进入隔离 OCR 进程。格式错误、无可读文字或不支持的文件会收到明确拒绝消息。
+在单聊的机器人自定义菜单点击 **“提交 RAG”**（配置为发送 `/rag`），或直接发送 `/rag`；也可用 `/menu` 调出消息内卡片并点击同名按钮。随后下一条消息只进入本地知识库，不会触发 Agent 执行。支持 TXT、Markdown、JSON/JSONL、CSV、HTML、PDF、DOCX、XLSX 和 PPTX：普通文档保留标题与章节结构；API JSON/OpenAPI 自动建立“应用—资源—读写—接口”目录；扫描版 PDF 在直接解析无文字时才进入隔离 OCR 进程。格式错误、无可读文字或不支持的文件会收到明确拒绝消息。
 
 所有上传内容、向量库和解析回执均保存在 Git 忽略的 `.agent/rag/`，不会进入仓库。
 

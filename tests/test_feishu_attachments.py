@@ -386,6 +386,24 @@ class FeishuIngressTests(unittest.IsolatedAsyncioTestCase):
         self.ns["_handle_command"].assert_awaited_once_with("chat", "new", ["新对话"])
         self.pump.notify.assert_called_once()
 
+    async def test_rag_menu_command_arms_next_message_without_queueing_agent(self):
+        await self.ns["handle_feishu_message"](incoming("rag-command", "/rag"))
+        self.ns["_send_text"].assert_awaited_once()
+        self.assertIn("只存入 RAG", self.ns["_send_text"].call_args.args[1])
+        self.assertIsNotNone(
+            self.ns["RAG_UPLOADS"].claim("chat", "owner", "next-upload")[0]
+        )
+        self.pump.notify.assert_not_called()
+
+    async def test_menu_command_is_control_only(self):
+        self.ns["RAG_UPLOADS"].arm("chat", "owner")
+        await self.ns["handle_feishu_message"](incoming("menu-command", "/menu"))
+        self.ns["_handle_command"].assert_awaited_once_with("chat", "menu", [])
+        self.assertIsNotNone(
+            self.ns["RAG_UPLOADS"].claim("chat", "owner", "following-upload")[0]
+        )
+        self.pump.notify.assert_not_called()
+
     async def test_inspection_never_loads_ocr_model(self):
         source = self.root / "inspect.pdf"
         source.write_bytes(self.pdf)

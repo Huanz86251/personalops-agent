@@ -432,6 +432,13 @@ async def _send_card(
     try:
         result = await feishu_channel.send(chat_id, {"card": card})
         if not result.success:
+            error = result.error
+            logger.warning(
+                "飞书消息卡片被拒绝，已降级为纯文本 | code=%s | raw_code=%s | hint=%s",
+                getattr(error, "code", None),
+                getattr(error, "raw_code", None),
+                getattr(error, "hint", None),
+            )
             await _send_text(chat_id, fallback_text)
     except Exception:
         logger.exception("飞书消息卡片发送失败，已降级为纯文本")
@@ -455,8 +462,7 @@ async def _send_control_panel(chat_id: str) -> None:
         new_card()
         .header("PersonalOps", subtitle="快捷操作", template="blue")
         .buttons(buttons[:3])
-        .buttons(buttons[3:6])
-        .buttons(buttons[6:])
+        .buttons(buttons[3:])
         .build()
     )
     await _send_card(
@@ -656,6 +662,8 @@ async def _start_command(
         "**运行控制**\n"
         "`/insert 内容` 优先插入后恢复 · `/replace 内容` 安全替换 · "
         "`/cancel` 安全取消\n\n"
+        "**快捷入口**\n"
+        "`/rag` 让下一条资料只进入知识库 · `/menu` 显示消息内按钮\n\n"
         "**记忆**\n"
         f"`/clean` 进入冲突清理（当前 {conflicts['open_groups']} 组 / "
         f"{conflicts['open_pairs']} 对，高置信 {conflicts['high_priority_groups']} 组） · "
@@ -1160,6 +1168,10 @@ async def _handle_command(
 
         return True
 
+    if command == "menu":
+        await _send_control_panel(chat_id)
+        return True
+
     if command == "new":
         await _new_conversation_command(
             chat_id,
@@ -1345,8 +1357,6 @@ async def _deliver_feishu_event_result(event: AgentEvent, result: str) -> None:
         return
     chat_id, _ = context
     await _send_text(chat_id, result)
-    if event.action is not EventAction.CANCEL:
-        await _send_control_panel(chat_id)
     logger.info(
         "EVENT COMPLETE | event_id=%s | %s",
         event.event_id,
@@ -1774,6 +1784,7 @@ async def handle_feishu_card_action(event: Any) -> None:
         await _send_text(chat_id, "无法识别这个按钮，请使用 /help。")
         return
     if action == "rag_upload":
+        FEISHU_INTERACTIONS.pop(chat_id, None)
         RAG_UPLOADS.arm(chat_id, operator_id)
         await _send_text(chat_id, "请发送下一条资料（文本、PDF、TXT、Markdown、JSON/JSONL、CSV、HTML、DOCX、XLSX、PPTX）；只存入 RAG，不执行任务。扫描版 PDF 会尝试 OCR，语音需有转写文本。")
     elif action == "help":
@@ -1841,28 +1852,29 @@ async def handle_feishu_message(
     if not FEISHU_EXPORTS.admit_message(message):
         await _send_text(chat_id, "当前个人助手仅对本机配置的授权用户和会话开放。")
         return
-    conversation = await conversation_runtime.get_active_conversation(
-        channel=FEISHU_CHANNEL, external_chat_id=OWNER_EXTERNAL_CHAT_ID,
-    )
-    upload_reply = await RAG_UPLOADS.consume(
-        message, FEISHU_ATTACHMENTS, feishu_channel,
-        getattr(conversation_runtime, "retrieval_hub", None), conversation.conversation_id,
-    )
-    if upload_reply is not None:
-        await _send_text(chat_id, upload_reply)
-        await _send_control_panel(chat_id)
-        return
-    if await FEISHU_EXPORTS.handle_control(message, user_text):
-        return
     command, _ = _parse_command(user_text)
     control_only = (
         command in {
             "start", "help", "new", "list", "switch", "current",
             "approve", "reject", "cancel", "insert", "replace", "clean", "exit",
+            "rag", "menu",
         }
         and not getattr(message, "resources", ())
         and not getattr(message, "batched_sources", None)
     )
+    conversation = await conversation_runtime.get_active_conversation(
+        channel=FEISHU_CHANNEL, external_chat_id=OWNER_EXTERNAL_CHAT_ID,
+    )
+    if not control_only:
+        upload_reply = await RAG_UPLOADS.consume(
+            message, FEISHU_ATTACHMENTS, feishu_channel,
+            getattr(conversation_runtime, "retrieval_hub", None), conversation.conversation_id,
+        )
+        if upload_reply is not None:
+            await _send_text(chat_id, upload_reply)
+            return
+    if await FEISHU_EXPORTS.handle_control(message, user_text):
+        return
     if not control_only:
         try:
             async with OWNER_MESSAGE_LOCK:
@@ -1904,6 +1916,18 @@ async def handle_feishu_message(
     logger.info("USER | %s", _compact_terminal_text(user_text))
 
     command, args = _parse_command(user_text)
+    if command == "rag":
+        if args:
+            await _send_text(chat_id, "用法：/rag（下一条资料只进入 RAG）")
+            return
+        sender_id = str(getattr(getattr(message, "sender", None), "open_id", "") or "")
+        if not sender_id:
+            await _send_text(chat_id, "无法识别发送者，未开启 RAG 上传。")
+            return
+        FEISHU_INTERACTIONS.pop(chat_id, None)
+        RAG_UPLOADS.arm(chat_id, sender_id)
+        await _send_text(chat_id, "请发送下一条资料（文本、PDF、TXT、Markdown、JSON/JSONL、CSV、HTML、DOCX、XLSX、PPTX）；只存入 RAG，不执行任务。")
+        return
     if command == "cancel":
         if args:
             await _send_text(chat_id, "用法：/cancel（取消当前运行任务）")
