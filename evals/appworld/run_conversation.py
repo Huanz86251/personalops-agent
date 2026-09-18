@@ -14,15 +14,17 @@ import os
 from pathlib import Path
 from uuid import uuid4
 
+EXECUTION_ENVIRONMENT = "appworld"
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task", required=True)
-    parser.add_argument("--split", choices=("train", "dev", "test_normal"), required=True)
+    parser.add_argument("--split", choices=("train", "dev", "test_normal", "test_challenge"), required=True)
     parser.add_argument("--image")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--phoenix-project")
-    parser.add_argument("--max-calls", type=int, default=60)
+    parser.add_argument("--max-calls", type=int, default=80)
     parser.add_argument("--max-interactions", type=int, default=90)
     parser.add_argument("--allow-paid", action="store_true")
     monitor_default = os.getenv("APPWORLD_RUN_MONITOR_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
@@ -43,11 +45,10 @@ def main():
     from phoenix_runtime import PhoenixServerRuntime
     phoenix_runtime = PhoenixServerRuntime()
     phoenix_runtime.start()
-    image = args.image or (
-        "personalops-appworld-test-normal:0.1.3.post1"
-        if args.split == "test_normal"
-        else "personalops-appworld:0.1.3.post1"
-    )
+    image = args.image or {
+        "test_normal": "personalops-appworld-test-normal:0.1.3.post1",
+        "test_challenge": "personalops-appworld-test-challenge:0.1.3.post1",
+    }.get(args.split, "personalops-appworld:0.1.3.post1")
     if args.output is None:
         out = root / ".agent/appworld-conversations" / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid4().hex[:8])
     else:
@@ -111,7 +112,7 @@ def main():
         save("manifest.json", {"task_id": args.task, "split": args.split,
              "max_calls": args.max_calls, "max_interactions": args.max_interactions,
              "entrypoint": "normal ConversationRuntime", "project": os.environ["PHOENIX_PROJECT"],
-             "image": image})
+             "image": image, "execution_environment": EXECUTION_ENVIRONMENT})
         try:
             with DockerWorld(image=image) as world:
                 task = world.request("initialize", split=args.split, task_id=args.task,

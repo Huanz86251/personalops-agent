@@ -97,7 +97,8 @@ class CatalogTests(unittest.TestCase):
                 self.assertEqual({s.name for s in result.selected}, set(selected))
                 request = json.loads(model.selection_requests[0][0]["content"])
                 candidates = request["available_skills"]
-                self.assertTrue(all(set(item) == {"id", "description"} for item in candidates))
+                self.assertTrue(all(set(item) == {"id", "description", "exclusive", "conflicts_with"}
+                                    for item in candidates))
                 self.assertFalse(excluded.intersection(item["id"] for item in candidates))
         for role, selected in [("code", ["code-debug-root-cause"]),
                                ("reviewer", ["review-code-state"])]:
@@ -164,6 +165,23 @@ class CatalogTests(unittest.TestCase):
 
 
 class RolePreparationTests(unittest.IsolatedAsyncioTestCase):
+    def test_replanned_worker_skill_selection_uses_compact_new_contract(self):
+        middleware = RoleSkillsMiddleware(None, "general", ())
+        replan_context = {
+            "user_request": "导出后关闭账户",
+            "accepted_steps": [{"step_id": 1, "status": "COMPLETED"}],
+            "previous_failure": "CSV格式验收失败",
+            "new_step_id": 3,
+            "objective": "重新导出",
+            "success_criteria": ["官方格式通过"],
+        }
+        options = middleware._options({
+            "messages": [{"role": "user", "content": "旧Worker指令"}],
+            "skill_reselection_context": replan_context,
+            "executor_model_run_limit": 5,
+        })
+        self.assertEqual(options["task"]["task_contract"], replan_context)
+
     async def test_single_policy_body_reaches_only_its_role_and_survives_resume(self):
         # Exercise the shared middleware used by both real CODE factories.
         # Scripted choices verify plumbing, not a provider's selection quality.

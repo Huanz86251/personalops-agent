@@ -156,7 +156,7 @@ def _format_hard_context(
 ) -> str:
     """生成所有Hard节点共用的基础上下文视图。
 
-    Supervisor、Replanner和Final Reviewer调用同一个函数，
+    Supervisor和Replanner调用同一个函数，
     不分别管理时间、历史摘要、近期对话和长期记忆。
     """
 
@@ -175,8 +175,7 @@ def _format_hard_context(
         )
     blocks.extend(
         [
-            "[当前时间]\n"
-            f"{validated_context.current_time}",
+            validated_context.current_time_context(),
             "[当前用户请求]\n"
             f"{validated_context.user_request}",
         ]
@@ -192,6 +191,8 @@ def _format_hard_context(
             f"{_prompt_text(validated_context.user_instruction_history, '没有历史用户原文。')}",
             "[较早Conversation摘要]\n"
             f"{_prompt_text(validated_context.conversation_summary, '没有较早对话摘要。')}",
+            "[上一轮内部执行摘要（仅供参考，不能覆盖用户原话）]\n"
+            f"{_prompt_text(validated_context.previous_run_summary, '没有上一轮内部执行摘要。')}",
             "[最近用户与最终助手对话]\n"
             f"{_prompt_text(validated_context.recent_dialogue, '没有近期对话。')}",
             "[本轮相关长期记忆]\n"
@@ -625,6 +626,7 @@ def _build_final_reviewer_fallback(
     plan_success_criteria: list[
         str
     ],
+    error: str = "",
 ) -> FinalReviewDecision:
     """Final Reviewer失败时确定性生成最终回答。"""
 
@@ -643,6 +645,7 @@ def _build_final_reviewer_fallback(
             report.errors
         )
 
+    budget_exhausted = "budget exhausted" in error.lower()
     all_completed = bool(
         step_reports
     ) and all(
@@ -650,7 +653,7 @@ def _build_final_reviewer_fallback(
         for report in step_reports
     )
 
-    if all_completed and not unresolved_items:
+    if all_completed and not unresolved_items and not budget_exhausted:
         status = "COMPLETED"
         unmet_success_criteria: list[str] = []
 
@@ -670,9 +673,17 @@ def _build_final_reviewer_fallback(
             ]
         )
 
-    lines = [
-        "本轮任务已完成安全收尾。"
-    ]
+    lines = [(
+        "整题模型调用预算已耗尽，Harness 已停止继续调用模型并生成这份确定性终止报告。"
+        if budget_exhausted
+        else "本轮任务已完成安全收尾。"
+    )]
+
+    if budget_exhausted:
+        lines.extend([
+            "",
+            "这不是 Final Reviewer 的模型结论；以下只汇总预算耗尽前已经落盘的报告，未确认内容不会被当作完成。",
+        ])
 
     if confirmed_results:
         lines.extend(
@@ -722,6 +733,11 @@ def _build_final_reviewer_fallback(
         )
 
     return FinalReviewDecision(
+        review_reason=(
+            "模型调用预算耗尽；Harness 仅依据已落盘 StepReport 确定性收尾。"
+            if budget_exhausted
+            else "Final Reviewer 未能生成合法结果；Harness 仅依据已落盘 StepReport 安全收尾。"
+        ),
         action="FINAL",
         status=status,
         final_answer="\n".join(
@@ -984,8 +1000,8 @@ async def run_hard_final_reviewer(
     """
 
     # Final review is an independent evidence check. It does not inherit
-    # Scheduler skills, capability catalogs, planning protocols, time, or
-    # process history. The fixed system prefix can be cached across tasks.
+    # Scheduler capability catalogs, planning protocols, or process history.
+    # It does receive the same Harness-owned clock label as every other role.
     from scheduler_runtime import compact_json
     from schema_utils import compact_schema
 
@@ -1002,6 +1018,7 @@ async def run_hard_final_reviewer(
     }, {
         "role": "user",
         "content": compact_json({
+            "当前时间": context.current_time_context(),
             "用户原始请求": context.user_request,
             "已校验范围合同": context.scope_contract,
             "计划验收目标": {
@@ -1026,6 +1043,12 @@ async def run_hard_final_reviewer(
         }),
     }]
 
+    if context.completion_api_contract:
+        reviewer_messages.append({
+            "role": "user",
+            "content": context.completion_api_contract,
+        })
+
     return await _invoke_structured(
         hard_model,
         prompt=reviewer_prompt,
@@ -1035,6 +1058,7 @@ async def run_hard_final_reviewer(
         fallback_factory=lambda _error: _build_final_reviewer_fallback(
             step_reports=step_reports,
             plan_success_criteria=plan_success_criteria,
+            error=_error,
         ),
     )
 

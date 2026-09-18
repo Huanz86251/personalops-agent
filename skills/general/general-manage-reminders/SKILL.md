@@ -5,6 +5,7 @@ metadata:
   roles: "general"
   topics: "reminders schedules"
   required-tools: "get_current_time schedule_create schedule_list"
+  exclusive: "true"
 ---
 
 # 本地提醒任务

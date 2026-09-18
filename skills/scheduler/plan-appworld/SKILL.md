@@ -4,6 +4,7 @@ description: 用户明确在 AppWorld 模拟环境中测试或操作应用时，
 metadata:
   roles: "scheduler"
   topics: "planning appworld"
+  conflicts-with: "plan-web-research plan-personal-tasks"
 ---
 
 # AppWorld 任务规划
@@ -23,6 +24,25 @@ Code 脚本使用 code_task 的 ARTIFACT 交付，写明脚本/结果产物、�
 AppWorld 范围案例：用户要求“归档我创建的文件夹中、我标星的文档”。先把“我创建的文件夹内全部文档”的ID记为A，把“我标星的全部文档”的ID记为B，真正目标是A∩B。不能查询“我标星的文件夹”后处理其中所有文档；那会把作用在文档上的条件错误地移到文件夹。计划中明确要求执行者分别取得A和B、按文档ID求交集、只写交集并回读交集；真实接口名仍由执行者查文档。
 本例的target_selection应令target_entity=document，A的condition_owner=folder、result_entity=document，B的condition_owner=document、result_entity=document，operation=INTERSECTION，operands=[A,B]，join_key=document_id。不要在该结构中填写API名。
 同时按用户动作填写effect_mode：只查询这些文档为READ_ONLY，移动、标记或删除为MUTATION。若最终范围还依赖另一对象中的说明，把它放进required_context，并写清先读什么、为什么以及用于哪一步筛选；不要伪造成同类型集合。
+
+## 关系来源规划
+
+当target_selection.required_context包含relationship时，先规划关系成员的读取与身份关联，再规划最终对象的筛选、修改和回读。关系成员是筛选前提，不是最终操作对象。原样保留Scope给出的source_system、relationship、resolution_status、resolution_note和used_for_sets；不得因为最终对象位于某个应用，就把关系来源自动替换成该应用的好友网络。
+
+- EXPLICIT：按用户明确指定的来源规划。
+- DERIVED：保留唯一推导所依赖的已知上下文。
+- INFERRED：在execution_guidance中明确要求Worker先核对真实API文档、只读取得关系成员，再通过真实返回中的稳定身份字段关联最终对象；不得把推测描述成用户明说。
+- UNKNOWN：先安排关系来源发现，来源未解决前不安排写入。
+
+AppWorld任务族合成英文示例一（不是评测原题）：`Tag incoming Venmo payments from my friends this week.`
+
+该个人关系跨应用筛选任务族使用Phone联系人关系。计划应先取得Phone联系人簿中的friend成员，再按邮箱、电话号码或真实返回中的其他稳定身份字段关联本周收到的Venmo付款，最后只修改匹配付款。可把`phone.search_contacts`作为Skill已提供的候选接口名写入api_suggestion，但不得写参数或签名，Worker仍须用真实文档核验；如果当前版本文档不一致，以真实文档为准并忽略建议。
+
+AppWorld任务族合成英文示例二（不是评测原题）：`Review this month's Venmo transfers with my Venmo friends.`
+
+该平台交易好友任务族使用Venmo好友网络。计划应先取得Venmo好友，再按真实身份字段筛选本月与好友之间的交易。可把`venmo.search_friends`作为Skill已提供的候选接口名写入api_suggestion，但不得写参数或签名，Worker仍须核验真实文档。示例只要求查询，不能凭借本Skill自行添加点赞或写入动作。
+
+这两个例子不构成全局的“friend=Phone”或“friend=Venmo”。先按照Scope已经识别的任务族与关系用途选择；若Phone和目标平台都支持friend且当前材料仍不能消歧，应保留INFERRED或UNKNOWN并让Worker先做只读查证，不得把API存在本身当作语义已经确定。success_criteria必须检查关系来源、身份关联和最终对象集合，而不只是检查已选对象是否操作成功。
 
 **注意：绝对不要忽略最后的完成提交。业务改完、回查通过、打印“成功”、提交 StepReport，都不能代替 complete_task。** 最后一个 Step 的 execution_guidance 必须直接写明：“业务核验通过后，通过 appworld_execute 执行 apis.supervisor.complete_task()，检查真实返回并保留调用证据；未调用或调用失败必须报告未完成。”不要缩写成“最后提交”或“打印成功结果”。success_criteria 另列“完成接口实际调用成功，有工具返回证据”。输出计划前检查这两处均已写入；缺任一处先补齐计划，不把收尾留给执行者猜。按文档选择下面一种形式（answer 只用于任务明确要求的答案，不是总结报告）：
 

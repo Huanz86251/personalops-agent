@@ -17,7 +17,7 @@ def allowed_splits():
         ).split(",")
         if value.strip()
     )
-    if not values or any(value not in {"train", "dev", "test_normal"} for value in values):
+    if not values or any(value not in {"train", "dev", "test_normal", "test_challenge"} for value in values):
         raise ValueError("Invalid frozen AppWorld split policy")
     return values
 

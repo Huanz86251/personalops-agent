@@ -66,6 +66,18 @@ def test_expression_rejects_moving_one_set_to_a_different_result_entity():
         PlanStep.model_validate(payload)
 
 
+def test_constraint_and_context_set_links_must_reference_known_branches():
+    payload = intersection_step().model_dump()
+    payload["target_selection"]["constraints"] = [{
+        "source_text": "已标星",
+        "applies_to": "document",
+        "applies_to_sets": ["MISSING"],
+        "meaning": "限定已标星文档",
+    }]
+    with pytest.raises(ValidationError, match="applies_to_sets"):
+        PlanStep.model_validate(payload)
+
+
 def test_direct_selection_stays_optional_for_simple_steps():
     simple = PlanStep(
         step_id=1,

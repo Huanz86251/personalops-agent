@@ -1,6 +1,12 @@
 """Decision schemas must ask for evidence or reasons before outcomes."""
 
-from evals.appworld.tool_descriptions import AppWorldBindingCheck, AppWorldCallInput
+import pytest
+
+from evals.appworld.tool_descriptions import (
+    AppWorldBindingCheck,
+    AppWorldCallInput,
+    AppWorldSetBinding,
+)
 from memory import MemoryResolution
 from planning_models import (
     FinalReviewDecision,
@@ -31,6 +37,8 @@ def _before(model, earlier: str, later: str) -> None:
 
 def test_reason_precedes_model_decisions() -> None:
     for model, reason, result in [
+        (AppWorldSetBinding, "read_api_reason", "read_api"),
+        (AppWorldSetBinding, "coverage_reason", "completion_condition"),
         (AppWorldBindingCheck, "reason", "assessment"),
         (AppWorldCallInput, "reason", "action_phase"),
         (MemoryResolution, "reason", "action"),
@@ -43,6 +51,21 @@ def test_reason_precedes_model_decisions() -> None:
         (CodeContinuationSubmission, "reasons", "action"),
     ]:
         _before(model, reason, result)
+
+
+def test_action_card_rejects_legacy_nested_coverage_fields() -> None:
+    with pytest.raises(ValueError):
+        AppWorldSetBinding.model_validate({
+            "set_id": "A",
+            "match_reason": "接口范围与集合一致。",
+            "read_api": "drive.list_documents",
+            "source_ref": "E1",
+            "requested_scope": "全部目标文档",
+            "coverage_plan": {
+                "reason": "分页读完才完整。",
+                "completion_condition": "读到无下一页",
+            },
+        })
 
 
 def test_evidence_precedes_worker_and_reviewer_conclusions() -> None:

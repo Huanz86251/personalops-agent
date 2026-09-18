@@ -4,6 +4,7 @@ import asyncio
 from trace_presentation import run_name
 import logging
 from contextlib import nullcontext
+import json
 from contextvars import (
     Context,
 )
@@ -627,6 +628,55 @@ def _compact_context_text(
             -tail_chars:
         ]
     )
+
+
+def _planning_run_handoff_material(result: dict[str, Any]) -> str:
+    """Project a completed run into bounded evidence, not its raw trace."""
+    def data(value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        if hasattr(value, "model_dump"):
+            return value.model_dump(mode="json")
+        return {}
+
+    def clipped(value: Any, limit: int = 500) -> str:
+        return str(value or "")[:limit]
+
+    reports = []
+    for raw_report in list(result.get("completed_step_reports") or [])[-12:]:
+        report = data(raw_report)
+        reports.append({
+            "step_id": report.get("step_id"),
+            "status": clipped(report.get("status"), 60),
+            "summary": clipped(report.get("summary")),
+            "stop_reason": clipped(report.get("stop_reason"), 180),
+            "criterion_results": [
+                {
+                    "criterion_id": item.get("criterion_id"),
+                    "criterion": clipped(item.get("criterion"), 160),
+                    "status": clipped(item.get("status"), 60),
+                    "evidence": clipped(item.get("evidence"), 220),
+                }
+                for item in (data(raw) for raw in report.get("criterion_results") or [])
+            ][:8],
+        })
+    material = {
+        "plan_objective": clipped(result.get("plan_objective")),
+        "final_status": clipped(result.get("final_status"), 60),
+        "overall_stop_reason": clipped(result.get("overall_stop_reason"), 300),
+        "unmet_success_criteria": [clipped(item, 200) for item in
+                                   list(result.get("unmet_success_criteria") or [])[:8]],
+        "completed_step_reports": reports,
+        "replan_history": [
+            clipped(data(item).get("reason") or data(item).get("summary"), 200)
+            for item in list(result.get("replan_history") or [])[-3:]
+        ],
+    }
+    return _compact_context_text(
+        json.dumps(material, ensure_ascii=False, default=str), max_chars=12000
+    )
+
+
 class ConversationRuntime:
     """管理模型、Agent、Conversation和Checkpoint。"""
 
@@ -2218,12 +2268,16 @@ class ConversationRuntime:
                     "历史Conversation Pair相关性评分失败；仅保留上一轮。"
                 )
 
-        summary_turns: list[list[DialogueMessage]] = []
+        # Only older user-facing assistant replies are summarized. Historical
+        # user requests remain exact in user_instruction_history; the latest
+        # answer and current request are also kept verbatim.
+        summary_turns: list[list[DialogueMessage]] = dialogue_turns[:-4]
 
         summary_messages = [
             message
             for turn in summary_turns
             for message in turn
+            if message.role == "assistant"
         ]
 
         selected_older_dialogue = [
@@ -2266,11 +2320,6 @@ class ConversationRuntime:
         ):
             stored_summary = ""
 
-        # Rolling summaries stay persisted for compatibility, but the Hard
-        # Scheduler now receives selected exact pairs instead of an unrelated
-        # multi-topic summary plus an unbounded raw instruction ledger.
-        stored_summary = ""
-
         summarized_message_count = (
             state_values.get(
                 "conversation_summary_message_count",
@@ -2304,11 +2353,7 @@ class ConversationRuntime:
             ]
         )
 
-        pending_turn_count = sum(
-            1
-            for message in pending_messages
-            if message.role == "user"
-        )
+        pending_turn_count = len(pending_messages)
 
         if (
             pending_messages
@@ -2440,10 +2485,21 @@ class ConversationRuntime:
                 user_request
             ),
 
-            user_instruction_history=[],
+            # Historical user instructions remain exact even when older
+            # assistant replies are summarized. The checkpoint is canonical.
+            user_instruction_history=[
+                message.content
+                for turn in dialogue_turns
+                for message in turn
+                if message.role == "user"
+            ],
 
             conversation_summary=(
                 conversation_summary
+            ),
+
+            previous_run_summary=str(
+                state_values.get("previous_run_summary") or ""
             ),
 
             recent_dialogue=(
@@ -3097,6 +3153,23 @@ class ConversationRuntime:
                             + "交付准备失败；没有继续覆盖用户文件。"
                         )
 
+                    previous_run_summary = ""
+                    if channel != "appworld" and planning_result:
+                        handoff_material = _planning_run_handoff_material(planning_result)
+                        previous_run_summary = await summarize_conversation_history(
+                            self.summary_model,
+                            previous_summary="",
+                            messages=[{"role": "user", "content": handoff_material}],
+                            max_chars=self.settings.planning.conversation_summary_max_chars,
+                            prompt_name="conversation/run_summary",
+                            material_label="上一轮内部规划、执行与审核记录",
+                        )
+                        terminal_status = str(planning_result.get("final_status") or "UNKNOWN")
+                        previous_run_summary = _compact_context_text(
+                            f"运行终态（Harness记录）：{terminal_status}\n{previous_run_summary}",
+                            max_chars=self.settings.planning.conversation_summary_max_chars,
+                        )
+
                     # 无论Supervisor直接FINAL，
                     # 还是General Worker在独立Step Thread中执行，
                     # 最终都把本轮用户消息和回答写回原Conversation。
@@ -3128,6 +3201,8 @@ class ConversationRuntime:
                             "last_active_at": (
                                 now
                             ),
+
+                            "previous_run_summary": previous_run_summary,
                         },
 
                         # 这里保存的是已经由Planning Graph生成好的

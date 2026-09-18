@@ -221,8 +221,13 @@ class WorkerProgressState(
     title_generated: NotRequired[bool]
     memory_context: NotRequired[str]
     execution_instructions: NotRequired[str]
+    completion_api_contract: NotRequired[str]
+    current_time_context: NotRequired[str]
     skill_catalog: NotRequired[list[dict[str, Any]]]
     skill_topics: NotRequired[list[str]]
+    # Replanned Steps receive this compact Harness-authored package so skill
+    # routing can reconsider the new assignment without seeing raw tool logs.
+    skill_reselection_context: NotRequired[dict[str, Any] | None]
     skill_mode: NotRequired[str]
     skill_fixed_ids: NotRequired[dict[str, list[str]]]
     role_skill_snapshot: NotRequired[dict[str, Any]]
@@ -234,6 +239,7 @@ class WorkerProgressState(
     code_context_fingerprint: NotRequired[str]
     conversation_summary: NotRequired[str]
     conversation_summary_message_count: NotRequired[int]
+    previous_run_summary: NotRequired[str]
 
     executor_model_run_limit: NotRequired[int]
     executor_tool_run_limit: NotRequired[int]

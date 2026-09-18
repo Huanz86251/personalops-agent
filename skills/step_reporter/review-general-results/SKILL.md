@@ -4,6 +4,7 @@ description: 审核普通 General 步骤的查询、整理或工具操作结果�
 metadata:
   roles: "step_reporter"
   topics: "verification"
+  exclusive: "true"
 ---
 
 # General 审核流水线

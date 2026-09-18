@@ -92,7 +92,7 @@ PLANNING_INTEGER_OPTIONS: dict[
     # 整个用户请求的模型与工具总预算。
     "max_plan_model_rounds": (
         "PLANNING_MAX_PLAN_MODEL_ROUNDS",
-        60,
+        80,
         4,
         120,
     ),

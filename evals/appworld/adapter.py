@@ -81,9 +81,14 @@ def _trace_messages(batches):
 class UsageMeter(BaseCallbackHandler):
     """One record per LangChain model invocation, independent of OTel layering."""
     raise_error = True
-    run_inline = True
+    # AsyncCallbackManager constructs every inline callback coroutine before it
+    # awaits them one by one.  Raising the hard budget error from an inline
+    # callback therefore strands any later coroutine and emits ``was never
+    # awaited`` during cleanup.  Keep the pre-send rejection, but let LangChain
+    # await it in the gathered callback group so sibling callbacks are drained.
+    run_inline = False
 
-    def __init__(self, max_calls=30):
+    def __init__(self, max_calls=80):
         self.max_calls = max_calls
         self.started = {}
         self.records = {}
@@ -438,7 +443,8 @@ async def run_personalops(world, task, *, simple_model, hard_model, trial_id,
     )
     context = PlanningContextPack(
         skill_mode=skill_mode, skill_fixed_ids=skill_fixed_ids or {},
-        current_time=task["datetime"], user_request=task["instruction"],
+        current_time=task["datetime"], execution_environment="appworld",
+        user_request=task["instruction"],
         execution_instructions=instructions + "\nSimulated account owner:\n"
                                + json.dumps(task["supervisor"], ensure_ascii=False),
         toolset_catalog=[{"name": "APPWORLD", "description":
@@ -467,6 +473,15 @@ async def run_personalops(world, task, *, simple_model, hard_model, trial_id,
         "self_reported_final_status": result.get("final_status"),
         "progress_stages": progress_stages,
         "stop_reason": result.get("overall_stop_reason"),
+        "terminal_decision_source": (
+            "scheduler_model"
+            if result.get("scheduler_final_decision") is True
+            else (
+                "harness"
+                if result.get("harness_terminal_decision") is True
+                else None
+            )
+        ),
         "reported_model_rounds": result.get("model_rounds_used"),
         "reported_tool_calls": result.get("tool_calls_used"),
         "final_answer": result.get("final_answer"),

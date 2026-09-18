@@ -5,6 +5,7 @@ metadata:
   roles: "code"
   topics: "implementation"
   required-tools: "read_file execute"
+  exclusive: "true"
 ---
 
 # 按契约增量实现

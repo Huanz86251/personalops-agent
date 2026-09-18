@@ -73,6 +73,15 @@ from scheduler_runtime import scheduler_node
 HARD_CALL_MAX_ROUNDS = MAX_VALIDATION_RETRIES + 1
 
 
+def _terminal_completion_contract(
+    context: PlanningContextPack, remaining_steps: list[PlanStep]
+) -> str:
+    """Expose the public completion API only to a terminal planned Step."""
+    if context.execution_environment != "appworld" or remaining_steps:
+        return ""
+    return context.completion_api_contract
+
+
 def _record_skill_traces(context, traces):
     snapshots = dict(context.role_skill_snapshots)
     for trace in traces:
@@ -207,6 +216,8 @@ class PlanningState(TypedDict, total=False):
     final_status: str
     # Explicit provenance: a real Scheduler Final Review issued a terminal decision.
     scheduler_final_decision: bool
+    # Separate provenance for a deterministic Harness terminal report.
+    harness_terminal_decision: bool
     final_answer: str
     unmet_success_criteria: list[str]
     overall_stop_reason: str
@@ -769,6 +780,18 @@ def _build_step_instruction(
         else ""
     )
 
+    api_suggestion_block = ""
+    if current_step.api_suggestion is not None:
+        suggestion = current_step.api_suggestion
+        api_suggestion_block = (
+            "[Scheduler API建议：低置信、必须自行查证]\n"
+            f"建议理由：{suggestion.use_reason}\n"
+            f"建议接口名：{suggestion.api_name}\n"
+            "这不是已验证接口契约，也不一定准确。请先依据真实API文档判断；"
+            "如果不准确，请忽略该建议并使用你自己查证出的接口。"
+            "不要从这条建议推测参数或Schema。\n\n"
+        )
+
     # Worker-facing execution capacity is supplied after role allocation and
     # skill preparation. Do not advertise the shared plan/control reserve.
     worker_budget = "" if current_step.worker_kind in {"GENERAL", "CODE"} else (
@@ -804,8 +827,51 @@ def _build_step_instruction(
         f"此前StepReport：\n"
         f"{_json_text(reports)}\n\n"
 
-        f"{worker_budget}\n{leadership_block}"
+        f"{worker_budget}\n{api_suggestion_block}{leadership_block}"
     )
+
+
+def _replanned_skill_selection_context(
+    state: PlanningState,
+    current_step: PlanStep,
+) -> dict[str, Any] | None:
+    """Give a newly replanned Step a compact, semantic skill-selection task."""
+
+    history = state.get("replan_history", [])
+    if not history:
+        return None
+    latest = history[-1]
+    replanned = latest.get("remaining_steps", []) if isinstance(latest, dict) else []
+    if not any(
+        isinstance(item, dict) and item.get("step_id") == current_step.step_id
+        for item in replanned
+    ):
+        return None
+
+    accepted_steps = []
+    for report in state.get("completed_step_reports", []):
+        if isinstance(report, dict):
+            step_id = report.get("step_id")
+            status = report.get("status")
+            summary = str(report.get("summary") or "")
+        else:
+            step_id = report.step_id
+            status = report.status
+            summary = report.summary
+        accepted_steps.append({
+            "step_id": step_id,
+            "status": status,
+            "summary": summary[:600],
+        })
+
+    return {
+        "user_request": _context(state).user_request,
+        "accepted_steps": accepted_steps[-8:],
+        "previous_failure": str(latest.get("request_reason") or "")[:1200],
+        "new_step_id": current_step.step_id,
+        "objective": current_step.objective,
+        "success_criteria": current_step.success_criteria,
+    }
 
 
 def _split_parallel_budget(total: int, count: int) -> tuple[int, ...]:
@@ -1187,6 +1253,30 @@ def _build_forced_final_decision(
     )
 
 
+def _build_budget_exhausted_final_decision(
+    state: PlanningState,
+) -> FinalReviewDecision:
+    """Summarize only durable evidence when no further model call can start."""
+
+    base = _build_forced_final_decision(state)
+    detail = base.final_answer or "本轮没有形成可确认结果。"
+    return base.model_copy(update={
+        "review_reason": (
+            "整题模型调用预算耗尽；Harness 未再调用模型，只依据已落盘的 StepReport 收尾。"
+        ),
+        "status": "PARTIAL" if base.status == "COMPLETED" else base.status,
+        "unmet_success_criteria": (
+            base.unmet_success_criteria
+            or ["Final Reviewer 未执行；只能由 Harness 汇总已落盘证据。"]
+        ),
+        "final_answer": (
+            "整题模型调用预算已耗尽，Harness 已停止继续调用模型并生成确定性终止报告。\n"
+            "这不是 Final Reviewer 的模型结论；未确认内容不会被当作完成。\n\n"
+            + detail
+        ),
+    })
+
+
 def build_planning_graph(
     *,
     simple_model,
@@ -1377,6 +1467,8 @@ def build_planning_graph(
 
             "plan_challenge_scheduler_instruction": "",
             "final_review_rounds": 0,
+            "scheduler_final_decision": False,
+            "harness_terminal_decision": False,
             "final_worker_repair_round": 0,
             "final_worker_repair_request": None,
             "final_worker_repair_history": [],
@@ -1492,6 +1584,9 @@ def build_planning_graph(
                 "skill_mode": _context(provisional).skill_mode,
                 "skill_fixed_ids": _context(provisional).skill_fixed_ids,
                 "skill_topics": current_step.skill_topics,
+                "skill_reselection_context": _replanned_skill_selection_context(
+                    provisional, current_step
+                ),
                 "toolset_route_query": json.dumps(
                     {
                         "current_step": current_step.objective,
@@ -1515,6 +1610,10 @@ def build_planning_graph(
                 "execution_instructions": (
                     _context(provisional).execution_instructions
                 ),
+                "completion_api_contract": _terminal_completion_contract(
+                    _context(provisional), provisional.get("remaining_steps", [])
+                ),
+                "current_time_context": _context(provisional).current_time_context(),
                 "conversation_id": thread_id,
                 "conversation_title": (
                     f"Planning Step {current_step.step_id} / {assignment_key}"
@@ -2303,6 +2402,9 @@ def build_planning_graph(
             "skill_mode": _context(state).skill_mode,
             "skill_fixed_ids": _context(state).skill_fixed_ids,
             "skill_topics": current_step.skill_topics,
+            "skill_reselection_context": _replanned_skill_selection_context(
+                state, current_step
+            ),
             "toolset_route_query": json.dumps(
                 {
                     "current_step": current_step.objective,
@@ -2324,6 +2426,10 @@ def build_planning_graph(
             "toolset_route_fallback_query": _context(state).user_request,
             "toolset_route_full_user_request": _context(state).user_request,
             "execution_instructions": _context(state).execution_instructions,
+            "completion_api_contract": _terminal_completion_contract(
+                _context(provisional), remaining_steps
+            ),
+            "current_time_context": _context(state).current_time_context(),
             "conversation_id": (
                 thread_id
             ),
@@ -3270,6 +3376,10 @@ def build_planning_graph(
 
         review_packet = build_step_review_packet(
             user_request=_context(state).user_request,
+            current_time_context=_context(state).current_time_context(),
+            completion_api_contract=_terminal_completion_contract(
+                _context(state), state.get("remaining_steps", [])
+            ),
             plan_objective=state["plan_objective"],
             current_step=current_step,
             replaced_attempts=state.get(
@@ -3301,6 +3411,8 @@ def build_planning_graph(
         from reporting.general_gate import general_review_reasons
         review_reasons = general_review_reasons(current_step, state.get('current_step_trace', {}), review_packet,
                                                state.get('current_step_stop_reason','')) if current_step.worker_kind=='GENERAL' else ['other_role']
+        if current_step.worker_kind == "GENERAL" and review_packet.task_contract.completion_api_contract:
+            review_reasons.append("terminal_appworld_completion")
         if persisted_report is not None:
             report = persisted_report
             reporter_rounds = 0
@@ -4174,12 +4286,11 @@ def build_planning_graph(
         if challenge_flow and decision.action == "CONTINUE" and new_steps:
             previous_step = state["current_step"]
             revised_step = new_steps[0]
-            resume_same_worker = (
-                previous_step.worker_kind == revised_step.worker_kind
-                and revised_step.worker_kind in {"GENERAL", "WEB", "CODE"}
-                and previous_step.execution_mode == "SINGLE"
-                and revised_step.execution_mode == "SINGLE"
-            )
+            # A Scheduler-accepted replacement is a genuinely new assignment.
+            # Start a fresh role session so Worker and Reviewer skills are
+            # selected from the revised contract instead of inheriting the
+            # snapshot chosen for the rejected Step.
+            resume_same_worker = False
             instruction = (
                 "Scheduler接受计划异议并替换了当前及后续步骤。"
                 f"裁决依据：{decision.reason}"
@@ -4425,6 +4536,25 @@ def build_planning_graph(
                 },
             })
             skill_rounds = snapshot.model_calls
+            if (
+                snapshot.selection_method == "selection_error"
+                and "EvaluationBudgetExceeded" in snapshot.reason
+            ):
+                decision = _build_budget_exhausted_final_decision(state)
+                return Command(
+                    update={
+                        "context": context,
+                        "model_rounds_used": state.get("model_rounds_used", 0) + skill_rounds,
+                        "final_review_rounds": final_review_rounds + 1,
+                        "scheduler_final_decision": False,
+                        "harness_terminal_decision": True,
+                        "final_status": decision.status or "FAILED",
+                        "final_answer": decision.final_answer or "",
+                        "unmet_success_criteria": decision.unmet_success_criteria,
+                        "overall_stop_reason": "model_call_budget_exhausted_before_final_review",
+                    },
+                    goto=END,
+                )
 
         repair_round = state.get("final_worker_repair_round", 0)
         latest_worker_evidence = _final_worker_evidence(state)
@@ -4477,6 +4607,10 @@ def build_planning_graph(
             final_repair_model_rounds += result.model_rounds_used
 
         decision = result.output
+        budget_fallback = bool(
+            result.used_fallback
+            and any("budget exhausted" in item.lower() for item in result.validation_errors)
+        )
         current_step = state.get("current_step")
         if decision.action == "RETURN_TO_WORKER":
             request = decision.repair_request
@@ -4547,12 +4681,19 @@ def build_planning_graph(
                 "model_rounds_used": model_rounds_used,
                 "final_repair_model_rounds_used": final_repair_model_rounds,
                 "final_review_rounds": final_review_rounds + 1,
-                "scheduler_final_decision": result.output.action == "FINAL",
+                "scheduler_final_decision": (
+                    result.output.action == "FINAL" and not result.used_fallback
+                ),
+                "harness_terminal_decision": (
+                    result.output.action == "FINAL" and result.used_fallback
+                ),
                 "final_status": decision.status or "FAILED",
                 "final_answer": decision.final_answer or "",
                 "unmet_success_criteria": decision.unmet_success_criteria,
-                "overall_stop_reason": state.get(
-                    "overall_stop_reason", "final_reviewer_completed"
+                "overall_stop_reason": (
+                    "model_call_budget_exhausted_during_final_review"
+                    if budget_fallback
+                    else state.get("overall_stop_reason", "final_reviewer_completed")
                 ),
             },
             goto=END,

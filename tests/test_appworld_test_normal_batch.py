@@ -27,12 +27,45 @@ def test_duplicate_ids_are_rejected():
         raise AssertionError("duplicate task IDs must fail closed")
 
 
+def test_challenge_prepare_isolated_and_frozen(tmp_path, monkeypatch):
+    monkeypatch.setattr(batch_runner, "ROOT", tmp_path)
+    monkeypatch.setattr(batch_runner, "_list_task_ids", lambda image, split: ["c-2", "c-1"])
+    monkeypatch.setattr(batch_runner, "_source_digest", lambda: "frozen-source")
+    batch = batch_runner.prepare("challenge-one", 42, "challenge-only-image", "test_challenge")
+    manifest = json.loads((batch / "manifest.private.json").read_text(encoding="utf-8"))
+    assert batch == tmp_path / ".agent/appworld-test-challenge/challenge-one"
+    assert manifest["split"] == "test_challenge"
+    assert manifest["image"] == "challenge-only-image"
+    assert {task for half in manifest["halves"].values() for task in half["task_ids"]} == {"c-1", "c-2"}
+    with pytest.raises(FileExistsError):
+        batch_runner.prepare("challenge-one", 42, "challenge-only-image", "test_challenge")
+
+
 def test_parallelism_is_bounded():
     assert batch_runner._validate_parallelism(1) == 1
     assert batch_runner._validate_parallelism(batch_runner.MAX_PARALLELISM) == batch_runner.MAX_PARALLELISM
     for value in (0, batch_runner.MAX_PARALLELISM + 1, True):
         with pytest.raises(ValueError, match="Parallelism"):
             batch_runner._validate_parallelism(value)
+
+
+def test_atomic_progress_write_retries_transient_windows_reader_lock(tmp_path, monkeypatch):
+    destination = tmp_path / "progress.json"
+    destination.write_text('{"status":"OLD"}', encoding="utf-8")
+    original_replace = Path.replace
+    attempts = []
+
+    def temporarily_locked(source, target):
+        attempts.append(target)
+        if len(attempts) == 1:
+            raise PermissionError("progress reader briefly holds the destination")
+        return original_replace(source, target)
+
+    monkeypatch.setattr(Path, "replace", temporarily_locked)
+    monkeypatch.setattr(batch_runner.time, "sleep", lambda _seconds: None)
+    batch_runner._atomic_json(destination, {"status": "RUNNING"})
+    assert len(attempts) == 2
+    assert json.loads(destination.read_text(encoding="utf-8")) == {"status": "RUNNING"}
 
 
 def test_half_runs_tasks_with_bounded_parallel_processes(tmp_path, monkeypatch):

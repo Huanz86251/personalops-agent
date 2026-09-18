@@ -26,6 +26,10 @@ class ReviewTaskContract(BaseModel):
     """The immutable contract against which one Step is reviewed."""
 
     user_request: str
+    # Delivered as its own short reviewer message so it cannot displace any
+    # bounded execution evidence during packet compaction.
+    current_time_context: str = Field(default="", exclude=True)
+    completion_api_contract: str = Field(default="", exclude=True)
     plan_objective: str
     step_id: int = Field(ge=1)
     execution_guidance: str | None = None

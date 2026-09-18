@@ -5,6 +5,7 @@ metadata:
   roles: "reviewer"
   topics: "verification"
   required-tools: "read_file execute"
+  exclusive: "true"
 ---
 
 # 从要求推导独立验证

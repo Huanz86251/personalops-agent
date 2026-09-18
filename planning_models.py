@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import (
     Any,
     Literal,
@@ -125,7 +126,9 @@ class PlanningModel(
     )
 
 
-_NULLISH_STRINGS = {"", "null", "none", "nil", "false", "n/a"}
+_NULLISH_STRINGS = {
+    "", "null", "none", "nil", "false", "n/a", "undefined", "aull",
+}
 
 
 def _normalize_optional_value(value: Any) -> Any:
@@ -202,6 +205,11 @@ class PlanningContextPack(
         min_length=1,
     )
 
+    # The same timestamp can mean wall-clock time in normal use or the frozen
+    # clock supplied by a simulated evaluation world. Keep that distinction as
+    # one small Harness-owned switch instead of asking each model to infer it.
+    execution_environment: Literal["real_world", "appworld"] = "real_world"
+
     user_request: str = Field(
         min_length=1,
     )
@@ -214,8 +222,10 @@ class PlanningContextPack(
     # 较早Conversation的滚动摘要。
     conversation_summary: str = ""
 
-    # 兼容旧Checkpoint的历史指令字段。新Run不再把无界用户原文账本
-    # 注入Scheduler；连续性由上一轮Pair和高相关历史Pair提供。
+    # 上一轮内部规划/执行/审核的有界摘要；不是用户原话或最终答复。
+    previous_run_summary: str = ""
+
+    # 历史用户原始命令保持原文；较早助手答复与内部运行记录分开摘要。
     user_instruction_history: list[str] = Field(default_factory=list)
 
     # Persisted Scheduler message stream; never an LLM-generated field.
@@ -234,6 +244,10 @@ class PlanningContextPack(
 
     # Application-supplied environment contract and optional skill for this run.
     execution_instructions: str = ""
+    # Public API documentation read once by the AppWorld Harness. Scheduler
+    # and Final Reviewer see it directly; only the terminal Step's Worker and
+    # bound Reviewer receive it during dispatch.
+    completion_api_contract: str = ""
     # Harness-owned, frozen once per planning run. These are never model output.
     skill_catalog: list[dict[str, Any]] | None = None
     role_skill_snapshots: dict[str, dict[str, Any]] = Field(default_factory=dict)
@@ -252,6 +266,38 @@ class PlanningContextPack(
     ] = Field(
         default_factory=list,
     )
+
+    def current_time_context(self) -> str:
+        label = (
+            "AppWorld 当前时间"
+            if self.execution_environment == "appworld"
+            else "真实世界当前时间"
+        )
+        timestamp = self.current_time.strip()
+        timezone_name = ""
+        # Real-world get_current_time returns a small multiline record, while
+        # AppWorld initialization returns the world's frozen task datetime.
+        # Use the timestamp in either case as the single source of weekday.
+        if self.execution_environment == "real_world":
+            for line in timestamp.splitlines():
+                if line.startswith("时区："):
+                    timezone_name = line.removeprefix("时区：").strip()
+                elif line.startswith("当前时间："):
+                    timestamp = line.removeprefix("当前时间：").strip()
+        # The Harness already owns this timestamp. Derive the weekday from
+        # the displayed local date, without asking a Worker to infer it or
+        # converting an AppWorld task date through the host timezone.
+        try:
+            weekday = datetime.fromisoformat(timestamp).weekday()
+        except ValueError:
+            return f"{label}：{self.current_time}"
+        weekdays = (
+            "星期一 / Monday", "星期二 / Tuesday", "星期三 / Wednesday",
+            "星期四 / Thursday", "星期五 / Friday", "星期六 / Saturday",
+            "星期日 / Sunday",
+        )
+        detail = f"时区：{timezone_name}；" if timezone_name else ""
+        return f"{label}：{timestamp}（{detail}{weekdays[weekday]}）"
 
 
 class WorkerAssignment(
@@ -455,12 +501,24 @@ SetOperation = Literal[
 
 EffectMode = Literal["READ_ONLY", "MUTATION"]
 
+ResolutionStatus = Literal[
+    "EXPLICIT",
+    "DERIVED",
+    "INFERRED",
+    "UNKNOWN",
+]
+
 
 class ScopeConstraint(PlanningModel):
     """One exact qualifier copied from the user's request."""
 
     source_text: str = Field(min_length=1, max_length=300, description="用户原话中的限定词或关系短语。")
     applies_to: str = Field(min_length=1, max_length=80, description="该限定条件直接约束的对象类型，不能按词语距离猜。")
+    applies_to_sets: list[str] = Field(
+        default_factory=list,
+        max_length=8,
+        description="该条件约束的set_id；空列表表示约束全部分支。",
+    )
     meaning: str = Field(min_length=1, max_length=300, description="该条件如何改变最终对象范围。")
 
 
@@ -493,13 +551,38 @@ class RequiredContextSpec(PlanningModel):
         max_length=80,
         description="需要读取的关系标签，例如friend、roommate；非关系型前置信息填null。",
     )
+    resolution_status: ResolutionStatus | None = Field(
+        default=None,
+        description=(
+            "source_system与relationship的依据：EXPLICIT为用户明说；DERIVED为由已知上下文唯一推出；"
+            "INFERRED为合理但待验证的推测；UNKNOWN为当前无法确定。null仅兼容旧合同。"
+        ),
+    )
+    resolution_note: str | None = Field(
+        default=None,
+        max_length=300,
+        description=(
+            "简述依据或缺口。INFERRED/UNKNOWN必须填写；EXPLICIT/DERIVED可填null。"
+        ),
+    )
+    used_for_sets: list[str] = Field(
+        default_factory=list,
+        max_length=8,
+        description="这项前置信息服务的set_id；空列表表示服务全部分支。",
+    )
     because: str = Field(min_length=1, max_length=300, description="为什么缺少这项信息就不能正确确定最终结果。")
     used_for: str = Field(min_length=1, max_length=300, description="该信息将用于筛选、关联或生成哪一部分最终结果。")
 
-    @field_validator("source_system", "relationship", mode="before")
+    @field_validator("source_system", "relationship", "resolution_note", mode="before")
     @classmethod
     def normalize_optional_source_fields(cls, value: Any) -> Any:
         return _normalize_optional_value(value)
+
+    @model_validator(mode="after")
+    def validate_resolution_evidence(self) -> "RequiredContextSpec":
+        if self.resolution_status in {"INFERRED", "UNKNOWN"} and not self.resolution_note:
+            raise ValueError("INFERRED或UNKNOWN的required_context必须填写resolution_note。")
+        return self
 
 
 class ResolvedTimeRangeSpec(PlanningModel):
@@ -526,11 +609,41 @@ class ResolvedTimeRangeSpec(PlanningModel):
             "无法仅凭现有上下文确定时填null，并在required_context说明缺项。"
         ),
     )
+    resolution_status: ResolutionStatus | None = Field(
+        default=None,
+        description=(
+            "时间边界的依据：EXPLICIT为用户给出绝对时间；DERIVED为由任务开始时间等已知上下文唯一换算；"
+            "INFERRED为待验证推测；UNKNOWN为缺少必要事实。null仅兼容旧合同。"
+        ),
+    )
+    resolution_note: str | None = Field(
+        default=None,
+        max_length=300,
+        description=(
+            "简述换算依据或缺失事实。INFERRED/UNKNOWN必须填写；EXPLICIT/DERIVED可填null。"
+        ),
+    )
+    used_for_sets: list[str] = Field(
+        default_factory=list,
+        max_length=8,
+        description="该时间边界约束的set_id；空列表表示约束全部分支。",
+    )
 
-    @field_validator("start_at", "end_at", mode="before")
+    @field_validator("start_at", "end_at", "resolution_note", mode="before")
     @classmethod
     def normalize_null_time_boundary(cls, value: Any) -> Any:
         return _normalize_optional_value(value)
+
+    @model_validator(mode="after")
+    def validate_resolution_evidence(self) -> "ResolvedTimeRangeSpec":
+        if self.resolution_status in {"EXPLICIT", "DERIVED"}:
+            if not self.start_at or not self.end_at:
+                raise ValueError("EXPLICIT或DERIVED的时间范围必须同时填写start_at和end_at。")
+        if self.resolution_status == "UNKNOWN" and (self.start_at or self.end_at):
+            raise ValueError("UNKNOWN的时间范围不得猜测start_at或end_at。")
+        if self.resolution_status in {"INFERRED", "UNKNOWN"} and not self.resolution_note:
+            raise ValueError("INFERRED或UNKNOWN的时间范围必须填写resolution_note。")
+        return self
 
 
 class ScopeContract(PlanningModel):
@@ -539,18 +652,18 @@ class ScopeContract(PlanningModel):
     target_entity: str = Field(min_length=1, max_length=80, description="最终被操作的实体类型。")
     effect_mode: EffectMode = Field(
         default="MUTATION",
-        description="READ_ONLY只读取、筛选、计算或回答；MUTATION会改变外部应用中的业务状态。生成回答本身不算写入。",
+        description="按用户要求的最终外部效果判断：READ_ONLY只读取、筛选、计算或回答；MUTATION会改变外部应用中的业务状态，包括播放、暂停或调整播放队列。定位目标时先读取，不会把最终操作变成READ_ONLY；生成回答本身不算写入。",
     )
     constraints: list[ScopeConstraint] = Field(default_factory=list, max_length=8, description="用户原文中的限定条件及其归属。")
-    sets: list[ScopeSetSpec] = Field(min_length=1, max_length=4, description="用于计算最终对象范围的集合。")
+    sets: list[ScopeSetSpec] = Field(min_length=1, max_length=8, description="用于计算最终对象范围的集合。")
     operation: SetOperation = Field(description="单集合DIRECT；同时满足INTERSECTION；任一满足UNION；排除DIFFERENCE。")
-    operands: list[str] = Field(min_length=1, max_length=4, description="参与运算的全部set_id，每个恰好一次。")
+    operands: list[str] = Field(min_length=1, max_length=8, description="参与运算的全部set_id，每个恰好一次。")
     join_key: str | None = Field(default=None, max_length=80, description="多集合运算必须填写稳定实体ID字段，如bookmark_id；DIRECT必须为null。")
     ambiguity: bool = Field(default=False, description="两种合理解释会改变最终对象集合时为true。")
     alternatives: list[str] = Field(default_factory=list, max_length=3, description="ambiguity=true时列出可能范围，否则为空。")
     required_context: list[RequiredContextSpec] = Field(
         default_factory=list,
-        max_length=4,
+        max_length=8,
         description="确定最终对象前必须读取的跨实体信息。没有前置信息依赖时填[]；不写API、执行步骤或登录方式。",
     )
     resolved_time_ranges: list[ResolvedTimeRangeSpec] = Field(
@@ -581,6 +694,16 @@ class ScopeContract(PlanningModel):
             raise ValueError("ScopeContract每个集合必须且只能在operands中出现一次。")
         if {item.result_entity for item in self.sets} != {self.target_entity}:
             raise ValueError("ScopeContract每个集合必须产出target_entity。")
+        known_set_ids = set(set_ids)
+        for constraint in self.constraints:
+            if not set(constraint.applies_to_sets).issubset(known_set_ids):
+                raise ValueError("constraints.applies_to_sets只能引用已定义的set_id。")
+        for item in self.required_context:
+            if not set(item.used_for_sets).issubset(known_set_ids):
+                raise ValueError("required_context.used_for_sets只能引用已定义的set_id。")
+        for item in self.resolved_time_ranges:
+            if not set(item.used_for_sets).issubset(known_set_ids):
+                raise ValueError("resolved_time_ranges.used_for_sets只能引用已定义的set_id。")
         if self.operation == "DIRECT":
             if len(self.operands) != 1:
                 raise ValueError("DIRECT必须且只能有一个集合。")
@@ -632,9 +755,14 @@ class TargetSelection(PlanningModel):
         default="MUTATION",
         description="复制已采用ScopeContract的外部效果：READ_ONLY不进入写入链；MUTATION必须写入并回读验收。",
     )
+    constraints: list[ScopeConstraint] = Field(
+        default_factory=list,
+        max_length=8,
+        description="从ScopeContract保留的限定条件及其分支绑定；让执行者无需从set定义中反推条件归属。",
+    )
     sets: list[TargetSetSpec] = Field(
         min_length=1,
-        max_length=4,
+        max_length=8,
         description="从用户原请求拆出的对象集合；不得增加用户未给出的条件。",
     )
     operation: SetOperation = Field(
@@ -642,7 +770,7 @@ class TargetSelection(PlanningModel):
     )
     operands: list[str] = Field(
         min_length=1,
-        max_length=4,
+        max_length=8,
         description="参与运算的set_id；DIFFERENCE中顺序有意义。",
     )
     join_key: str | None = Field(
@@ -660,7 +788,7 @@ class TargetSelection(PlanningModel):
     )
     required_context: list[RequiredContextSpec] = Field(
         default_factory=list,
-        max_length=4,
+        max_length=8,
         description="执行者在计算目标集合前必须先取得的跨实体信息；从ScopeContract原样保留，不猜API。",
     )
     resolved_time_ranges: list[ResolvedTimeRangeSpec] = Field(
@@ -698,6 +826,17 @@ class TargetSelection(PlanningModel):
         if set(set_ids) != set(self.operands):
             raise ValueError("每个集合必须且只能在operands中引用一次。")
 
+        known_set_ids = set(set_ids)
+        for constraint in self.constraints:
+            if not set(constraint.applies_to_sets).issubset(known_set_ids):
+                raise ValueError("constraints.applies_to_sets只能引用已定义的set_id。")
+        for item in self.required_context:
+            if not set(item.used_for_sets).issubset(known_set_ids):
+                raise ValueError("required_context.used_for_sets只能引用已定义的set_id。")
+        for item in self.resolved_time_ranges:
+            if not set(item.used_for_sets).issubset(known_set_ids):
+                raise ValueError("resolved_time_ranges.used_for_sets只能引用已定义的set_id。")
+
         entities = {item.result_entity for item in self.sets}
         if entities != {self.target_entity}:
             raise ValueError("参与运算的每个集合都必须产出target_entity。")
@@ -712,6 +851,26 @@ class TargetSelection(PlanningModel):
             if not self.join_key:
                 raise ValueError("多集合运算必须提供稳定join_key。")
         return self
+
+
+class SchedulerApiSuggestion(PlanningModel):
+    """A non-authoritative API lead; the Worker still owns discovery."""
+
+    use_reason: str = Field(
+        min_length=1,
+        max_length=300,
+        description=(
+            "先说明为什么该接口可能适合当前Step。只能依据已见信息；"
+            "如果不能确定就不要猜，令整个api_suggestion为null。"
+        ),
+    )
+    api_name: str = Field(
+        min_length=1,
+        max_length=160,
+        description=(
+            "再填写准确接口名，例如app.api；不得附带参数、参数Schema、调用代码或返回字段。"
+        ),
+    )
 
 
 class PlanStep(
@@ -774,6 +933,16 @@ class PlanStep(
         | None
     ) = None
 
+    api_suggestion: "SchedulerApiSuggestion | None" = Field(
+        default=None,
+        description=(
+            "可选且低置信的接口线索。只有Scheduler已从当前可见信息确认准确接口名时才填写；"
+            "不知道、只是猜测、Replan仍需Worker重新查证或Worker持续报错时填null。"
+            "只写为什么可能适用和准确接口名，不写参数、参数Schema、调用代码或返回字段。"
+            "Worker会把它当作可拒绝的建议，而不是真实接口契约。"
+        ),
+    )
+
     target_selection: TargetSelection | None = Field(
         default=None,
         description="复杂范围任务的结构化对象集合合同。出现同时、其中、或、排除、only/all/except等组合条件时填写；简单单集合任务可为null。不得写未经确认的API名。",
@@ -822,7 +991,7 @@ class PlanStep(
     join_policy: StepJoinPolicy = "ALL_TERMINAL"
 
     @field_validator(
-        "rag_query", "execution_guidance", "target_selection", "code_task",
+        "rag_query", "execution_guidance", "api_suggestion", "target_selection", "code_task",
         mode="before",
     )
     @classmethod
@@ -1187,7 +1356,12 @@ class ReplanDecision(
 
     reason: str = Field(
         min_length=1,
-        description="先说明已有事实、剩余问题和选择该动作的依据，再填写action。",
+        description=(
+            "先说明已有事实、剩余问题和选择该动作的依据；对照用户原话，"
+            "指出Scope或旧计划中需要纠正的可疑解释（若有）。"
+            "只可修正解释，不得放宽原始范围、阈值或禁止事项；"
+            "无法满足时明确写出未满足项，再填写action。"
+        ),
     )
 
     action: ReplanAction
@@ -1204,6 +1378,12 @@ class ReplanDecision(
         PlanStep
     ] = Field(
         default_factory=list,
+        description=(
+            "CONTINUE时填写后续Step：可纠正Scope或旧Step误加的条件、调整执行路径，"
+            "但每个Step的目标与验收必须保留用户原话的对象、范围、时间或数量门槛、"
+            "排除项和禁止事项；不能以较弱的近似结果替代。"
+            "RETURN_TO_WORKER或FINISH时留空。"
+        ),
     )
 
     @model_validator(

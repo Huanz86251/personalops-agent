@@ -121,7 +121,10 @@ class TaskTools:
 def can_judge(snapshot):
     values = snapshot.values
     return (not snapshot.next
-            and values.get("scheduler_final_decision") is True
+            and (
+                values.get("scheduler_final_decision") is True
+                or values.get("harness_terminal_decision") is True
+            )
             and values.get("final_status") in {"COMPLETED", "FAILED", "PARTIAL"})
 
 
@@ -133,6 +136,7 @@ class AppWorldConversation(ConversationRuntime):
         self.task_tools = TaskTools(world)
         self.discover_tool, self.execute_tool, self.verify_tool = self.task_tools.build()
         self._task_started = False
+        self._completion_api_contract = ""
         super().__init__(settings, [self.discover_tool, self.execute_tool])
 
     async def start(self):
@@ -147,10 +151,32 @@ class AppWorldConversation(ConversationRuntime):
             "skill_catalog": appworld_skill_catalog(
                 context.skill_catalog if context.skill_catalog is not None else load_catalog()),
             "current_time": self.task["datetime"],
+            "execution_environment": "appworld",
+            "completion_api_contract": self._completion_api_contract,
             "toolset_catalog": [{"name": "APPWORLD", "description":
                 "在当前任务的隔离 AppWorld 模拟环境中，先用appworld_discover查精确接口名和签名，"
                 "再用appworld_execute查询或修改数据；Code Reviewer用appworld_discover和appworld_verify独立核验。"}],
         })
+
+    def _read_completion_api_contract(self) -> str:
+        """Read the public completion signature, never the evaluator or task answer."""
+        code = ('print(apis.api_docs.show_api_doc('
+                'app_name="supervisor", api_name="complete_task"))')
+        self.task_tools._validate_discovery(code)
+        document = self.task_tools.execute(
+            code, "harness_documentation",
+            reason="Read the public completion API contract once for role handoff.",
+            source_refs=["api_docs.supervisor.complete_task"],
+        )
+        if not isinstance(document, str) or not all(
+            term in document for term in ("complete_task", "answer", "status")
+        ) or len(document) > 20000:
+            raise RuntimeError("AppWorld did not return a bounded complete_task API document")
+        return (
+            "[AppWorld public API documentation: supervisor.complete_task]\n"
+            + document.strip()
+            + "\nThis is the public API contract, not a hidden grading rule or proof of task success."
+        )
 
     async def _consolidate_memory_background(self, **kwargs):
         # Benchmark task text is not durable user memory. The original runtime
@@ -177,6 +203,7 @@ class AppWorldConversation(ConversationRuntime):
         try:
             with trace_span("AppWorld / " + task_id, attributes={"appworld.task_id": task_id,
                     "session.id": conversation.conversation_id}) as span, task_overview(span, self.task, result):
+                self._completion_api_contract = self._read_completion_api_contract()
                 with execution_state_scope(self.task_tools.execution_state):
                     result["answer"] = await self.ask(
                         user_text="当前我们正在 AppWorld 里面进行测试。\n\n" + self.task["instruction"], channel="appworld",
@@ -187,6 +214,15 @@ class AppWorldConversation(ConversationRuntime):
                     {"configurable": {"thread_id": thread_id}})
                 result["scheduler_status"] = snapshot.values.get("final_status")
                 result["stop_reason"] = snapshot.values.get("overall_stop_reason")
+                result["terminal_decision_source"] = (
+                    "scheduler_model"
+                    if snapshot.values.get("scheduler_final_decision") is True
+                    else (
+                        "harness"
+                        if snapshot.values.get("harness_terminal_decision") is True
+                        else None
+                    )
+                )
                 with self.task_tools.lock:
                     self.task_tools.accepting = False
                     if can_judge(snapshot):

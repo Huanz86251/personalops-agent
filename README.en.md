@@ -4,12 +4,12 @@
 
 **A personal tool-using agent that resolves scope before it plans, executes, verifies, and repairs.**
 
-[中文](README.md) · [Benchmark protocol](docs/benchmark.md) · [Models and datasets on Hugging Face](https://huggingface.co/chris0809)
+[中文](README.md) · [Benchmark protocol](docs/benchmark.md) · [Architecture and portability](docs/architecture-portability.md) · [Models and datasets on Hugging Face](https://huggingface.co/chris0809)
 
 [![Python 3.10](https://img.shields.io/badge/Python-3.10-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Feishu](https://img.shields.io/badge/Feishu-Personal_Agent-3370FF?logo=lark&logoColor=white)](https://open.feishu.cn/)
 [![LangGraph](https://img.shields.io/badge/LangGraph-Stateful_Workflow-1C3C3C)](https://github.com/langchain-ai/langgraph)
-[![AppWorld Pass@1](https://img.shields.io/badge/AppWorld_Normal_Pass%401-74.4%25-27AE60)](docs/benchmark.md)
+[![AppWorld Pass@1](https://img.shields.io/badge/AppWorld_Normal_Pass%401-83.3%25-27AE60)](docs/benchmark.md)
 
 ![Synthetic PersonalOps workflow demo](docs/assets/personalops-demo.gif)
 
@@ -21,14 +21,21 @@ A tool-using agent can sound correct while selecting the wrong object, calling a
 skipping read-after-write verification, or repeating work after a worker handoff. PersonalOps
 therefore evaluates final world state instead of treating an agent self-report as success.
 
-On **168 AppWorld Test-N Normal tasks**, with one attempt per task and no failed-task reruns,
-the system passed **125/168 (74.4% Pass@1)**. Cloud planning and execution used only
-Qwen3.8-Flash and GLM-5.3-Flash, without Max/Pro tiers or high-reasoning mode. The arithmetic
-mean of per-task prompt-cache hit rates was **78.9%**; cost per task was **¥0.112 P50** and
-**¥0.355 P90**; end-to-end latency was **215.1 s P50** and **645.9 s P90**.
+In full, single-run AppWorld Test-Normal and Test-Challenge evaluations, the system passed
+**140/168 (83.3%)** and **315/417 (75.5%)**, respectively. The
+[official leaderboard workflow](https://github.com/StonyBrookNLP/appworld-leaderboard/pull/23)
+reproduced these scores. Cloud planning and execution used only Qwen3.8-Flash and
+GLM-5.3-Flash, with no Max/Pro tiers; only the Scope Resolver used medium reasoning,
+while most other roles used low or disabled reasoning. Estimated median API cost was
+**¥0.13 / ¥0.19 per task**, and median end-to-end latency was **281 / 352 seconds**
+for Normal / Challenge.
 
 See the [full aggregate protocol and percentile table](docs/benchmark.md). Raw tasks, simulated
 accounts, traces, runtime archives, private conversations, and credentials are never published.
+
+For multi-turn Feishu use, original user requests and the most recent user-facing answer stay
+verbatim. Older assistant answers may be summarized; the previous run's internal planning,
+execution, and review are summarized separately instead of replaying its full trace.
 
 ## Architecture
 

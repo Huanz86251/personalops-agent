@@ -4,12 +4,12 @@
 
 **面向真实工具调用的个人智能 Agent：先明确范围，再执行、验收和返修。**
 
-[English](README.en.md) · [评测方法与完整分位数](docs/benchmark.md) · [Hugging Face 模型与数据](https://huggingface.co/chris0809)
+[English](README.en.md) · [评测方法与完整分位数](docs/benchmark.md) · [架构与迁移边界](docs/architecture-portability.md) · [Hugging Face 模型与数据](https://huggingface.co/chris0809)
 
 [![Python 3.10](https://img.shields.io/badge/Python-3.10-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Feishu](https://img.shields.io/badge/Feishu-Personal_Agent-3370FF?logo=lark&logoColor=white)](https://open.feishu.cn/)
 [![LangGraph](https://img.shields.io/badge/LangGraph-Stateful_Workflow-1C3C3C)](https://github.com/langchain-ai/langgraph)
-[![AppWorld Pass@1](https://img.shields.io/badge/AppWorld_Normal_Pass%401-74.4%25-27AE60)](docs/benchmark.md)
+[![AppWorld Pass@1](https://img.shields.io/badge/AppWorld_Normal_Pass%401-83.3%25-27AE60)](docs/benchmark.md)
 
 ![PersonalOps synthetic workflow demo](docs/assets/personalops-demo.gif)
 
@@ -19,9 +19,9 @@
 
 工具型 Agent 最容易出现的问题，不是“不会聊天”，而是选错对象、调用错接口、写入后没有回读，或在 Worker 交接后重复劳动。因此项目用 AppWorld 的模拟业务环境检查完整任务结果，而不是把模型自报成功当成通过。
 
-在 **AppWorld Test-N Normal 168 题**中，每题只运行一次、失败不重跑，官方评测通过 **125/168，Pass@1 74.4%**。云端规划与执行只使用 Qwen3.8-Flash 与 GLM-5.3-Flash，未使用 Max/Pro 档或高推理模式；任务级平均缓存命中率 **78.9%**，单题成本 P50 **约 ¥0.112**、P90 **约 ¥0.355**，端到端耗时 P50 **215.1 秒**、P90 **645.9 秒**。
+在 **AppWorld Test-Normal／Test-Challenge 全量单次评测**中，任务通过率分别为 **83.3%（140/168）／75.5%（315/417）**；[官方榜单流程](https://github.com/StonyBrookNLP/appworld-leaderboard/pull/23)复算结果一致。云端规划与执行仅使用 Qwen3.8-Flash 和 GLM-5.3-Flash，不使用 Max/Pro；最高仅 Scope Resolver 使用 medium 推理，其余主要角色为 low 或关闭。两组单题估算成本 P50 分别为 **¥0.13／¥0.19**，端到端耗时 P50 为 **281／352 秒**；分位数、缓存命中和统计口径见[评测方法](docs/benchmark.md)。
 
-> 成本按可观测 usage 和公开价格估算；16 次请求缺少 usage/cost，因此总成本是下界。原题、模拟账号、Trace 和运行归档只保存在本地，仓库仅发布[聚合统计和评测口径](docs/benchmark.md)。
+> 成本按可观测 usage 和公开价格估算，不是账单；少量请求缺少 usage，因此总成本仅是下界。原题、模拟账号、Trace 和运行归档只保存在本地，仓库仅发布[聚合统计和评测口径](docs/benchmark.md)。
 
 ## 👤 项目定位
 
@@ -157,7 +157,7 @@ Worker 和 Reporter 都不直接写正式 Workspace；它们分别负责生产�
 
 ### Conversation Rolling Summary
 
-当对话累计到配置阈值后，较早的对话会被更新为滚动摘要。Scope Resolver、Scheduler、Replanner 和 Final Reviewer 使用这份摘要，同时只携带有限数量的最近对话。
+用户每轮原始命令保留原文；最近一轮发给用户的答复也保留原文。较早的助手答复达到阈值后才进入滚动摘要。上一轮 Scheduler／Worker／Reviewer 的内部执行记录另行压缩成一份交接摘要，供下一轮规划参考，不把冗长原始轨迹重新注入。Scope Resolver、Scheduler、Replanner 和 Final Reviewer 读取相应上下文。
 
 这样可以保留目标、约束和关键结果，又避免规划节点持续读取完整历史。
 

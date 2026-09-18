@@ -4,6 +4,7 @@ description: 已有多份材料或候选方案，需要按统一维度比较、�
 metadata:
   roles: "general"
   topics: "documents research comparison"
+  exclusive: "true"
 ---
 
 # 按统一口径综合比较

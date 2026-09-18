@@ -46,6 +46,11 @@ class RoleSkillsMiddleware(AgentMiddleware[WorkerProgressState]):
             if (m.get("role") if isinstance(m, dict) else m.type) in {"user", "human"}
             and not (m.get("additional_kwargs", {}) if isinstance(m, dict) else m.additional_kwargs).get("personalops_runtime_event")
         ][-1:]
+        if self.role != "reviewer" and state.get("skill_reselection_context"):
+            task = {
+                "task_contract": state["skill_reselection_context"],
+                "recent_attempt_outcomes": [],
+            }
         if self.role == "reviewer":
             from knowledge_rag.query import task_query
             assignment = "\n".join(str(m.get("content", "")) for m in task.get("assignment", []))

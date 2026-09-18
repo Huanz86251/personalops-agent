@@ -67,6 +67,65 @@ def test_next_step_receives_usage_and_return_structure():
     assert "Documented object with title/content; not executed yet." in prompt
 
 
+def test_scheduler_api_suggestion_is_explicitly_non_authoritative_to_worker():
+    from planning_graph import _build_step_instruction
+    from planning_models import PlanStep, PlanningContextPack
+    from test_planning_handoff_publication import planning_settings
+
+    state = {
+        "context": PlanningContextPack(current_time="now", user_request="处理记录"),
+        "plan_objective": "处理记录",
+        "completed_step_reports": [],
+    }
+    step = PlanStep.model_validate({
+        "step_id": 1,
+        "objective": "处理记录",
+        "success_criteria": ["处理完成"],
+        "worker_kind": "GENERAL",
+        "api_suggestion": {
+            "use_reason": "已见目录表明它能读取候选记录。",
+            "api_name": "service.list_records",
+        },
+    })
+    prompt = _build_step_instruction(
+        state, step, 1, model_limit=4, tool_limit=4, planning=planning_settings()
+    )
+    assert "Scheduler API建议：低置信、必须自行查证" in prompt
+    assert "service.list_records" in prompt
+    assert "如果不准确，请忽略该建议" in prompt
+
+
+def test_replanned_skill_context_contains_only_compact_decision_facts():
+    from planning_graph import _replanned_skill_selection_context
+    from planning_models import PlanStep, PlanningContextPack
+
+    step = PlanStep(
+        step_id=3,
+        objective="重新读取并导出",
+        success_criteria=["导出通过验收"],
+        worker_kind="GENERAL",
+    )
+    state = {
+        "context": PlanningContextPack(current_time="now", user_request="导出后关闭账户"),
+        "completed_step_reports": [
+            StepReport(step_id=1, status="COMPLETED", summary="已读取账户", stop_reason="done")
+        ],
+        "replan_history": [{
+            "request_reason": "旧写法未通过格式验收",
+            "remaining_steps": [step.model_dump(mode="json")],
+        }],
+    }
+    context = _replanned_skill_selection_context(state, step)
+    assert context == {
+        "user_request": "导出后关闭账户",
+        "accepted_steps": [{"step_id": 1, "status": "COMPLETED", "summary": "已读取账户"}],
+        "previous_failure": "旧写法未通过格式验收",
+        "new_step_id": 3,
+        "objective": "重新读取并导出",
+        "success_criteria": ["导出通过验收"],
+    }
+
+
 def test_skill_examples_parse_and_wrong_call_is_not_executable():
     text = Path("skills/appworld/appworld-execute-api/SKILL.md").read_text(encoding="utf-8")
     calls = []

@@ -393,7 +393,7 @@ def _validate_appworld_target_bindings(request, args, refs, prior):
 
     This validates coverage and provenance. It deliberately does not claim to
     understand the business meaning of an API name; the model must state that
-    comparison in match_reason before the call can execute.
+    comparison in read_api_reason before the call can execute.
     """
 
     selection = request.state.get("worker_target_selection")
@@ -597,34 +597,28 @@ def _validate_appworld_target_bindings(request, args, refs, prior):
             "BINDINGS_COVERAGE",
             "set_bindings must cover every target_selection operand exactly once; "
             f"missing={missing}, extra={extra}.",
-            f"提交且只提交这些集合：{operands}；每项包含set_id/read_api/source_ref/match_reason/requested_scope/coverage_plan。",
+            f"提交且只提交这些集合：{operands}；每项包含set_id/read_api_reason/read_api/source_ref/requested_scope/coverage_reason/completion_condition。",
         )
 
     for binding in bindings:
         api_name = str(binding.get("read_api") or "").strip()
         source_ref = str(binding.get("source_ref") or "").strip()
-        match_reason = str(binding.get("match_reason") or "").strip()
+        read_api_reason = str(binding.get("read_api_reason") or "").strip()
         requested_scope = str(binding.get("requested_scope") or "").strip()
-        coverage_plan = binding.get("coverage_plan")
-        coverage_reason = (
-            str(coverage_plan.get("reason") or "").strip()
-            if isinstance(coverage_plan, dict) else ""
-        )
-        completion_condition = (
-            str(coverage_plan.get("completion_condition") or "").strip()
-            if isinstance(coverage_plan, dict) else ""
-        )
+        coverage_reason = str(binding.get("coverage_reason") or "").strip()
+        completion_condition = str(binding.get("completion_condition") or "").strip()
         if source_ref not in refs:
             raise _action_card_error(
                 "BINDING_SOURCE_NOT_CITED",
                 f"set binding {binding.get('set_id')} source_ref={source_ref!r} must also appear in source_refs={refs}.",
                 f"把{source_ref!r}加入顶层source_refs，或改用其中已有且真正支持该绑定的编号。",
             )
-        if not all((api_name, match_reason, requested_scope, coverage_reason, completion_condition)):
+        if not all((api_name, read_api_reason, requested_scope, coverage_reason, completion_condition)):
             raise _action_card_error(
                 "BINDING_FIELDS",
-                f"Each set binding requires read_api, match_reason, requested_scope and coverage_plan; set_id={binding.get('set_id')!r}.",
-                "补齐真实读取接口、请求范围，以及reason在前的完整性停止条件。",
+                "Each set binding requires read_api_reason, read_api, requested_scope, "
+                f"coverage_reason and completion_condition; set_id={binding.get('set_id')!r}.",
+                "按扁平字段补齐真实读取接口、请求范围、完整性理由和停止条件；不要提交coverage_plan对象。",
             )
 
         if phase == "TARGET_READ":
@@ -808,9 +802,9 @@ def target_read_binding_review(request, evidence_refs):
             f"- 集合{set_id}定义：{definitions.get(set_id, '')}",
             f"  已引用来源中的真实描述：{_description_excerpt(texts.get(source_ref, ''), binding.get('read_api'))}",
             f"  读取前声明范围：{str(binding.get('requested_scope') or '')}",
-            f"  读取前完整条件：{str((binding.get('coverage_plan') or {}).get('completion_condition') or '')}",
-            f"  读取前完整理由：{str((binding.get('coverage_plan') or {}).get('reason') or '')}",
-            f"  上一轮范围说明：{str(binding.get('match_reason') or '')}",
+            f"  读取前完整条件：{str(binding.get('completion_condition') or '')}",
+            f"  读取前完整理由：{str(binding.get('coverage_reason') or '')}",
+            f"  上一轮接口适用理由：{str(binding.get('read_api_reason') or '')}",
         ])
     return "\n".join(lines)
 

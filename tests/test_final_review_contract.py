@@ -9,6 +9,32 @@ from test_planning_repair_prefix import Scripted
 
 
 class ReviewContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_budget_exhaustion_produces_explicit_harness_report(self):
+        class Exhausted(Scripted):
+            def __init__(self):
+                super().__init__([])
+
+            def with_structured_output(self, *args, **kwargs):
+                class Bound:
+                    async def ainvoke(self, messages):
+                        raise RuntimeError("Trial model-call budget exhausted")
+                return Bound()
+
+        result = await run_hard_final_reviewer(
+            Exhausted(),
+            context=PlanningContextPack(current_time="now", user_request="finish safely"),
+            plan_objective="finish safely",
+            plan_success_criteria=["verified"],
+            step_reports=[],
+            replan_history=[],
+            overall_stop_reason="budget",
+            replan_available=False,
+        )
+        self.assertTrue(result.used_fallback)
+        self.assertEqual(result.output.status, "FAILED")
+        self.assertIn("预算已耗尽", result.output.final_answer)
+        self.assertIn("不是 Final Reviewer", result.output.final_answer)
+
     async def test_observed_invalid_branch_can_repair_without_changing_prefix(self):
         invalid = {'action': 'REPLAN', 'unmet_success_criteria': ['unfinished'], 'replan_reason': 'continue'}
         valid = {'action': 'REPLAN', 'status': None, 'final_answer': None,
@@ -49,6 +75,7 @@ class ReviewContractTests(unittest.IsolatedAsyncioTestCase):
         context = PlanningContextPack(
             current_time='SHOULD_NOT_APPEAR',
             user_request='核对全部订单',
+            completion_api_contract='PUBLIC-COMPLETE-TASK-DOC',
             toolset_catalog=[{'name': 'CAPABILITY_SHOULD_NOT_APPEAR'}],
         )
         context.scheduler_session['records'] = [{
@@ -70,7 +97,8 @@ class ReviewContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('一次调整', wire)
         self.assertNotIn('OLD_PLAN_PROTOCOL_SHOULD_NOT_APPEAR', wire)
         self.assertNotIn('CAPABILITY_SHOULD_NOT_APPEAR', wire)
-        self.assertNotIn('SHOULD_NOT_APPEAR', wire)
+        self.assertIn('SHOULD_NOT_APPEAR', wire)
+        self.assertIn('PUBLIC-COMPLETE-TASK-DOC', wire)
 
     def test_return_to_worker_is_evidence_first_and_has_no_api_advice(self):
         decision = FinalReviewDecision.model_validate({

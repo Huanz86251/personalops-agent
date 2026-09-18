@@ -223,6 +223,7 @@ class StepReporterAgentTests(unittest.IsolatedAsyncioTestCase):
     async def test_reporter_reads_packet_and_returns_planner_handoff(self) -> None:
         packet = build_step_review_packet(
             user_request="Find a cinema.",
+            completion_api_contract="PUBLIC-COMPLETE-TASK-DOC",
             plan_objective="Return verified cinema information.",
             current_step=sample_step(),
             current_attempt={
@@ -286,6 +287,8 @@ class StepReporterAgentTests(unittest.IsolatedAsyncioTestCase):
             "worker-a",
         )
         prompt = "\n".join(m["content"] for m in model.structured.messages[0])
+        self.assertEqual(sum(m["content"] == "PUBLIC-COMPLETE-TASK-DOC"
+                             for m in model.structured.messages[0]), 1)
         self.assertNotIn("call-1", model.structured.messages[0][0]["content"])
         self.assertIn("StepReviewPacket", prompt)
         self.assertNotIn("call-1", prompt)

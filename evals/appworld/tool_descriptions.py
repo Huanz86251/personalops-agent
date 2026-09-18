@@ -53,25 +53,22 @@ AppWorldActionPhase = Literal[
 ]
 
 
-class AppWorldCoveragePlan(BaseModel):
-    reason: str = Field(
-        min_length=1,
-        max_length=300,
-        description="先说明为什么这个停止条件足以证明目标范围已经读取完整。",
-    )
-    completion_condition: str = Field(
-        min_length=1,
-        max_length=300,
-        description="读取前定义何时算完整，例如读到无下一页、返回明确总数并对齐，或接口保证一次返回全部。",
-    )
-
-
 class AppWorldSetBinding(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     set_id: str = Field(
         min_length=1,
         max_length=24,
         pattern=r"^[A-Z][A-Z0-9_]*$",
         description="复制当前Step.target_selection中的集合编号，例如A或B。",
+    )
+    read_api_reason: str = Field(
+        min_length=1,
+        max_length=300,
+        description=(
+            "先比较接口真实返回范围与当前集合definition，说明为什么该接口适合产生这个集合，"
+            "并确认没有额外加入或丢失筛选条件。"
+        ),
     )
     read_api: str = Field(
         min_length=3,
@@ -87,18 +84,20 @@ class AppWorldSetBinding(BaseModel):
         pattern=r"^(?:P1|[URSHCE][1-9][0-9]*)$",
         description="支持本次TARGET_READ绑定的可见来源号，引用已见接口文档或真实返回。",
     )
-    match_reason: str = Field(
-        min_length=1,
-        max_length=300,
-        description="一句话比较接口真实返回范围与集合definition，说明没有额外加入或丢失筛选条件。",
-    )
     requested_scope: str = Field(
         min_length=1,
         max_length=400,
         description="读取前写清楚本次要取得的对象边界、筛选条件和是否要求全部结果。",
     )
-    coverage_plan: AppWorldCoveragePlan = Field(
-        description="与requested_scope放在一起，读取前定义怎样证明结果完整。",
+    coverage_reason: str = Field(
+        min_length=1,
+        max_length=300,
+        description="先说明为什么下面的完成条件足以证明requested_scope已经读取完整。",
+    )
+    completion_condition: str = Field(
+        min_length=1,
+        max_length=300,
+        description="读取前定义何时算完整，例如读到无下一页、返回明确总数并对齐，或接口保证一次返回全部。",
     )
 
 
@@ -146,14 +145,16 @@ class AppWorldCallInput(BaseModel):
                 "binding_ref": None,
                 "binding_checks": [],
                 "set_bindings": [
-                    {"set_id": "A", "read_api": "drive.list_folder_documents",
-                     "source_ref": "E1", "match_reason": "产生文件夹内文档集合，没有加入批准条件。",
+                    {"set_id": "A", "read_api_reason": "产生文件夹内文档集合，没有加入批准条件。",
+                     "read_api": "drive.list_folder_documents", "source_ref": "E1",
                      "requested_scope": "选定文件夹内的全部文档",
-                     "coverage_plan": {"reason": "接口分页，因此读到无下一页才不会漏项。", "completion_condition": "持续分页直到没有下一页"}},
-                    {"set_id": "B", "read_api": "drive.list_approved_documents",
-                     "source_ref": "E1", "match_reason": "产生已批准文档集合，没有加入文件夹条件。",
+                     "coverage_reason": "接口分页，因此读到无下一页才不会漏项。",
+                     "completion_condition": "持续分页直到没有下一页"},
+                    {"set_id": "B", "read_api_reason": "产生已批准文档集合，没有加入文件夹条件。",
+                     "read_api": "drive.list_approved_documents", "source_ref": "E1",
                      "requested_scope": "全部已批准文档",
-                     "coverage_plan": {"reason": "接口保证一次返回全部匹配项。", "completion_condition": "一次返回且响应没有分页字段"}},
+                     "coverage_reason": "接口保证一次返回全部匹配项。",
+                     "completion_condition": "一次返回且响应没有分页字段"},
                 ],
                 "code": "# 示例API仅展示结构；实际调用必须替换为已见文档中的真实API",
             },

@@ -104,11 +104,12 @@ class SchedulerConversation:
                 self.add("相关较早对话", older_pairs, protected=False)
             if latest_pair:
                 self.fact("最近一轮原文", latest_pair)
-        if self.context.conversation_summary or self.context.memory_context:
+        if self.context.conversation_summary or self.context.memory_context or self.context.previous_run_summary:
             self.add(
                 "辅助背景",
                 {
                     "历史进展": self.context.conversation_summary,
+                    "上一轮内部执行摘要": self.context.previous_run_summary,
                     "相关记忆": self.context.memory_context,
                 },
                 protected=False,
@@ -126,8 +127,10 @@ class SchedulerConversation:
             self.fact("任务修改", self.context.replacement_context)
         if self.context.execution_instructions:
             self.fact("执行环境", self.context.execution_instructions)
+        if self.context.completion_api_contract:
+            self.fact("AppWorld公开完成接口合同", self.context.completion_api_contract)
         self.fact("可用能力", self.context.toolset_catalog)
-        self.add("time", {"任务开始时间": self.context.current_time}, protected=False)
+        self.add("time", self.context.current_time_context(), protected=False)
 
     def wire(self):
         # Replaceable projections are emitted after the reusable prefix.  The

@@ -4,6 +4,7 @@ description: 审核 AppWorld 模拟应用操作是否真正完成：核对原始
 metadata:
   roles: "step_reporter"
   topics: "appworld verification"
+  conflicts-with: "report-web-evidence"
 ---
 
 # AppWorld 操作结果审核
@@ -23,10 +24,6 @@ metadata:
 ## 3. 验范围，再验结果
 
 用户要求“集合A中符合条件B的全部记录”，需要支持A的范围、B的筛选与分页完成，再看这些记录是否达到目标。只证明选出的记录处理成功，不能证明没有漏选。查到记录不等于修改成功；修改回执还应结合回读结果和原要求判断。对其它记录未改动的结论也需要证据，不能自动补上。
-
-required_context指定source_system或relationship时，还要核对执行证据是否真的从该权威来源取得成员。用Venmo平台好友替代Phone联系人friend，或用Splitwise群组替代Phone联系人roommate，都属于范围不成立；即使被处理记录本身操作成功，也不能判范围标准MET。Reviewer若观察到替换但Worker没有提出异议，应明确指出最早的错误来源和漏选/多选风险。
-
-CSV等文件不能只接受Worker的“解析后相等”摘要。需要核对原始表头、列顺序、分隔符、引号和实际单元格值；若Worker用与写入逻辑配套的自定义解析器读回同一文件，这属于同源自证，不能单独证明官方格式兼容。包含删除账户等不可逆后续动作时，备份文件未独立验收就执行删除，应将备份标准判为NOT_MET或UNKNOWN，并如实保留删除已发生的事实。
 
 ## 4. 完成标记单独看真实回执
 

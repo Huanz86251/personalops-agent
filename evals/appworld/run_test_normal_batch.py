@@ -30,7 +30,17 @@ def _atomic_json(path: Path, value: Any) -> None:
     temporary.write_text(
         json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    temporary.replace(path)
+    # A concurrent progress reader can briefly hold the destination open on
+    # Windows, causing os.replace to raise PermissionError. The write is
+    # idempotent; retry only that local replace, never the paid child trial.
+    for attempt in range(10):
+        try:
+            temporary.replace(path)
+            return
+        except PermissionError:
+            if attempt == 9:
+                raise
+            time.sleep(0.05)
 
 
 def split_task_ids(task_ids: list[str], seed: int) -> tuple[list[str], list[str]]:
@@ -67,27 +77,29 @@ def _source_digest() -> str:
     return digest.hexdigest()
 
 
-def _list_task_ids(image: str) -> list[str]:
+def _list_task_ids(image: str, split: str = "test_normal") -> list[str]:
     from evals.appworld.protocol import DockerWorld
 
     with DockerWorld(image=image) as world:
-        ids = world.request("list_tasks", split="test_normal")
+        ids = world.request("list_tasks", split=split)
     if not isinstance(ids, list) or not all(isinstance(value, str) for value in ids):
         raise RuntimeError("Frozen Test-N worker returned an invalid ID list")
     return ids
 
 
-def prepare(batch_id: str, seed: int, image: str) -> Path:
-    batch = ROOT / ".agent/appworld-test-normal" / batch_id
+def prepare(batch_id: str, seed: int, image: str, split: str = "test_normal") -> Path:
+    if split not in {"test_normal", "test_challenge"}:
+        raise ValueError("Unsupported frozen test split")
+    batch = ROOT / (".agent/appworld-test-normal" if split == "test_normal" else ".agent/appworld-test-challenge") / batch_id
     batch.mkdir(parents=True, exist_ok=False)
-    ids = _list_task_ids(image)
+    ids = _list_task_ids(image, split)
     half_a, half_b = split_task_ids(ids, seed)
     if set(half_a) & set(half_b) or set(half_a) | set(half_b) != set(ids):
         raise RuntimeError("Deterministic halves do not partition Test-N")
     manifest = {
-        "schema": "appworld-test-normal-halves",
+        "schema": "appworld-test-normal-halves" if split == "test_normal" else "appworld-test-challenge-halves",
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
-        "split": "test_normal",
+        "split": split,
         "seed": seed,
         "image": image,
         "task_count": len(ids),
@@ -259,7 +271,7 @@ def run_half(
             # would make several processes rewrite the same aggregate files.
             "--no-monitor",
             "--max-calls",
-            "60",
+            "80",
             "--max-interactions",
             "90",
             "--allow-paid",
@@ -382,7 +394,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch-id", required=True)
     parser.add_argument("--seed", type=int, default=20260915)
-    parser.add_argument("--image", default=DEFAULT_IMAGE)
+    parser.add_argument("--split", choices=("test_normal", "test_challenge"), default="test_normal")
+    parser.add_argument("--image")
     parser.add_argument("--prepare", action="store_true")
     parser.add_argument("--half", choices=("A", "B"))
     parser.add_argument(
@@ -402,9 +415,10 @@ def main() -> None:
     )
     parser.add_argument("--allow-paid", action="store_true")
     args = parser.parse_args()
-    batch = ROOT / ".agent/appworld-test-normal" / args.batch_id
+    batch = ROOT / (".agent/appworld-test-normal" if args.split == "test_normal" else ".agent/appworld-test-challenge") / args.batch_id
+    image = args.image or (DEFAULT_IMAGE if args.split == "test_normal" else "personalops-appworld-test-challenge:0.1.3.post1")
     if args.prepare:
-        batch = prepare(args.batch_id, args.seed, args.image)
+        batch = prepare(args.batch_id, args.seed, image, args.split)
         print(batch)
     if args.half:
         try:
@@ -414,6 +428,7 @@ def main() -> None:
                 allow_paid=args.allow_paid,
                 parallelism=args.parallelism,
                 phoenix_project=args.phoenix_project,
+                expected_split=args.split,
             )
         except ValueError as error:
             parser.error(str(error))

@@ -2,13 +2,17 @@
 import os
 os.environ["PHOENIX_TRACING_ENABLED"] = "false"
 
+import gc
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
+import warnings
 from pydantic import Field
+from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.callbacks.manager import AsyncCallbackManager
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult, LLMResult
@@ -16,7 +20,8 @@ from langchain_core.runnables import RunnableLambda
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from evals.appworld.adapter import (
-    EvaluationBudgetExceeded, UsageMeter, run_personalops, make_discover_tool, make_execute_tool,
+    EvaluationBudgetExceeded, UsageMeter, default_planning, run_personalops,
+    make_discover_tool, make_execute_tool,
 )
 from hard_planning import _format_hard_context
 from planning_models import PlanningContextPack, PlanningReplacementContext
@@ -207,6 +212,35 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         meter.on_chat_model_start({}, [], run_id=uuid4())
         with self.assertRaises(EvaluationBudgetExceeded):
             meter.on_chat_model_start({}, [], run_id=uuid4())
+
+    def test_appworld_default_whole_trial_budget_is_eighty(self):
+        self.assertEqual(UsageMeter().max_calls, 80)
+        self.assertEqual(default_planning().max_plan_model_rounds, 80)
+
+    async def test_async_budget_rejection_does_not_leak_later_callback_coroutines(self):
+        class LaterInlineCallback(BaseCallbackHandler):
+            run_inline = True
+
+            def on_chat_model_start(self, serialized, messages, **kwargs):
+                return None
+
+        manager = AsyncCallbackManager([
+            UsageMeter(max_calls=0),
+            LaterInlineCallback(),
+        ])
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", RuntimeWarning)
+            with self.assertRaises(EvaluationBudgetExceeded):
+                await manager.on_chat_model_start({}, [[]])
+            gc.collect()
+
+        leaked = [
+            warning
+            for warning in caught
+            if issubclass(warning.category, RuntimeWarning)
+            and "was never awaited" in str(warning.message)
+        ]
+        self.assertEqual(leaked, [])
 
     def test_usage_meter_reads_runtime_model_role_metadata(self):
         meter, call = UsageMeter(), uuid4()

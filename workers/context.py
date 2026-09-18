@@ -30,6 +30,11 @@ class WorkerRuntimeContextMiddleware(AgentMiddleware[WorkerProgressState]):
             blocks.append(f"[当前可用执行额度]\n模型执行轮次：{remaining}；业务工具调用：{tools}。以本次状态更新为准。")
         memory_context = state.get("memory_context", "")
         execution_instructions = state.get("execution_instructions", "")
+        completion_api_contract = state.get("completion_api_contract", "")
+        current_time_context = state.get("current_time_context", "")
+
+        if isinstance(current_time_context, str) and current_time_context.strip():
+            blocks.append(current_time_context.strip())
 
         if isinstance(memory_context, str) and memory_context.strip():
             blocks.append(f"[相关记忆]\n{memory_context.strip()}")
@@ -41,6 +46,8 @@ class WorkerRuntimeContextMiddleware(AgentMiddleware[WorkerProgressState]):
                 "[执行环境]\n"
                 f"{execution_instructions.strip()}"
             )
+        if isinstance(completion_api_contract, str) and completion_api_contract.strip():
+            blocks.append(completion_api_contract.strip())
 
         return context_event(state, "\n\n".join(blocks), "runtime_context_fingerprint")
 

@@ -5,6 +5,7 @@ metadata:
   roles: "general web"
   topics: "documents"
   required-tools: "attachment_to_text"
+  exclusive: "true"
 ---
 
 # 带覆盖范围的文档读取

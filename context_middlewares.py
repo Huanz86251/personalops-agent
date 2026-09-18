@@ -775,6 +775,8 @@ async def summarize_conversation_history(
         Any
     ],
     max_chars: int,
+    prompt_name: str = "conversation/summary",
+    material_label: str = "本次新增的较早对话",
 ) -> str:
     """更新Hard节点共用的Conversation Rolling Summary。
 
@@ -817,7 +819,7 @@ async def summarize_conversation_history(
         )
 
     source_blocks.append(
-        "[本次新增的较早对话]\n"
+        f"[{material_label}]\n"
         f"{new_history_text}"
     )
 
@@ -826,7 +828,7 @@ async def summarize_conversation_history(
     )
 
     summary_prompt = (
-        render_prompt("conversation/summary")
+        render_prompt(prompt_name)
         + "\n\n"
         + (
             "最终摘要总长度不得超过"

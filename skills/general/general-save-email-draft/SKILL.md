@@ -5,6 +5,7 @@ metadata:
   roles: "general"
   topics: "email drafts"
   required-tools: "email_create_draft"
+  exclusive: "true"
 ---
 
 # 仅保存邮箱草稿

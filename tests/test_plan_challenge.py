@@ -120,6 +120,3 @@ def test_worker_and_reviewer_prompts_explain_the_bounded_route():
     assert "ReviewAttempt含plan_challenge" in reporter_prompt
     assert "ScopeContract" in scheduler_prompt
     assert "execution_guidance" in scheduler_prompt
-    assert "今年3月" in worker_prompt
-    assert "只要求“3月”" in worker_prompt
-    assert "关系来源" in worker_prompt

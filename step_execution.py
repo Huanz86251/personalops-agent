@@ -1674,6 +1674,16 @@ async def run_step_reporter(
                 {"role": "user", "content": packet_context}]
     # The contract is never compressed with evidence; validation uses these exact criteria.
     messages.append({"role": "user", "content": "原始验收契约（逐条原样审核，不得自行拆分或替换）：" + review_packet.task_contract.model_dump_json()})
+    if review_packet.task_contract.current_time_context:
+        messages.append({
+            "role": "user",
+            "content": review_packet.task_contract.current_time_context,
+        })
+    if review_packet.task_contract.completion_api_contract:
+        messages.append({
+            "role": "user",
+            "content": review_packet.task_contract.completion_api_contract,
+        })
     # Publication identities must survive packet compaction; approval uses these exact refs.
     artifact_manifest = [{"review_ref": reporter_evidence_refs.get(a.review_ref, a.review_ref), "description": a.description[:300],
                           "size_bytes": a.size_bytes, "sha256": a.sha256}

@@ -5,6 +5,7 @@ metadata:
   roles: "web"
   topics: "research"
   required-tools: "web_search"
+  exclusive: "true"
 ---
 
 # 跨领域证据调查

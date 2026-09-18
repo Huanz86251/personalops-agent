@@ -324,6 +324,8 @@ def _build_attempt(
 def build_step_review_packet(
     *,
     user_request: str,
+    current_time_context: str = "",
+    completion_api_contract: str = "",
     plan_objective: str,
     current_step: PlanStep,
     current_attempt: Mapping[str, Any],
@@ -354,6 +356,8 @@ def build_step_review_packet(
         created_at=datetime.now(timezone.utc),
         task_contract=ReviewTaskContract(
             user_request=user_request,
+            current_time_context=current_time_context,
+            completion_api_contract=completion_api_contract,
             plan_objective=plan_objective,
             step_id=current_step.step_id,
             step_assignment=current_step.objective,

@@ -255,7 +255,7 @@ async def prepare_scope_context(
                 contract, model_calls = await resolve_scope_contract(
                     model,
                     context.user_request,
-                    context.current_time,
+                    context.current_time_context(),
                 )
                 set_span_attributes(
                     resolver_span, **{

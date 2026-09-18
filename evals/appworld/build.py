@@ -17,22 +17,22 @@ DATA_SHA256 = "fd9f9608c2ec71ed0ac25c3633a738b9129a318a129e31230425b9188e508250"
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--protocol", choices=("development", "test-normal"), default="development")
+    parser.add_argument("--protocol", choices=("development", "test-normal", "test-challenge"), default="development")
     parser.add_argument("--image")
     parser.add_argument("--wsl", default="Ubuntu")
     args = parser.parse_args()
-    image = args.image or (
-        "personalops-appworld-test-normal:0.1.3.post1"
-        if args.protocol == "test-normal"
-        else "personalops-appworld:0.1.3.post1"
-    )
+    image = args.image or {
+        "development": "personalops-appworld:0.1.3.post1",
+        "test-normal": "personalops-appworld-test-normal:0.1.3.post1",
+        "test-challenge": "personalops-appworld-test-challenge:0.1.3.post1",
+    }[args.protocol]
     root = Path(__file__).resolve().parents[2]
     cache = root / ".agent/appworld-downloads"
-    context = root / (
-        ".agent/appworld-build-test-normal"
-        if args.protocol == "test-normal"
-        else ".agent/appworld-build"
-    )
+    context = root / {
+        "development": ".agent/appworld-build",
+        "test-normal": ".agent/appworld-build-test-normal",
+        "test-challenge": ".agent/appworld-build-test-challenge",
+    }[args.protocol]
     for path in (cache, context):
         if not path.resolve().is_relative_to(root):
             raise ValueError("Build paths must remain inside the project")
@@ -62,7 +62,11 @@ def main():
     else:
         command, context_arg = ["docker"], str(context)
     print(json.dumps({"verified_data_sha256": actual, "context": str(context)}), flush=True)
-    allowed_splits = "test_normal" if args.protocol == "test-normal" else "train,dev"
+    allowed_splits = {
+        "development": "train,dev",
+        "test-normal": "test_normal",
+        "test-challenge": "test_challenge",
+    }[args.protocol]
     subprocess.run(
         command + [
             "build", "--progress", "plain",

@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 from langchain.messages import AIMessage, HumanMessage
 
 from context_middlewares import summarize_conversation_history
-from conversation_runtime import ConversationRuntime
+from conversation_runtime import ConversationRuntime, _planning_run_handoff_material
 from hard_planning import _format_hard_context
 from planning_models import PlanningContextPack
 from memory import (
@@ -60,13 +60,15 @@ class PromptContextContractTests(unittest.IsolatedAsyncioTestCase):
             state_values=state, user_request="继续执行", memory_context="旧偏好",
         )
         self.assertEqual(context.user_request, "继续执行")
-        self.assertEqual(context.user_instruction_history, [])
+        self.assertEqual(context.user_instruction_history, [unrelated, related, low_score, latest_user])
         self.assertEqual(context.conversation_summary, "")
         restored = PlanningContextPack.model_validate_json(context.model_dump_json())
         rendered = _format_hard_context(restored)
         self.assertIn(related, rendered)
-        self.assertNotIn(unrelated, rendered)
-        self.assertNotIn(low_score, rendered)
+        # Earlier user instructions stay exact; irrelevant assistant replies do not.
+        self.assertIn(unrelated, rendered)
+        self.assertNotIn("无关回复", rendered)
+        self.assertNotIn("普通回复", rendered)
         self.assertIn(latest_user, rendered)
         self.assertIn(latest_assistant, rendered)
         self.assertLess(rendered.index(related), rendered.index(latest_user))
@@ -80,6 +82,92 @@ class PromptContextContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(low_score, rerank_call["documents"][2])
         agent.aupdate_state.assert_not_awaited()
         model.ainvoke.assert_not_awaited()
+
+    async def test_feishu_older_turns_are_summarized_once_without_rewriting_current_request(self):
+        messages = []
+        for index in range(6):
+            messages.extend([
+                HumanMessage(content=f"历史用户原话 {index}"),
+                AIMessage(content=f"历史任务结果 {index}"),
+            ])
+        summary_model = SimpleNamespace(
+            ainvoke=AsyncMock(return_value=AIMessage(content="较早两轮的已确认进展"))
+        )
+        runtime = SimpleNamespace(
+            settings=SimpleNamespace(planning=SimpleNamespace(
+                hard_recent_dialogue_max_chars=4000,
+                conversation_summary_trigger_turns=2,
+                conversation_summary_max_chars=1000,
+            )),
+            summary_model=summary_model,
+            toolset_catalog=[],
+            toolset_router=None,
+            retrieval_models=None,
+            _build_config=lambda thread_id: {"configurable": {"thread_id": thread_id}},
+        )
+        agent = SimpleNamespace(aupdate_state=AsyncMock())
+        original_request = "请继续处理本轮文件，保留这句原始命令。"
+        context = await ConversationRuntime._prepare_planning_context(
+            runtime, agent=agent, hard_model=SimpleNamespace(),
+            conversation=SimpleNamespace(thread_id="feishu-conversation"),
+            state_values={"messages": messages, "previous_run_summary": "上一轮内部审核未通过"}, user_request=original_request,
+            memory_context="",
+        )
+        self.assertEqual(context.user_request, original_request)
+        self.assertEqual(context.conversation_summary, "较早两轮的已确认进展")
+        self.assertEqual(context.previous_run_summary, "上一轮内部审核未通过")
+        self.assertEqual(context.recent_dialogue[-2].content, "历史用户原话 5")
+        self.assertEqual(context.recent_dialogue[-1].content, "历史任务结果 5")
+        self.assertIn("历史用户原话 0", _format_hard_context(context))
+        self.assertNotIn("历史任务结果 0", _format_hard_context(context))
+        self.assertIn(original_request, _format_hard_context(context))
+        self.assertEqual(summary_model.ainvoke.await_count, 1)
+        self.assertNotIn("历史用户原话 0", summary_model.ainvoke.call_args.args[0][1]["content"])
+        saved = agent.aupdate_state.await_args.args[1]
+        self.assertEqual(saved["conversation_summary_message_count"], 2)
+
+        resumed = await ConversationRuntime._prepare_planning_context(
+            runtime, agent=agent, hard_model=SimpleNamespace(),
+            conversation=SimpleNamespace(thread_id="feishu-conversation"),
+            state_values={"messages": messages, **saved},
+            user_request=original_request, memory_context="",
+        )
+        self.assertEqual(resumed.conversation_summary, context.conversation_summary)
+        self.assertEqual(summary_model.ainvoke.await_count, 1)
+
+    def test_previous_run_summary_is_separate_and_raw_trace_is_not_replayed(self):
+        material = _planning_run_handoff_material({
+            "plan_objective": "更新报表",
+            "final_status": "FAILED",
+            "overall_stop_reason": "验收未通过",
+            "final_answer": "给用户的原文，不放入内部摘要",
+            "completed_step_reports": [{
+                "step_id": 1, "status": "FAILED", "summary": "报表已写入但未验收",
+                "stop_reason": "缺少回读", "secret_token": "never-copy-this",
+            }],
+        })
+        self.assertIn("报表已写入但未验收", material)
+        self.assertNotIn("给用户的原文", material)
+        self.assertNotIn("never-copy-this", material)
+        context = PlanningContextPack(
+            current_time="2026-09-18", user_request="请修复上一轮报表",
+            previous_run_summary="上一轮写入了报表，但回读验收未完成",
+        )
+        rendered = _format_hard_context(context)
+        self.assertIn("上一轮写入了报表", rendered)
+        self.assertIn("请修复上一轮报表", rendered)
+
+    async def test_internal_run_summary_uses_its_own_prompt(self):
+        model = SimpleNamespace(ainvoke=AsyncMock(return_value=AIMessage(content="上轮未完成回读")))
+        result = await summarize_conversation_history(
+            model, previous_summary="", messages=[{"role": "user", "content": "FAILED: 缺少回读"}],
+            max_chars=200, prompt_name="conversation/run_summary",
+            material_label="上一轮内部规划、执行与审核记录",
+        )
+        self.assertEqual(result, "上轮未完成回读")
+        sent = model.ainvoke.call_args.args[0]
+        self.assertIn("内部规划", sent[0]["content"])
+        self.assertIn("FAILED: 缺少回读", sent[1]["content"])
 
     async def test_summary_material_is_separate_from_system_rules(self):
         material = "历史原文包含 {messages} 和 {{user_message}}，不要插值"

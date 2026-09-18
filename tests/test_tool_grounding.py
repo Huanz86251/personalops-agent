@@ -161,16 +161,14 @@ def _target_selection_state(messages=None, effect_mode="MUTATION"):
 
 def _bindings(source_ref="U1"):
     return [
-        {"set_id": "A", "read_api": "drive.list_folder_documents",
-         "source_ref": source_ref,
-         "match_reason": "返回文件夹内文档，产出document且没有增加标星条件。",
+        {"set_id": "A", "read_api_reason": "返回文件夹内文档，产出document且没有增加标星条件。",
+         "read_api": "drive.list_folder_documents", "source_ref": source_ref,
          "requested_scope": "指定文件夹内的全部文档",
-         "coverage_plan": {"reason": "分页读完才能覆盖全部文档。", "completion_condition": "读到没有下一页"}},
-        {"set_id": "B", "read_api": "drive.list_starred_documents",
-         "source_ref": source_ref,
-         "match_reason": "返回已标星文档，产出document且没有增加文件夹条件。",
+         "coverage_reason": "分页读完才能覆盖全部文档。", "completion_condition": "读到没有下一页"},
+        {"set_id": "B", "read_api_reason": "返回已标星文档，产出document且没有增加文件夹条件。",
+         "read_api": "drive.list_starred_documents", "source_ref": source_ref,
          "requested_scope": "全部已标星文档",
-         "coverage_plan": {"reason": "分页读完才能覆盖全部标星文档。", "completion_condition": "读到没有下一页"}},
+         "coverage_reason": "分页读完才能覆盖全部标星文档。", "completion_condition": "读到没有下一页"},
     ]
 
 
@@ -456,7 +454,7 @@ def test_action_card_rejection_gives_specific_correction_and_expected_lineage():
     message = str(caught.value)
     assert "ACTION_CARD_REJECTED[BINDINGS_COVERAGE]" in message
     assert "missing=['B']" in message
-    assert "set_id/read_api/source_ref/match_reason/requested_scope/coverage_plan" in message
+    assert "set_id/read_api_reason/read_api/source_ref/requested_scope/coverage_reason/completion_condition" in message
     assert "不要原样重复" in message
 
     read_args = {

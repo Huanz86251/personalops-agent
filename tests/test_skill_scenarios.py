@@ -40,7 +40,7 @@ class ScenarioCatalogTests(unittest.TestCase):
                         topics=asset["topics"], tools=asset["required_tools"], mode="dynamic")
                     self.assertEqual([s.name for s in selected.selected], [asset["name"]])
                     request = json.loads(model.selection_requests[0][0]["content"])
-                    self.assertTrue(all(set(item) == {"id", "description"}
+                    self.assertTrue(all(set(item) == {"id", "description", "exclusive", "conflicts_with"}
                                         for item in request["available_skills"]))
                     for other in catalog:
                         if role not in other["roles"]:

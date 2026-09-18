@@ -102,7 +102,7 @@ class ScopeResolutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(model.options["method"], "json_mode")
         self.assertIn('"target_entity"', model.messages[0]["content"])
         self.assertIn("bookmark_id", model.messages[0]["content"])
-        self.assertIn("任务开始时间", model.messages[1]["content"])
+        self.assertIn("真实世界当前时间", model.messages[1]["content"])
         self.assertIn("now", model.messages[1]["content"])
 
     def test_contract_preserves_cross_entity_required_context_and_read_only_effect(self):
@@ -128,6 +128,8 @@ class ScopeResolutionTests(unittest.IsolatedAsyncioTestCase):
                 "read": "Laura发来的电影推荐短信",
                 "source_system": "messaging",
                 "relationship": "null",
+                "resolution_status": "EXPLICIT",
+                "resolution_note": None,
                 "because": "短信中可能包含电影筛选要求",
                 "used_for": "从集合A中筛出最终回复内容",
             }],
@@ -160,12 +162,16 @@ class ScopeResolutionTests(unittest.IsolatedAsyncioTestCase):
                 "read": "Phone联系人中的朋友",
                 "source_system": "phone contact book",
                 "relationship": "friend",
+                "resolution_status": "EXPLICIT",
+                "resolution_note": None,
                 "because": "需要确定哪些发送者属于用户的朋友",
                 "used_for": "筛选待处理Venmo请求的发送者",
             }, {
                 "read": "Phone联系人中的室友",
                 "source_system": "phone contact book",
                 "relationship": "roommate",
+                "resolution_status": "EXPLICIT",
+                "resolution_note": None,
                 "because": "需要确定哪些发送者属于用户的室友",
                 "used_for": "筛选待处理Venmo请求的发送者",
             }],
@@ -186,6 +192,7 @@ class ScopeResolutionTests(unittest.IsolatedAsyncioTestCase):
             "constraints": [{
                 "source_text": "今年3月",
                 "applies_to": "file",
+                "applies_to_sets": ["A"],
                 "meaning": "创建日期位于2023-03-01至2023-03-31",
             }],
             "sets": [{
@@ -203,25 +210,105 @@ class ScopeResolutionTests(unittest.IsolatedAsyncioTestCase):
                 "source_text": "今年3月",
                 "start_at": "2023-03-01",
                 "end_at": "2023-03-31",
+                "resolution_status": "DERIVED",
+                "resolution_note": "由任务开始时间唯一换算",
+                "used_for_sets": ["A"],
             }, {
                 "source_text": "未定义财年",
                 "start_at": "null",
                 "end_at": False,
+                "resolution_status": "UNKNOWN",
+                "resolution_note": "缺少财年起始月",
             }],
         })
         self.assertIsNone(contract.join_key)
         self.assertEqual(contract.alternatives, [])
         self.assertEqual(contract.required_context, [])
         self.assertEqual(contract.resolved_time_ranges[0].start_at, "2023-03-01")
+        self.assertEqual(contract.resolved_time_ranges[0].resolution_status, "DERIVED")
         self.assertIsNone(contract.resolved_time_ranges[1].start_at)
         self.assertIsNone(contract.resolved_time_ranges[1].end_at)
+        self.assertEqual(contract.resolved_time_ranges[1].resolution_status, "UNKNOWN")
         schema = ScopeContract.model_json_schema()["properties"]
         self.assertIn("resolved_time_ranges", schema)
+
+    def test_scope_relations_can_bind_known_facts_to_specific_sets(self):
+        contract = ScopeContract.model_validate({
+            "target_entity": "message",
+            "effect_mode": "MUTATION",
+            "constraints": [{
+                "source_text": "未读",
+                "applies_to": "message",
+                "applies_to_sets": ["A", "B"],
+                "meaning": "两个分支都必须是未读消息",
+            }],
+            "sets": [
+                {"set_id": "A", "definition": "来自朋友的未读消息", "result_entity": "message"},
+                {"set_id": "B", "definition": "来自室友的未读消息", "result_entity": "message"},
+            ],
+            "operation": "UNION",
+            "operands": ["A", "B"],
+            "join_key": "message_id",
+            "required_context": [{
+                "read": "朋友名单",
+                "source_system": "phone contact book",
+                "relationship": "friend",
+                "resolution_status": "EXPLICIT",
+                "used_for_sets": ["A"],
+                "because": "需要确定朋友身份",
+                "used_for": "筛选集合A",
+            }],
+        })
+        self.assertEqual(contract.constraints[0].applies_to_sets, ["A", "B"])
+        self.assertEqual(contract.required_context[0].used_for_sets, ["A"])
+        invalid = contract.model_dump(mode="json")
+        invalid["required_context"][0]["used_for_sets"] = ["MISSING"]
+        with self.assertRaisesRegex(ValueError, "used_for_sets"):
+            ScopeContract.model_validate(invalid)
+
+    def test_resolution_status_rejects_unexplained_guess_and_unknown_time_values(self):
+        base = {
+            "target_entity": "message",
+            "effect_mode": "READ_ONLY",
+            "constraints": [],
+            "sets": [{"set_id": "A", "definition": "目标消息", "result_entity": "message"}],
+            "operation": "DIRECT",
+            "operands": ["A"],
+        }
+        with self.assertRaisesRegex(ValueError, "resolution_note"):
+            ScopeContract.model_validate({
+                **base,
+                "required_context": [{
+                    "read": "朋友名单",
+                    "source_system": "phone contact book",
+                    "relationship": "friend",
+                    "resolution_status": "INFERRED",
+                    "because": "需要识别发送者",
+                    "used_for": "筛选目标消息",
+                }],
+            })
+        with self.assertRaisesRegex(ValueError, "UNKNOWN"):
+            ScopeContract.model_validate({
+                **base,
+                "resolved_time_ranges": [{
+                    "source_text": "本财年",
+                    "start_at": "2023-01-01",
+                    "end_at": None,
+                    "resolution_status": "UNKNOWN",
+                    "resolution_note": "缺少财年起始月",
+                }],
+            })
 
     def test_scheduler_scope_tail_must_match_frozen_contract(self):
         target = {
             "target_entity": "bookmark",
             "effect_mode": "MUTATION",
+            "constraints": [
+                {"source_text": "工作标签", "applies_to": "bookmark",
+                 "applies_to_sets": ["A"], "meaning": "书签带有工作标签"},
+                {"source_text": "尚未归档", "applies_to": "bookmark",
+                 "applies_to_sets": ["B"], "meaning": "书签不在归档区"},
+            ],
             "sets": [
                 {"set_id": "A", "definition": "工作标签书签",
                  "condition_owner": "bookmark", "result_entity": "bookmark"},
@@ -264,6 +351,8 @@ class ScopeResolutionTests(unittest.IsolatedAsyncioTestCase):
                 "source_text": "今年3月",
                 "start_at": "2023-03-01",
                 "end_at": "2023-03-31",
+                "resolution_status": "DERIVED",
+                "resolution_note": "由任务开始时间唯一换算",
             }],
         })
         target = {
@@ -280,6 +369,8 @@ class ScopeResolutionTests(unittest.IsolatedAsyncioTestCase):
                 "source_text": "今年3月",
                 "start_at": "2023-03-01",
                 "end_at": "2023-03-31",
+                "resolution_status": "DERIVED",
+                "resolution_note": "由任务开始时间唯一换算",
             }],
         }
         decision = SupervisorDecision.model_validate({
@@ -311,6 +402,7 @@ class ScopeResolutionTests(unittest.IsolatedAsyncioTestCase):
                 "success_criteria": ["完成"],
                 "rag_query": "NULL",
                 "execution_guidance": False,
+                "api_suggestion": "AULL",
                 "target_selection": "false",
                 "code_task": "none",
                 "worker_kind": "GENERAL",
@@ -318,6 +410,7 @@ class ScopeResolutionTests(unittest.IsolatedAsyncioTestCase):
         }).steps[0]
         self.assertIsNone(step.rag_query)
         self.assertIsNone(step.execution_guidance)
+        self.assertIsNone(step.api_suggestion)
         self.assertIsNone(step.target_selection)
         self.assertIsNone(step.code_task)
 

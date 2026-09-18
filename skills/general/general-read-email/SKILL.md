@@ -5,6 +5,7 @@ metadata:
   roles: "general"
   topics: "email documents"
   required-tools: "email_connection_status email_list_recent email_read_message"
+  exclusive: "true"
 ---
 
 # 邮件阅读与附件获取
