@@ -7,6 +7,54 @@ from runtime_tracing import ROLE_NAMES, TRACE_IDS
 from usage_accounting import SCOPES, normalize_usage, FIELDS
 
 
+def _current_request_usage_attributes(usage):
+    """Build non-cumulative usage fields for one provider request.
+
+    Phoenix also displays cumulative token counts on parent spans.  These
+    explicitly named attributes make it clear that the values belong only to
+    the selected LLM leaf span / provider request.
+    """
+
+    incoming = usage.get("input_tokens")
+    outgoing = usage.get("output_tokens")
+    cached = usage.get("cache_read_tokens")
+    attrs = {
+        "usage.current.scope": "single_provider_request",
+        "usage.current.input_tokens": incoming,
+        "usage.current.output_tokens": outgoing,
+        "usage.current.cache_read_tokens": cached,
+        "usage.current.cache_status": (
+            "reported" if isinstance(cached, int) else "unavailable"
+        ),
+    }
+    if isinstance(incoming, int) and isinstance(cached, int):
+        uncached = max(incoming - cached, 0)
+        ratio = cached / incoming if incoming else None
+        attrs["usage.current.uncached_input_tokens"] = uncached
+        if ratio is not None:
+            attrs["usage.current.cache_hit_ratio"] = ratio
+            attrs["usage.current.cache_hit_percent"] = round(ratio * 100, 2)
+            attrs["usage.current.summary"] = (
+                f"input={incoming} | cache_read={cached} ({ratio * 100:.1f}%) | "
+                f"uncached={uncached} | output={outgoing if isinstance(outgoing, int) else 'unknown'}"
+            )
+    elif isinstance(incoming, int):
+        attrs["usage.current.summary"] = (
+            f"input={incoming} | cache_read=unavailable | "
+            f"output={outgoing if isinstance(outgoing, int) else 'unknown'}"
+        )
+    return {key: value for key, value in attrs.items() if value is not None}
+
+
+def _is_graph_interrupt(error):
+    """LangGraph用GraphInterrupt表示可恢复暂停，不是业务失败。"""
+    try:
+        from langgraph.errors import GraphInterrupt
+    except ImportError:
+        return False
+    return isinstance(error, GraphInterrupt)
+
+
 class RuntimeTraceCallback(BaseCallbackHandler):
     run_inline = True
 
@@ -18,6 +66,26 @@ class RuntimeTraceCallback(BaseCallbackHandler):
         self.lock = RLock()
         self.display_counts = {}
         self.chat_inputs = {}
+        self.tool_context = {}
+        self.paused_progress_gates = {}
+
+    @staticmethod
+    def _progress_gate_key(name, parent_run_id, inputs, metadata=None):
+        if name != "publish_worker_progress":
+            return None
+        import json
+        try:
+            payload = json.dumps(inputs, ensure_ascii=False, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            payload = str(inputs)
+        metadata = metadata or {}
+        worker_identity = (
+            metadata.get("runtime.worker_id")
+            or metadata.get("worker_id")
+            or parent_run_id
+            or ""
+        )
+        return (str(worker_identity), name, payload)
 
     def _start(self, run_id, name, kind, inputs, attrs):
         key = str(run_id)
@@ -34,12 +102,18 @@ class RuntimeTraceCallback(BaseCallbackHandler):
             counter_key = (context.trace_id, getattr(parent, "span_id", 0), name)
             self.display_counts[counter_key] = self.display_counts.get(counter_key, 0) + 1
             ordinal = self.display_counts[counter_key]
-            span.update_name(f"{name} · {ordinal:02d}")
+            display_name = f"{name} · {ordinal:02d}"
+            span.update_name(display_name)
             span.set_attribute("runtime.display_ordinal", ordinal)
             if len(self.display_counts) > 10000:
                 self.display_counts = {counter_key: ordinal}
             self.spans[key] = span
-            self.clocks[key] = {"start": perf_counter(), "first": None, "kind": kind}
+            self.clocks[key] = {
+                "start": perf_counter(),
+                "first": None,
+                "kind": kind,
+                "display_name": display_name,
+            }
             if kind == "llm":
                 self.chat_inputs[key] = inputs
                 self.usage_context[key] = (SCOPES.get(), attrs.get("runtime.model_role", "model"),
@@ -61,6 +135,10 @@ class RuntimeTraceCallback(BaseCallbackHandler):
         thinking_options = {k: extra[k] for k in ("enable_thinking", "reasoning_effort", "thinking_budget", "preserve_thinking") if k in extra}
         if thinking_options:
             request_options["thinking"] = thinking_options
+        from runtime_tool_visibility import VISIBLE_MODEL_TOOLS
+        visible_tools = list(VISIBLE_MODEL_TOOLS.get())
+        if visible_tools:
+            request_options["visible_tools"] = visible_tools
         import sys, json
         evidence_module = sys.modules.get('workers.evidence_refs')
         evidence_refs = evidence_module.ACTIVE_EVIDENCE_REFS.get() if evidence_module else None
@@ -70,6 +148,7 @@ class RuntimeTraceCallback(BaseCallbackHandler):
             {"messages": [[message_record(m) for m in batch] for batch in messages],
              "request_options": request_options},
             {"llm.model_name": str(model), "runtime.model_role": role, "usage.status": "pending",
+             "tools.visible_count": len(visible_tools),
              **evidence_attrs,
              **{k: v for k, v in metadata.items() if k.startswith("runtime.")}})
 
@@ -82,6 +161,7 @@ class RuntimeTraceCallback(BaseCallbackHandler):
             chat_input = self.chat_inputs.pop(key, None)
             usage_context = self.usage_context.pop(key, None)
             clock = self.clocks.pop(key)
+            self.tool_context.pop(key, None)
             self.finished.add(key)
             # Bounded dedupe window; active spans are never evicted.
             if len(self.finished) > 10000:
@@ -106,6 +186,21 @@ class RuntimeTraceCallback(BaseCallbackHandler):
                     logging.getLogger(__name__).exception("Chat trace presentation failed")
             set_span_output(span, output)
             set_span_attributes(span, **(attrs or {}))
+            if clock["kind"] == "llm":
+                current = attrs or {}
+                incoming = current.get("usage.current.input_tokens")
+                outgoing = current.get("usage.current.output_tokens")
+                cache_percent = current.get("usage.current.cache_hit_percent")
+                if isinstance(incoming, int) and isinstance(outgoing, int):
+                    cache_label = (
+                        f"{cache_percent:.1f}%"
+                        if isinstance(cache_percent, (int, float))
+                        else "n/a"
+                    )
+                    span.update_name(
+                        f"{clock['display_name']} · I/O {incoming:,}→{outgoing:,} "
+                        f"· Cache {cache_label}"
+                    )
             if (attrs or {}).get("usage.status") == "missing":
                 span.add_event("Usage unavailable", {"usage.note": "Token usage was not reported; do not interpret as measured zero."})
             from opentelemetry.trace import Status, StatusCode
@@ -129,8 +224,19 @@ class RuntimeTraceCallback(BaseCallbackHandler):
                 value = usage.get(key)
                 if isinstance(value, int):
                     attrs["usage." + key] = value
-        from cost_accounting import estimate_cost, cost_attributes
+        current_usage_attrs = _current_request_usage_attributes(usage)
+        attrs.update(current_usage_attrs)
         active = self.spans.get(str(run_id))
+        if active is not None and current_usage_attrs:
+            active.add_event(
+                "Current LLM request usage",
+                {
+                    key: value
+                    for key, value in current_usage_attrs.items()
+                    if key != "usage.current.scope"
+                },
+            )
+        from cost_accounting import estimate_cost, cost_attributes
         model_name = (getattr(active, "attributes", {}) or {}).get("llm.model_name", "unknown")
         cost = estimate_cost(model_name, usage)
         attrs.update(cost_attributes(cost))
@@ -183,16 +289,45 @@ class RuntimeTraceCallback(BaseCallbackHandler):
 
     def on_tool_start(self, serialized, input_str, *, run_id, **kwargs):
         from trace_overview import tool_purpose
-        with self.lock:
-            if str(run_id) in self.spans or str(run_id) in self.finished:
-                return
         name = (serialized or {}).get("name", "unknown")
-        self._start(run_id, tool_purpose(name, kwargs.get("inputs") or input_str), "tool", kwargs.get("inputs") or input_str,
+        inputs = kwargs.get("inputs") or input_str
+        pause_key = self._progress_gate_key(
+            name,
+            kwargs.get("parent_run_id"),
+            inputs,
+            kwargs.get("metadata"),
+        )
+        key = str(run_id)
+        with self.lock:
+            if key in self.spans or key in self.finished:
+                return
+            paused = self.paused_progress_gates.pop(pause_key, None) if pause_key else None
+            if paused is not None:
+                span, clock = paused
+                self.spans[key] = span
+                self.clocks[key] = clock
+                self.tool_context[key] = {
+                    "name": name,
+                    "pause_key": pause_key,
+                }
+                span.update_name("Worker Progress Gate")
+                span.add_event("Worker progress gate resumed")
+                set_span_attributes(span, **{
+                    "business.status": "RESUMED",
+                    "worker.progress_gate.transition": "PAUSED_TO_CONTINUED",
+                })
+                return
+        self._start(run_id, tool_purpose(name, inputs), "tool", inputs,
                     {"tool.name": name, **{k: v for k, v in (kwargs.get("metadata") or {}).items() if k.startswith("runtime.")}})
-        parent = self.spans.get(str(run_id))
+        with self.lock:
+            self.tool_context[key] = {
+                "name": name,
+                "pause_key": pause_key,
+            }
+        parent = self.spans.get(key)
         if parent is not None:
             from trace_chat import emit_code_view
-            emit_code_view(get_tracer(), parent, kwargs.get("inputs") or input_str)
+            emit_code_view(get_tracer(), parent, inputs)
 
     def on_tool_end(self, output, *, run_id, **kwargs):
         failed = getattr(output, "status", None) == "error"
@@ -214,6 +349,24 @@ class RuntimeTraceCallback(BaseCallbackHandler):
                      RuntimeError("Tool returned an error result") if failed else None)
 
     def on_tool_error(self, error, *, run_id, **kwargs):
+        key = str(run_id)
+        if _is_graph_interrupt(error):
+            with self.lock:
+                context = self.tool_context.pop(key, None) or {}
+                pause_key = context.get("pause_key")
+                span = self.spans.pop(key, None)
+                clock = self.clocks.pop(key, None)
+                self.finished.add(key)
+                if span is not None and clock is not None and pause_key is not None:
+                    span.update_name("Worker Progress Gate")
+                    span.add_event("Worker progress gate paused")
+                    set_span_attributes(span, **{
+                        "business.status": "PAUSED",
+                        "worker.progress_gate.transition": "PAUSED",
+                        "control_flow.expected_interrupt": True,
+                    })
+                    self.paused_progress_gates[pause_key] = (span, clock)
+                    return
         self._finish(run_id, {"error": str(error)}, error=error)
 
 

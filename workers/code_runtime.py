@@ -18,6 +18,7 @@ import logging
 import os
 import shutil
 from collections.abc import Callable, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -70,6 +71,10 @@ from run_workspace import (
 
 AgentFactory = Callable[..., Any]
 logger = logging.getLogger("agent")
+_CODE_PROGRESS_CALLBACK: ContextVar[Any | None] = ContextVar(
+    "code_progress_callback",
+    default=None,
+)
 
 
 def _message_text(message: Any) -> str:
@@ -90,16 +95,11 @@ class _InvocationUsage:
     tool_limit: int
     model_calls: int = 0
     tool_calls: int = 0
-    show_all_toolsets_calls: int = 0
 
     def add(self, details: dict[str, Any]) -> None:
         summary = details.get("execution_summary", {})
         self.model_calls += max(int(summary.get("model_call_count", 0) or 0), 0)
         self.tool_calls += max(int(summary.get("tool_call_count", 0) or 0), 0)
-        self.show_all_toolsets_calls += max(
-            int(summary.get("show_all_toolsets_call_count", 0) or 0),
-            0,
-        )
 
     def state(
         self,
@@ -120,17 +120,10 @@ class _InvocationUsage:
                 "CODE Step tool budget cannot reach the next role while "
                 "preserving its review reserve"
             )
-        show_all_limit = max(
-            int(value.get("show_all_toolsets_run_limit", 0) or 0),
-            0,
-        )
         return {
             **value,
             "executor_model_run_limit": available_model,
             "executor_tool_run_limit": available_tools,
-            "show_all_toolsets_run_limit": max(
-                0, show_all_limit - self.show_all_toolsets_calls
-            ),
         }
 
 
@@ -241,6 +234,11 @@ class CodeStepRuntime:
         # exactly one CONTINUE / RESTART / STOP decision.
         self._sessions: dict[str, _CodeRuntimeSession] = {}
         self._startup_recovery_blockers: list[str] = []
+
+    def close(self) -> None:
+        """Release runtime control-plane resources owned by this instance."""
+
+        self.sandbox_manager.close()
 
     @property
     def recovered_session_ids(self) -> tuple[str, ...]:
@@ -590,7 +588,7 @@ class CodeStepRuntime:
             tools=self.reviewer_tools,
             backend=self.sandbox_manager.reviewer_backend(pair),
             schema_repair_max_rounds=self.schema_repair_max_rounds,
-            middleware=self._middleware(),
+            middleware=self._reviewer_middleware(),
             checkpointer=self.checkpointer,
             store=self.store,
         )
@@ -758,6 +756,15 @@ class CodeStepRuntime:
             return []
         return list(self.middleware_factory())
 
+    def _reviewer_middleware(self) -> list[Any]:
+        """Reviewer工具面固定；不参加Worker能力路由或能力补选。"""
+
+        return [
+            middleware
+            for middleware in self._middleware()
+            if type(middleware).__name__ != "ToolsetRouterMiddleware"
+        ]
+
     @staticmethod
     def _identity(input_state: dict[str, Any], thread_id: str) -> CodeCandidateRef:
         event_id = str(input_state.get("event_id") or thread_id)
@@ -805,6 +812,15 @@ class CodeStepRuntime:
         if not thread_id.endswith(":reviewer"):
             role_budget = ""  # Actual Worker capacity is injected after preparation.
         else:
+            from step_user_question import merge_ask_user_interactions
+            interactions = merge_ask_user_interactions(
+                state.get("step_user_interactions", [])
+            )
+            if interactions:
+                instruction += (
+                    "\n\n[用户补充问答：先前角色通过ask_user取得，审核时视为任务事实]\n"
+                    + json.dumps(interactions, ensure_ascii=False, separators=(",", ":"))
+                )
             role_budget = ("\n\n[本次审核可用额度]\n"
                            f"最多模型轮次：{state.get('executor_model_run_limit', 0)}；"
                            f"最多工具调用：{state.get('executor_tool_run_limit', 0)}。请依据实际证据提交报告。")
@@ -814,6 +830,9 @@ class CodeStepRuntime:
             thread_id=thread_id,
             trace_role="reviewer" if thread_id.endswith(":reviewer") else "code",
             state_update=state,
+            runtime_configurable={
+                "progress_callback": _CODE_PROGRESS_CALLBACK.get(),
+            },
             return_details=True,
         )
         if not isinstance(details, dict):
@@ -828,12 +847,21 @@ class CodeStepRuntime:
         configurable = (config or {}).get("configurable", {})
         thread_id = str(configurable.get("thread_id") or "code-step")
         pause_control = configurable.get("event_pause_control")
-        async with self._writer_slots:
-            return await self._run(
-                input_state,
-                thread_id=thread_id,
-                pause_control=pause_control,
-            )
+        progress_token = _CODE_PROGRESS_CALLBACK.set(
+            configurable.get("progress_callback")
+        )
+        from feishu_exports import export_worker_scope
+
+        try:
+            async with self._writer_slots:
+                with export_worker_scope("code"):
+                    return await self._run(
+                        input_state,
+                        thread_id=thread_id,
+                        pause_control=pause_control,
+                    )
+        finally:
+            _CODE_PROGRESS_CALLBACK.reset(progress_token)
 
     @operation('Code Runtime / Attempt', fields=('input_state', 'thread_id'))
     async def _run(
@@ -967,7 +995,6 @@ class CodeStepRuntime:
         all_messages: list[Any] = []
         model_calls_used = 0
         tool_calls_used = 0
-        show_all_toolsets_calls_used = 0
         worker_submission: dict[str, Any] | None = None
         review_details: dict[str, Any] = {}
         total_model_limit = max(
@@ -978,11 +1005,6 @@ class CodeStepRuntime:
             int(input_state.get("executor_tool_run_limit", 0) or 0),
             0,
         )
-        total_show_all_toolsets_limit = max(
-            int(input_state.get("show_all_toolsets_run_limit", 0) or 0),
-            0,
-        )
-
         def budgeted_state(
             value: dict[str, Any],
             *,
@@ -1007,10 +1029,6 @@ class CodeStepRuntime:
                 **value,
                 "executor_model_run_limit": available_model,
                 "executor_tool_run_limit": available_tools,
-                # Worker and Reviewer share the Step-level discovery allowance.
-                "show_all_toolsets_run_limit": max(
-                    0, total_show_all_toolsets_limit - show_all_toolsets_calls_used
-                ),
             }
 
         common_state = {
@@ -1068,7 +1086,7 @@ class CodeStepRuntime:
                 tools=self.reviewer_tools,
                 backend=self.sandbox_manager.reviewer_backend(pair),
                 schema_repair_max_rounds=self.schema_repair_max_rounds,
-                middleware=self._middleware(),
+                middleware=self._reviewer_middleware(),
                 checkpointer=self.checkpointer,
                 store=self.store,
             )
@@ -1088,10 +1106,6 @@ class CodeStepRuntime:
             all_messages.extend(worker_details.get("current_turn_messages", []))
             model_calls_used += self._used(worker_details, "model_call_count")
             tool_calls_used += self._used(worker_details, "tool_call_count")
-            show_all_toolsets_calls_used += self._used(
-                worker_details,
-                "show_all_toolsets_call_count",
-            )
             worker_submission = worker_details.get("code_worker_submission")
             if not isinstance(worker_submission, dict):
                 from workers.code_finalization import missing_handoff_message
@@ -1207,18 +1221,26 @@ class CodeStepRuntime:
                     review_details,
                     "tool_call_count",
                 )
-                show_all_toolsets_calls_used += self._used(
-                    review_details,
-                    "show_all_toolsets_call_count",
-                )
                 loop = CodeReviewLoopState.model_validate(
                     review_details.get("code_review_loop")
                 )
                 candidate = loop.candidate
                 current_runtime_phase = "REVIEW_COMPLETED"
-                boundary_report = CodeReviewReport.model_validate(
-                    review_details.get("code_review_report")
-                )
+                if loop.status == "WAITING_FOR_WORKER":
+                    # A repair request is a role handoff, not a final review.
+                    # request_code_worker_repair deliberately stores no
+                    # CodeReviewReport; validating one here would turn a
+                    # successful repair request into a None-validation crash.
+                    boundary_report = None
+                elif loop.status in {"APPLIED", "ESCALATED_TO_SCHEDULER"}:
+                    boundary_report = CodeReviewReport.model_validate(
+                        review_details.get("code_review_report")
+                    )
+                else:
+                    raise RuntimeError(
+                        "Code Reviewer returned an invalid loop state: "
+                        f"{loop.status}"
+                    )
                 self._commit_runtime_checkpoint(
                     runtime_session_id=runtime_session_id,
                     run_id=run_id,
@@ -1249,11 +1271,6 @@ class CodeStepRuntime:
                 )
                 if loop.status in {"APPLIED", "ESCALATED_TO_SCHEDULER"}:
                     break
-                if loop.status != "WAITING_FOR_WORKER":
-                    raise RuntimeError(
-                        "Code Reviewer returned an invalid loop state: "
-                        f"{loop.status}"
-                    )
 
                 pair = self.sandbox_manager.handoff(pair, "WORKER")
                 current_runtime_phase = "WORKER_RUNNING"
@@ -1310,10 +1327,6 @@ class CodeStepRuntime:
                 tool_calls_used += self._used(
                     worker_details,
                     "tool_call_count",
-                )
-                show_all_toolsets_calls_used += self._used(
-                    worker_details,
-                    "show_all_toolsets_call_count",
                 )
                 loop = CodeReviewLoopState.model_validate(
                     worker_details.get("code_review_loop")
@@ -1377,7 +1390,6 @@ class CodeStepRuntime:
                     "messages": [AIMessage(content=report.summary)],
                     "executor_model_calls_used": model_calls_used,
                     "executor_tool_calls_used": tool_calls_used,
-                    "show_all_toolsets_calls_used": show_all_toolsets_calls_used,
                     "code_worker_submission": worker_submission,
                     "code_review_loop": loop.model_dump(mode="json"),
                     "code_review_report": report.model_dump(mode="json"),
@@ -1518,7 +1530,6 @@ class CodeStepRuntime:
                 "messages": [AIMessage(content=final_text)],
                 "executor_model_calls_used": model_calls_used,
                 "executor_tool_calls_used": tool_calls_used,
-                "show_all_toolsets_calls_used": show_all_toolsets_calls_used,
                 "code_worker_submission": worker_submission,
                 "code_review_loop": loop.model_dump(mode="json"),
                 "code_review_report": report.model_dump(mode="json"),
@@ -1539,35 +1550,38 @@ class CodeStepRuntime:
             }
         except BaseException as error:
             if pair is not None and not cleanup_authorized:
+                freeze_error: Exception | None = None
                 try:
                     pair = self.sandbox_manager.freeze(pair)
-                    current_runtime_phase = "RECOVERY_REQUIRED"
-                    recovery_state = None
-                    if (
-                        isinstance(worker_submission, dict)
-                        and latest_candidate_relative
-                    ):
-                        recovery_state = self._recovery_state(
-                            contract=contract,
-                            candidate=candidate,
-                            loop=loop,
-                            worker_submission=worker_submission,
-                            review_details=(review_details or None),
-                            report=(
-                                CodeReviewReport.model_validate(
-                                    review_details.get("code_review_report")
-                                )
-                                if review_details.get("code_review_report")
-                                is not None
-                                else None
-                            ),
-                            started_at=started_at,
-                            parent_attempt_id=parent_attempt_id,
-                            worker_id=candidate.workspace_id,
-                            superseded_attempt_records=(
-                                superseded_attempt_records
-                            ),
-                        )
+                except Exception as freeze_failure:
+                    # A dead Docker control plane must not prevent the durable
+                    # recovery record from advancing beyond WORKER_RUNNING.
+                    freeze_error = freeze_failure
+                current_runtime_phase = "RECOVERY_REQUIRED"
+                recovery_state = None
+                if isinstance(worker_submission, dict):
+                    recovery_state = self._recovery_state(
+                        contract=contract,
+                        candidate=candidate,
+                        loop=loop,
+                        worker_submission=worker_submission,
+                        review_details=(review_details or None),
+                        report=(
+                            CodeReviewReport.model_validate(
+                                review_details.get("code_review_report")
+                            )
+                            if review_details.get("code_review_report")
+                            is not None
+                            else None
+                        ),
+                        started_at=started_at,
+                        parent_attempt_id=parent_attempt_id,
+                        worker_id=candidate.workspace_id,
+                        superseded_attempt_records=(
+                            superseded_attempt_records
+                        ),
+                    )
+                try:
                     self._commit_runtime_checkpoint(
                         runtime_session_id=runtime_session_id,
                         run_id=run_id,
@@ -1584,7 +1598,16 @@ class CodeStepRuntime:
                         candidate_snapshot_path=(latest_candidate_relative or None),
                         reviewer_snapshot_path=latest_reviewer_checkpoint_relative,
                         recovery_state=recovery_state,
-                        reason=f"Runtime stopped before cleanup authorization: {type(error).__name__}",
+                        reason=(
+                            "Runtime stopped before cleanup authorization: "
+                            f"{type(error).__name__}"
+                            + (
+                                "; sandbox freeze was unavailable: "
+                                f"{type(freeze_error).__name__}: {freeze_error}"
+                                if freeze_error is not None
+                                else ""
+                            )
+                        ),
                     )
                 except Exception:
                     # Preserve the original failure.  Most importantly, do not
@@ -1682,7 +1705,6 @@ class CodeStepRuntime:
             "messages": [AIMessage(content=report.summary)],
             "executor_model_calls_used": usage.model_calls,
             "executor_tool_calls_used": usage.tool_calls,
-            "show_all_toolsets_calls_used": usage.show_all_toolsets_calls,
             "code_worker_submission": session.worker_submission,
             "code_review_loop": session.loop.model_dump(mode="json"),
             "code_review_report": report.model_dump(mode="json"),
@@ -1762,13 +1784,13 @@ class CodeStepRuntime:
                 review_details.get("code_review_loop")
             )
             session.candidate = session.loop.candidate
-            report = CodeReviewReport.model_validate(
-                review_details.get("code_review_report")
-            )
             session.last_review_details = review_details
-            session.last_report = report
 
             if session.loop.status == "APPLIED":
+                report = CodeReviewReport.model_validate(
+                    review_details.get("code_review_report")
+                )
+                session.last_report = report
                 return self._finish_applied_session(
                     session,
                     report=report,
@@ -1779,6 +1801,26 @@ class CodeStepRuntime:
                 # Recovery deliberately avoids silently starting a new repair
                 # cycle. The Scheduler receives the Reviewer's concise report
                 # and decides whether preserving this attempt is still useful.
+                instruction = session.loop.pending_instruction
+                if instruction is None:
+                    raise RuntimeError(
+                        "Recovered Code Reviewer requested repair without a "
+                        "repair instruction"
+                    )
+                report = CodeReviewReport(
+                    candidate=session.candidate,
+                    verdict="ESCALATED",
+                    summary=instruction.summary,
+                    verification_summary=(
+                        "Crash recovery preserved the Reviewer's accepted repair "
+                        "instruction; no final review report was expected at the "
+                        "WAITING_FOR_WORKER boundary."
+                    ),
+                    failed_test_summaries=tuple(
+                        finding.summary for finding in instruction.findings
+                    ),
+                    recommended_action="CONTINUE",
+                )
                 session.loop = session.loop.model_copy(
                     update={
                         "status": "ESCALATED_TO_SCHEDULER",
@@ -1787,11 +1829,16 @@ class CodeStepRuntime:
                         "terminal_summary": report.summary,
                     }
                 )
-            if session.loop.status != "ESCALATED_TO_SCHEDULER":
+            elif session.loop.status == "ESCALATED_TO_SCHEDULER":
+                report = CodeReviewReport.model_validate(
+                    review_details.get("code_review_report")
+                )
+            else:
                 raise RuntimeError(
                     "Recovered Code Reviewer returned an invalid loop state: "
                     f"{session.loop.status}"
                 )
+            session.last_report = report
             session.pair = self.sandbox_manager.freeze(session.pair)
             session.recovery_phase = "AWAITING_SCHEDULER"
             self._commit_session_checkpoint(
@@ -1970,7 +2017,6 @@ class CodeStepRuntime:
             "messages": [AIMessage(content=session.last_report.summary)],
             "executor_model_calls_used": usage.model_calls,
             "executor_tool_calls_used": usage.tool_calls,
-            "show_all_toolsets_calls_used": usage.show_all_toolsets_calls,
             "code_worker_submission": session.worker_submission,
             "code_review_loop": session.loop.model_dump(mode="json"),
             "code_review_report": session.last_report.model_dump(mode="json"),
@@ -2087,7 +2133,6 @@ class CodeStepRuntime:
             "messages": [AIMessage(content=report.summary)],
             "executor_model_calls_used": usage.model_calls,
             "executor_tool_calls_used": usage.tool_calls,
-            "show_all_toolsets_calls_used": usage.show_all_toolsets_calls,
             "code_worker_submission": session.worker_submission,
             "code_review_loop": session.loop.model_dump(mode="json"),
             "code_review_report": report.model_dump(mode="json"),
@@ -2278,9 +2323,20 @@ class CodeStepRuntime:
                     review_details.get("code_review_loop")
                 )
                 session.candidate = session.loop.candidate
-                boundary_report = CodeReviewReport.model_validate(
-                    review_details.get("code_review_report")
-                )
+                if session.loop.status == "WAITING_FOR_WORKER":
+                    boundary_report = None
+                elif session.loop.status in {
+                    "APPLIED",
+                    "ESCALATED_TO_SCHEDULER",
+                }:
+                    boundary_report = CodeReviewReport.model_validate(
+                        review_details.get("code_review_report")
+                    )
+                else:
+                    raise RuntimeError(
+                        "Code Reviewer returned an invalid continued loop state: "
+                        f"{session.loop.status}"
+                    )
                 session.last_review_details = review_details
                 session.last_report = boundary_report
                 self._commit_session_checkpoint(
@@ -2293,11 +2349,6 @@ class CodeStepRuntime:
                     "ESCALATED_TO_SCHEDULER",
                 }:
                     break
-                if session.loop.status != "WAITING_FOR_WORKER":
-                    raise RuntimeError(
-                        "Code Reviewer returned an invalid continued loop state: "
-                        f"{session.loop.status}"
-                    )
                 session.pair = self.sandbox_manager.handoff(
                     session.pair,
                     "WORKER",

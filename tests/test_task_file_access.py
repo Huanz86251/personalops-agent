@@ -120,20 +120,36 @@ class TaskFileAccessTests(unittest.IsolatedAsyncioTestCase):
         class Model(SequenceModel):
             def _generate(self, messages, stop=None, run_manager=None, **kwargs):
                 for m in messages:
-                    if isinstance(m, ToolMessage) and m.tool_call_id == "route-0":
-                        content = json.loads(m.content)
+                    if isinstance(m, ToolMessage) and '"private_files"' in str(m.content):
+                        raw = str(m.content)
+                        content = json.loads(raw[raw.find("{"):])
                         path = content["private_files"][0]["reading_path"]
                         self.actions[1]["args"]["file_path"] = path
                         self.actions[2]["args"]["result"]["files"] = [
                             {"path": path, "description": "Original fixture PDF"}
                         ]
+                # EvidenceReferenceMiddleware deliberately exposes E1/E2 aliases
+                # to the model instead of internal tool-call IDs. Normalize only
+                # this scripted fixture so SequenceModel can advance its actions.
+                normalized = []
+                tool_index = 0
+                for message in messages:
+                    if isinstance(message, ToolMessage):
+                        message = message.model_copy(
+                            update={"tool_call_id": f"route-{tool_index}"}
+                        )
+                        tool_index += 1
+                    normalized.append(message)
                 return super()._generate(
-                    messages, stop=stop, run_manager=run_manager, **kwargs
+                    normalized, stop=stop, run_manager=run_manager, **kwargs
                 )
 
         model = Model(
             actions=[
-                {"tool": "email_download_attachment", "args": {}},
+                {
+                    "tool": "email_download_attachment",
+                    "args": {"source_refs": ["U1"]},
+                },
                 {
                     "tool": "read_file",
                     "args": {"file_path": "pending", "offset": 1, "limit": 1},
@@ -159,9 +175,9 @@ class TaskFileAccessTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         messages = [m for m in result["messages"] if isinstance(m, ToolMessage)]
-        read = json.loads(
-            next(m.content for m in messages if m.tool_call_id == "route-1")
-        )
+        read_message = next(m for m in messages if '"preview"' in str(m.content))
+        raw_read = str(read_message.content)
+        read = json.loads(raw_read[raw_read.find("{"):])
         self.assertIn("Native heading", read["preview"])
         self.assertIn("reading", read)
         self.assertIn(read["path"], result["files"])
@@ -239,3 +255,42 @@ class TaskFileAccessTests(unittest.IsolatedAsyncioTestCase):
             {"__builtins__": {}},
         )
         self.assertEqual(value, TASK_FILE_MAX_BYTES)
+
+    def test_code_sandbox_receives_verified_registered_download_before_reading(self):
+        _record, virtual_path = self.register()
+
+        class Sandbox:
+            def __init__(self):
+                self.uploaded = []
+                self.commands = []
+
+            def upload_files(self, files):
+                self.uploaded.extend(files)
+                return [SimpleNamespace(path=path, error=None) for path, _ in files]
+
+            def execute(self, command):
+                self.commands.append(command)
+                return SimpleNamespace(
+                    output=json.dumps({"preview": "task-local text"}),
+                    exit_code=0,
+                )
+
+        sandbox = Sandbox()
+        middleware = TaskFileAccessMiddleware(sandbox=sandbox)
+        request = SimpleNamespace(
+            tool_call={
+                "name": "read_file",
+                "id": "read-code-download",
+                "args": {"file_path": virtual_path, "offset": 0, "limit": 2},
+            },
+            state=self.state,
+        )
+        result = middleware._read(request)
+        self.assertEqual(result.status, "success")
+        self.assertEqual(len(sandbox.uploaded), 1)
+        uploaded_path, uploaded_payload = sandbox.uploaded[0]
+        self.assertTrue(uploaded_path.startswith("/workspace/.private-downloads/"))
+        self.assertTrue(uploaded_path.endswith("/sample.txt"))
+        self.assertEqual(uploaded_payload, b"task-local text")
+        self.assertIn(uploaded_path, sandbox.commands[0])
+        self.assertNotIn(str(self.root), sandbox.commands[0])

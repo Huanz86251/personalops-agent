@@ -7,11 +7,10 @@
 | 配置前缀 | 用途 | 本机当前模型 |
 | --- | --- | --- |
 | `GENERAL_LLM` | General Agent | ZHIPU/GLM-5.3-Flash（思考 low） |
-| `WEB_LLM` | Web Search / 浏览器 Agent | qwen3.7-flash（思考1024） |
+| `WEB_LLM` | Web Search / 浏览器 Agent，并负责同上下文Web StepReport结案 | ZHIPU/GLM-5.3-Flash（思考 low） |
 | `CODE_LLM` | Code Agent | ZHIPU/GLM-5.3-Flash（思考 low） |
 | `CODE_REVIEWER_LLM` | Code 独立审核 | ZHIPU/GLM-5.3-Flash（思考 low） |
 | `REPORTER_LLM` | 通用独立 Reporter，包括 General 文件结果 | qwen3.8-flash（思考 low） |
-| `WEB_REPORTER_LLM` | Web 独立 Reporter | qwen3.8-flash（思考 low） |
 | `SCHEDULER_LLM` | 普通规划 Scheduler / Supervisor | qwen3.8-flash（思考 low） |
 | `CODE_SCHEDULER_LLM` | Code 审核升级后的调度决定 | qwen3.8-flash（思考 low） |
 | `REPLANNER_LLM` | 重规划 | qwen3.8-flash（思考 low） |
@@ -27,7 +26,7 @@
 
 配置只决定已有调用使用谁，不新增调用。General 纯文本仍可自报告；Code 审核后由宿主确定性生成报告，不多调一个 Reporter。动态 Skills 选择使用独立 skill_selector，当前为 Qwen3.8 Flash low。本地 embedding、reranker、Write Gate 和注入检测不属于这些云端角色，继续用原来的本地配置。
 
-当前生效配置（2026-09-11）：General、Code、Code Reviewer 使用百炼 ZHIPU/GLM-5.3-Flash；Web Search 使用 Qwen3.7 Flash，沿用 config/model_thinking.json 的1024思考预算；Web Reporter、Final Reviewer 与其余云角色保留 Qwen3.8 Flash low。共19角色。GLM 保留 low 档，使用 max_tokens 与 thinking.clear_thinking=true，不发送 Qwen 专用 preserve_thinking。密钥与百炼地址沿用现有配置。未重启服务、未付费验证；账号需已开通智谱直供服务。GLM 尚未加入本地定价表，费用估算应显示 unknown。
+当前代码配置：General、Code、Code Reviewer 使用百炼 ZHIPU/GLM-5.3-Flash；Web Search 使用其独立 `WEB_LLM` 配置。Web Step不再配置或调用独立Web Reporter：Web Worker只调用一次 `complete_web_step`，Harness在同一次工具调用中验证提交并确定性生成StepReport。Final Reviewer与其余云角色仍按上表配置。GLM 使用 max_tokens 与 thinking.clear_thinking=true，不发送Qwen专用preserve_thinking。密钥与百炼地址沿用现有配置；实际进程须重启后才会加载配置。
 
 code_scheduler 是主规划图的代码审核升级分支：收到 Reviewer 上报后决定继续、重启或停止，并非第二套独立总调度器。记忆冲突目前由确定性规则建组，不增加云端冲突模型调用。
 
@@ -55,21 +54,24 @@ code_scheduler 是主规划图的代码审核升级分支：收到 Reviewer 上�
 
 本机已经给每个角色写了显式模型配置。代码仍保留旧 `LLM_*` / `HARD_LLM_*` 作为缺省配置来源；已有显式角色配置不受它们改变影响。旧的 `SUMMARY_LLM_*` 也是尚未单独指定的 Worker 摘要模型的缺省来源。
 
-## 示例：只把 Web Agent 换成千问
+## 示例：让 Web Agent 使用百炼上的 GLM-5.3-Flash
 
 在本机 `.env` 修改现有同名项，避免添加重复配置。以下密钥是占位符，需要替换为你自己的值：
 
 ```dotenv
 WEB_LLM_PROVIDER=qwen
-WEB_LLM_MODEL=qwen3.7-flash
+WEB_LLM_MODEL=ZHIPU/GLM-5.3-Flash
 WEB_LLM_API_KEY_ENV=MY_WEB_QWEN_KEY
 MY_WEB_QWEN_KEY=replace_with_your_key
 WEB_LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-WEB_LLM_THINKING_ENABLED=false
+WEB_LLM_THINKING_ENABLED=true
+WEB_LLM_REASONING_EFFORT=low
+WEB_LLM_TOKEN_LIMIT_PARAMETER=max_tokens
+WEB_LLM_EXTRA_BODY_JSON={"thinking":{"type":"enabled","clear_thinking":true}}
 WEB_LLM_MAX_TOKENS=5000
 ```
 
-这只改变 Web Agent，不改变 Web Reporter 或其他角色。北京旧域名仍可使用；也可填写百炼控制台给出的业务空间专属地址，密钥与地域需匹配。参见[千问官方兼容 API 文档](https://help.aliyun.com/zh/model-studio/qwen-api-via-openai-chat-completions)。
+这只改变Web Agent；它在唯一一次 `complete_web_step` 中提交结案事实，不存在另一套Web Reporter模型配置，也不存在第二次Web模型结案调用。这里的 `provider=qwen` 表示继续使用百炼兼容客户端和DashScope密钥，并不表示底层模型仍是千问。北京旧域名仍可使用；也可填写百炼控制台给出的业务空间专属地址，密钥与地域需匹配。
 
 ## 示例：Code 使用另一家兼容 API
 

@@ -12,6 +12,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.tools import BaseTool
 
 from eventing.store import AsyncEventStore
+from feishu_exports import export_worker_scope
 from mcp_runtime import PlaywrightMCPPool
 from workers.leadership import (
     LeadershipCoordinationState,
@@ -133,11 +134,12 @@ class WebStepRuntime:
             worker_configurable = dict(worker_config.get("configurable", {}))
             worker_configurable.pop("event_pause_control", None)
             worker_config["configurable"] = worker_configurable
-            return await controlled_worker.ainvoke(
-                worker_input,
-                config=worker_config,
-                **kwargs,
-            )
+            with export_worker_scope("web"):
+                return await controlled_worker.ainvoke(
+                    worker_input,
+                    config=worker_config,
+                    **kwargs,
+                )
 
 
 __all__ = ["WebStepRuntime"]

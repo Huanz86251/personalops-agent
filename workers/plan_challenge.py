@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from schema_normalization import EvidenceRefText, coerce_text_sequence
 
 
 class PlanChallenge(BaseModel):
@@ -28,9 +29,10 @@ class PlanChallenge(BaseModel):
         max_length=800,
         description="当前ScopeContract、target_selection或Step中与原要求冲突的具体内容。",
     )
-    evidence_tool_call_ids: list[str] = Field(
+    evidence_tool_call_ids: list[EvidenceRefText] = Field(
         default_factory=list,
-        description="可选的真实只读证据编号；若冲突仅凭用户原话即可确认可为空。",
+        max_length=24,
+        description="最多24个真实只读证据编号；若冲突仅凭用户原话即可确认可为空。",
     )
     requested_revision: str = Field(
         min_length=1,
@@ -41,9 +43,10 @@ class PlanChallenge(BaseModel):
         ),
     )
 
-    @field_validator("evidence_tool_call_ids")
+    @field_validator("evidence_tool_call_ids", mode="before")
     @classmethod
-    def normalize_evidence_ids(cls, values: list[str]) -> list[str]:
+    def normalize_evidence_ids(cls, values) -> list[str]:
+        values = coerce_text_sequence(values)
         result: list[str] = []
         for value in values:
             item = str(value).strip()

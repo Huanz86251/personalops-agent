@@ -68,7 +68,9 @@ class ScriptedCodePlanningModel:
     def with_structured_output(self, schema, **kwargs):
         async def respond(messages):
             if schema.__name__ == "SkillChoice":
-                return {"parsed": schema.model_validate({"skill_ids": [], "reason": "Offline fixture"}), "raw": None, "parsing_error": None}
+                request = json.loads(messages[0]["content"])
+                selected = ["plan-task-dependencies"] if request.get("role") == "scheduler" else []
+                return {"parsed": schema.model_validate({"skill_ids": selected, "reason": "Offline fixture"}), "raw": None, "parsing_error": None}
             if schema.__name__ == "SupervisorDecision":
                 payload = {
                     "action": "PLAN",
@@ -202,7 +204,6 @@ class AppliedCodeRuntime:
             "messages": [AIMessage(content=report.summary)],
             "executor_model_calls_used": 3,
             "executor_tool_calls_used": 5,
-            "show_all_toolsets_calls_used": 0,
             "code_review_loop": loop.model_dump(mode="json"),
             "code_review_report": report.model_dump(mode="json"),
             "code_artifact_manifest": {
@@ -267,7 +268,6 @@ class EscalateThenApplyCodeRuntime:
                 "messages": [AIMessage(content=report.summary)],
                 "executor_model_calls_used": 2,
                 "executor_tool_calls_used": 2,
-                "show_all_toolsets_calls_used": 0,
                 "code_review_loop": self.loop.model_dump(mode="json"),
                 "code_review_report": report.model_dump(mode="json"),
                 "code_runtime_session_id": "live-code-session",
@@ -284,7 +284,6 @@ class EscalateThenApplyCodeRuntime:
                 "messages": [AIMessage(content=self.failed_report.summary)],
                 "executor_model_calls_used": 0,
                 "executor_tool_calls_used": 0,
-                "show_all_toolsets_calls_used": 0,
                 "code_review_loop": loop.model_dump(mode="json"),
                 "code_review_report": self.failed_report.model_dump(mode="json"),
                 "code_runtime_session_id": None,
@@ -343,7 +342,6 @@ class EscalateThenApplyCodeRuntime:
             "messages": [AIMessage(content=report.summary)],
             "executor_model_calls_used": 2,
             "executor_tool_calls_used": 2,
-            "show_all_toolsets_calls_used": 0,
             "code_review_loop": loop.model_dump(mode="json"),
             "code_review_report": report.model_dump(mode="json"),
             "code_handoff_publication_receipts": [],

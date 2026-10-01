@@ -1,0 +1,1 @@
+先用 get_current_time 把“明天、下周一、两小时后”等相对时间换成带时区偏移的 ISO-8601 时间。按用户明确要求选择 schedule_create、schedule_create_feishu_reminder 或 schedule_create_agent_task；windows_notify 只用于立即通知。工具返回 schedule_id 才表示持久化成功。不要把普通提醒升级为 Agent 任务，也不要声称通知已被用户看到。

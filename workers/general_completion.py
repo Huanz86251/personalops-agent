@@ -10,7 +10,7 @@ from langgraph.types import Command
 from pydantic.json_schema import SkipJsonSchema
 from api_handoff import ApiHandoffList, api_field
 from handoff_knowledge import HandoffKnowledge, knowledge_field
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from prompt_loader import load_prompt
 
 from artifact_models import WorkerArtifactCandidate
@@ -23,6 +23,13 @@ from workers.submission import (
 )
 from workers.plan_challenge import PlanChallenge
 from middlewares import DynamicExecutionBudgetMiddleware
+from workers.control_protocol import defer_terminal_call_if_mixed
+from schema_normalization import (
+    EvidenceRefText,
+    ReportItem,
+    coerce_sequence,
+    coerce_text_sequence,
+)
 
 
 class GeneralBudgetMiddleware(DynamicExecutionBudgetMiddleware):
@@ -83,10 +90,17 @@ class GeneralBudgetMiddleware(DynamicExecutionBudgetMiddleware):
         messages = list(state.get("messages", []))
         last = messages[-1]
         calls = getattr(last, "tool_calls", [])
-        allowed = [c for c in calls if c.get("name") == GENERAL_REPORT_NAME][:1]
+        from step_user_question import ASK_USER_NAME
+        ask_calls = [c for c in calls if c.get("name") == ASK_USER_NAME]
+        allowed = (
+            ask_calls[:1]
+            if ask_calls
+            else [c for c in calls if c.get("name") == GENERAL_REPORT_NAME][:1]
+        )
         update = {
             "worker_finalization_model_calls_used": int(state.get("worker_finalization_model_calls_used", 0)) + 1,
-            "worker_finalization_tool_calls_used": int(state.get("worker_finalization_tool_calls_used", 0)) + len(allowed),
+            "worker_finalization_tool_calls_used": int(state.get("worker_finalization_tool_calls_used", 0))
+            + sum(call.get("name") != ASK_USER_NAME for call in allowed),
         }
         if state.get("worker_finalize_reason") == "SCHEMA_REPAIR":
             update["worker_schema_repair_model_calls_used"] = (
@@ -123,7 +137,11 @@ from workers.submission import WorkerCriterionClaim
 
 class GeneralResult(BaseModel):
     forced_finalization: SkipJsonSchema[bool] = Field(default=False, description="Harness-only forced finalization marker.")
-    criterion_claims: list[WorkerCriterionClaim] = Field(default_factory=list, description="For each current criterion, give your claim and its evidence. Claims are not independent approval.")
+    criterion_claims: list[WorkerCriterionClaim] = Field(
+        default_factory=list,
+        max_length=24,
+        description="逐项覆盖当前标准，最多24项；Claims are not independent approval.",
+    )
     handoff_apis: ApiHandoffList = api_field()
     handoff_knowledge: SkipJsonSchema[list[HandoffKnowledge]] = knowledge_field()
     plan_challenge: PlanChallenge | None = Field(
@@ -134,22 +152,44 @@ class GeneralResult(BaseModel):
         ),
     )
 
-    status: Literal["COMPLETED", "PARTIAL", "BLOCKED", "FAILED"] = Field(
-        description="自查后的状态。正常COMPLETED且无文件直接形成StepReport；未完成、预算收尾或有文件时由Harness启动独立Reviewer。"
+    status: SkipJsonSchema[Literal["COMPLETED", "PARTIAL", "BLOCKED", "FAILED"]] = Field(
+        default="BLOCKED",
+        description="Harness根据未解决项、计划异议和收尾原因确定；模型不要填写。",
     )
     summary: str = Field(
         min_length=1,
         max_length=4000,
         description="Actual completed actions and observed results. Distinguish not attempted from attempted and failed; do not include passwords or tokens.",
     )
-    unresolved_items: list[str] = Field(
+    answer_text: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=32000,
+        description=(
+            "当用户或当前Step明确要求产出建议、分析、草稿等可交付文字，且不以文件交付时，"
+            "填写完整的实际正文，保留段落与排版；不要只写‘已提供建议’。"
+            "无需文字产物时填null。此处是供最终审核的草稿，并非已发送给用户。"
+        ),
+    )
+
+    @field_validator("answer_text")
+    @classmethod
+    def preserve_answer_layout(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        answer = value.strip()
+        if not answer:
+            raise ValueError("answer_text cannot be blank")
+        return answer
+    unresolved_items: list[ReportItem] = Field(
         default_factory=list,
         max_length=12,
         description="For each unfinished item: not attempted or actual failure, observed blocker, missing prerequisite and next action. Execution-round exhaustion is not an API timeout or account-credit failure.",
     )
-    evidence_tool_call_ids: list[str] = Field(
+    evidence_tool_call_ids: list[EvidenceRefText] = Field(
         default_factory=list,
-        description="Cite every relevant, non-redundant actual tool result needed for coverage; omit for tasks requiring no tools.",
+        max_length=48,
+        description="最多48个真实证据编号；只保留覆盖验收所需的非重复结果，无工具任务留空。",
     )
     files: list[GeneralFile] = Field(
         default_factory=list,
@@ -157,10 +197,23 @@ class GeneralResult(BaseModel):
         description="Generated files needed by subsequent steps or requested as deliverables; omit for a text-only result.",
     )
 
+    @field_validator("criterion_claims", "files", mode="before")
+    @classmethod
+    def normalize_object_lists(cls, value):
+        return coerce_sequence(value)
+
+    @field_validator("unresolved_items", "evidence_tool_call_ids", mode="before")
+    @classmethod
+    def normalize_text_lists(cls, value):
+        return coerce_text_sequence(value)
+
 
 @tool(description=load_prompt("workers/general_report_tool"))
 def report_general_result(result: GeneralResult, runtime: ToolRuntime) -> Command:
     """Finish a simple General step with your self-checked results. This ends execution; Harness decides whether independent review is needed. Report incomplete work honestly; include real artifact candidates if later workers need generated files."""
+    deferred = defer_terminal_call_if_mixed(runtime, GENERAL_REPORT_NAME)
+    if deferred is not None:
+        return deferred
     state = runtime.state
     if result.plan_challenge is not None and int(
         state.get("worker_plan_challenges_remaining", 0) or 0
@@ -178,10 +231,17 @@ def report_general_result(result: GeneralResult, runtime: ToolRuntime) -> Comman
             )],
         })
     from reporting.criteria import (
+        complete_missing_worker_claims,
         criterion_claim_repair_feedback,
         validate_worker_claim_coverage,
     )
     try:
+        result = result.model_copy(update={
+            "criterion_claims": complete_missing_worker_claims(
+                state,
+                result.criterion_claims,
+            )
+        })
         validate_worker_claim_coverage(state, result.criterion_claims)
     except ValueError as error:
         return Command(update={
@@ -198,8 +258,32 @@ def report_general_result(result: GeneralResult, runtime: ToolRuntime) -> Comman
         'forced_finalization': bool(
             state.get('worker_finalize_requested')
             and state.get('worker_finalize_reason') != 'SCHEMA_REPAIR'
-        )
+        ),
     })
+    model_limit = state.get("executor_model_run_limit")
+    model_used = sum(
+        int(state.get(key, 0) or 0)
+        for key in (
+            "executor_model_calls_used",
+            "skill_preparation_calls_used",
+            "worker_compaction_calls_used",
+        )
+    )
+    tool_limit = state.get("executor_tool_run_limit")
+    tool_used = int(state.get("executor_tool_calls_used", 0) or 0)
+    exhausted = (
+        model_limit is not None and model_used >= int(model_limit)
+    ) or (
+        tool_limit is not None and tool_used >= int(tool_limit)
+    )
+    derived_status = (
+        "BLOCKED"
+        if result.plan_challenge is not None or result.forced_finalization or exhausted
+        else "PARTIAL"
+        if result.unresolved_items
+        else "COMPLETED"
+    )
+    result = result.model_copy(update={"status": derived_status})
     ids = list(result.evidence_tool_call_ids)
     ids.extend(ref for claim in result.criterion_claims for ref in claim.evidence_tool_call_ids)
     if result.plan_challenge is not None:
@@ -233,8 +317,9 @@ def report_general_result(result: GeneralResult, runtime: ToolRuntime) -> Comman
         submission=WorkerSubmission(
             plan_challenge=result.plan_challenge,
             criterion_claims=result.criterion_claims,
-            summary=result.summary[:2000],
-            final_conclusion=result.summary[:1600],
+            summary=result.summary,
+            answer_text=result.answer_text,
+            final_conclusion=result.summary,
             unresolved_items=result.unresolved_items,
             handoff_knowledge=result.handoff_knowledge,
             handoff_apis=result.handoff_apis,
@@ -248,8 +333,10 @@ def report_general_result(result: GeneralResult, runtime: ToolRuntime) -> Comman
             "worker_submission": record.model_dump(mode="json"),
             "messages": [
                 ToolMessage(
-                    content=("General self-report recorded; files remain private pending independent Reporter review."
-                             if artifacts else "General self-report recorded. No independent review was performed."),
+                    content=(
+                        "General self-report recorded. Harness will decide whether "
+                        "independent review is required."
+                    ),
                     tool_call_id=runtime.tool_call_id,
                 )
             ],
@@ -293,9 +380,11 @@ class GeneralCompletionMiddleware(AgentMiddleware[WorkerProgressState]):
     def _final_request(self, request):
         if not request.state.get("worker_finalize_requested"):
             return request
+        from step_user_question import ASK_USER_NAME
+        allowed = {GENERAL_REPORT_NAME, ASK_USER_NAME}
         tools = [t for t in request.tools if (getattr(t, "name", None) or
-                 (t.get("name") if isinstance(t, dict) else None)) == GENERAL_REPORT_NAME]
-        return request.override(tools=tools, tool_choice=GENERAL_REPORT_NAME)
+                 (t.get("name") if isinstance(t, dict) else None)) in allowed]
+        return request.override(tools=tools, tool_choice="required")
 
     def wrap_model_call(self, request, handler):
         return handler(self._final_request(request))

@@ -5,11 +5,13 @@ metadata:
   roles: "web"
   topics: "research technical"
   required-tools: "web_search"
+  required-toolsets: "WEB_RESEARCH"
 ---
 
 # 版本匹配的技术资料检索
 
 1. 从任务提取库名、版本、运行环境、符号名与关键报错。用“库名 版本 API名/报错”查询；中文概念配英文符号，中文教程过旧时查同版本英文原文，不擅自把版本换成 latest。
+   第一次调用可并发覆盖三个不同证据层：官方版本文档、上游 issue/release、必要时实现或测试。例如：`web_search(query="<库名> <版本> <API名> official docs", alternative_queries=["site:github.com/<上游仓库> <完整报错>", "<库名> <版本> release <行为>"])`。如果官方文档已经明确回答签名和限制，就不为凑 issue 或博客继续搜索；只有行为仍有歧义时才读取对应上游记录。
 2. 优先项目官方版本文档、维护者的 GitHub/GitLab 仓库与 release。示例：Python 接口查 docs.python.org 对应版本；浏览器 API 查 MDN 并核对兼容说明。先验证仓库归属，不能把任意 GitHub 仓库当官方。
 3. 行为不明确时沿官方文档链接查实现或测试；遇到缺陷查相关 issue/PR，区分讨论、已合并和已发布。保留 tag/commit 与适用环境；一个评论里的 workaround 不等于官方保证。
 4. 优先正文直链，用现有文本工具小段读取。GitHub Code Search 要求登录时，可用普通搜索的 site:github.com 定位公开仓库/文件，再由文件页取 Raw。遇到访问挑战改查官方文档或公开 release，不猜文件路径、使用不明镜像或声称完整检索了仓库。

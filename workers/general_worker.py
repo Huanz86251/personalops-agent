@@ -36,28 +36,30 @@ from workers.progress import (
     WorkerProgressState,
 )
 from workers.submission import (
-    SUBMIT_FOR_REVIEW_NAME,
+    COMPLETE_WEB_STEP_NAME,
 )
+from tools.capability_expansion import (
+    REQUEST_ADDITIONAL_CAPABILITIES_NAME,
+    request_additional_capabilities,
+)
+from step_user_question import ASK_USER_NAME, create_ask_user_tool
 
 GENERAL_WORKER_NAME = "general_worker"
 
 
-# These tools belong to the legacy single-agent control or filesystem layer.
-# Deep Agents supplies its own state-backed filesystem tools, while toolset
-# routing remains the responsibility of the current main runtime.
-LEGACY_TOOL_NAMES = frozenset(
+# Web capabilities belong to the dedicated resource-scoped Worker. Deep Agents
+# supplies each role's state-backed filesystem tools directly; host filesystem
+# tools are deliberately not part of the shared business-tool registry.
+GENERAL_EXCLUDED_TOOL_NAMES = frozenset(
     {
-        "read_file",
-        "write_file",
-        "list_directory",
-        "grep_files",
-        "replace_in_file",
-        "find_files",
-        "show_all_toolsets",
-        # Web capabilities belong to the dedicated resource-scoped Worker.
         "web_search",
         "find_github_mirror",
         "fetch_webpage",
+        "list_cinemas",
+        "list_city_movies",
+        "get_cinema_showtimes",
+        "get_movie_showtimes",
+        "search_1688_products",
     }
 )
 
@@ -114,7 +116,7 @@ def select_general_worker_tools(
         if name == "send_local_file_to_feishu" and not (allow_file_export and export_tool_available()):
             continue
 
-        if name not in LEGACY_TOOL_NAMES:
+        if name not in GENERAL_EXCLUDED_TOOL_NAMES:
             selected_tools.append(tool)
 
     return selected_tools
@@ -147,14 +149,17 @@ def create_general_worker(
         _tool_name(current_tool)
         in {
             PUBLISH_WORKER_PROGRESS_NAME,
-            SUBMIT_FOR_REVIEW_NAME,
+            COMPLETE_WEB_STEP_NAME,
             GENERAL_REPORT_NAME,
+            REQUEST_ADDITIONAL_CAPABILITIES_NAME,
+            ASK_USER_NAME,
         }
         for current_tool in business_tools
     ):
         raise ValueError("Worker runtime control tool was supplied as a business tool.")
 
     completion = GeneralCompletionMiddleware()
+    ask_user = create_ask_user_tool("GENERAL_WORKER")
     from middlewares import DynamicExecutionBudgetMiddleware
     policies = [
         GeneralBudgetMiddleware(
@@ -179,6 +184,8 @@ def create_general_worker(
         model=model,
         tools=[
             *business_tools,
+            ask_user,
+            request_additional_capabilities,
             report_general_result,
         ],
         system_prompt=load_prompt("workers/general_worker"),
@@ -188,7 +195,7 @@ def create_general_worker(
             ExecutionHistoryMiddleware(),
             ExecutionStateMiddleware(),
             WorkerCompactionMiddleware(summary_model if summary_model is not None else model),
-            RoleSkillsMiddleware(model, "general", [*DEEP_AGENT_FILE_TOOLS, *(_tool_name(t) for t in business_tools)],
+            RoleSkillsMiddleware(model, "general", [*DEEP_AGENT_FILE_TOOLS, ASK_USER_NAME, *(_tool_name(t) for t in business_tools)],
                                  policies=middleware or (), backend=resolved_backend),
             WorkerRuntimeContextMiddleware(execution_reserve=1),
             TaskFileAccessMiddleware(),

@@ -10,7 +10,7 @@ from pydantic import ValidationError
 class FetchOutcomeTests(unittest.TestCase):
     def fetch(self, handler, **kwargs):
         factory = httpx.Client
-        with patch.object(local, "_public_url"), patch("httpx.Client", side_effect=lambda **kw: factory(transport=httpx.MockTransport(handler), **kw)):
+        with patch.object(local, "_public_url", return_value="93.184.216.34"), patch("httpx.Client", side_effect=lambda **kw: factory(transport=httpx.MockTransport(handler), **kw)):
             return local.fetch_webpage.func("https://example.com/page", **kwargs)
 
     def test_empty_and_pagination_are_distinct(self):

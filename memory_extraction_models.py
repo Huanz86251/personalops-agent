@@ -26,17 +26,35 @@ class StrictModel(BaseModel):
 class MemoryFrame(StrictModel):
     """A cheap first-pass routing decision; it deliberately contains no quote."""
 
-    frame_id: str = Field(min_length=1, max_length=40)
-    frame_type: FrameType
+    frame_id: str = Field(
+        min_length=1,
+        max_length=40,
+        description="仅在当前candidate内唯一的短ID，例如f1、f2。",
+    )
+    frame_type: FrameType = Field(
+        description="只选profile、preference、person_relation、project或task。",
+    )
 
 
 class CandidateFramePlan(StrictModel):
-    candidate_id: str = Field(min_length=1, max_length=80)
-    frames: list[MemoryFrame] = Field(default_factory=list, max_length=5)
+    candidate_id: str = Field(
+        min_length=1,
+        max_length=80,
+        description="原样复制输入中的candidate_id，不得新增、遗漏或改写。",
+    )
+    frames: list[MemoryFrame] = Field(
+        default_factory=list,
+        max_length=5,
+        description="零到五个独立长期记忆帧；没有长期价值时填空列表。",
+    )
 
 
 class MemoryFramePlan(StrictModel):
-    candidates: list[CandidateFramePlan] = Field(default_factory=list, max_length=32)
+    candidates: list[CandidateFramePlan] = Field(
+        default_factory=list,
+        max_length=32,
+        description="逐项覆盖本轮全部输入candidate_id，每个恰好一次。",
+    )
 
 
 class TypedRecordBase(StrictModel):
@@ -154,7 +172,11 @@ RECORD_MODELS: dict[str, type[TypedRecordBase]] = {
 class TypedExtractionResult(StrictModel):
     """Light envelope; individual records are checked against selected schemas."""
 
-    records: list[dict[str, Any]] = Field(default_factory=list, max_length=160)
+    records: list[dict[str, Any]] = Field(
+        default_factory=list,
+        max_length=160,
+        description="逐项覆盖上一轮已选择的candidate_id/frame_id，且record_type必须一致。",
+    )
 
 
 def selected_output_schema(frame_types: set[str]) -> dict[str, Any]:

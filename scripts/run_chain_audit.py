@@ -170,7 +170,10 @@ async def run(args):
     settings = load_settings()
     settings = replace(settings, code_sandbox=replace(settings.code_sandbox, auto_build=False))
     runtime = cr.ConversationRuntime(settings, ALL_TOOLS)
-    result = {"task": TASK, "execute_once": args.execute_once, "output": str(folder)}
+    task = str(args.task or TASK).strip()
+    if not task:
+        raise ValueError("--task cannot be empty")
+    result = {"task": task, "execute_once": args.execute_once, "output": str(folder)}
     save("task.json", result)
     save("catalog.private.json", load_catalog())
     save("configuration.json", {"planning": asdict(settings.planning), "worker_runtime": asdict(settings.worker_runtime), "concurrency": asdict(settings.runtime_concurrency), "sandbox": asdict(settings.code_sandbox), "model": settings.llm_model, "hard_model": settings.hard_llm_model, "max_output_tokens": settings.cloud_llm_max_tokens, "scheduler_thinking_enabled": settings.scheduler_thinking_enabled, "llm_thinking_enabled": settings.llm_thinking_enabled, "max_calls": meter.max_calls, "transport_retries": 0, "original_data_untouched": str(original_data)})
@@ -213,7 +216,7 @@ async def run(args):
                     f.write(datetime.now(timezone.utc).isoformat())
                 async def progress(event):
                     append({"event": "progress", "value": event})
-                result["answer"] = await runtime.ask(user_text=TASK, channel="chain-audit", external_chat_id="isolated", event_id="chain_audit_20260906", progress_callback=progress)
+                result["answer"] = await runtime.ask(user_text=task, channel="chain-audit", external_chat_id="isolated", event_id="chain_audit_20260919_capability_routing", progress_callback=progress)
                 (folder / "answer.md").write_text(result["answer"], encoding="utf-8")
                 result["status"] = "returned"
             else:
@@ -245,4 +248,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--execute-once", action="store_true")
     parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--task",
+        help="Override the default audited task for one isolated run.",
+    )
     asyncio.run(run(parser.parse_args()))

@@ -8,6 +8,7 @@ import pytest
 
 from workers.code_publisher import (
     CodePublicationContext,
+    _candidate_relative_path,
     compute_code_tree_revision,
     publish_code_artifacts,
 )
@@ -22,6 +23,19 @@ def candidate() -> CodeCandidateRef:
         workspace_id="workspace-publish-1",
         candidate_revision=3,
     )
+
+
+def test_workspace_alias_is_normalized_without_rejecting_unicode() -> None:
+    assert _candidate_relative_path("/workspace/个人名片.html") == "个人名片.html"
+    assert _candidate_relative_path("/workspace/dist/index.html") == "dist/index.html"
+
+
+def test_non_workspace_absolute_path_explains_the_required_contract() -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"relative to /workspace.*not an absolute path",
+    ):
+        _candidate_relative_path("/review/publish/card.html")
 
 
 def test_publisher_copies_only_reviewer_approved_files(tmp_path: Path) -> None:

@@ -7,6 +7,7 @@ from typing import Literal
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+from schema_normalization import EvidenceRefText, coerce_text_sequence
 
 
 WorkerArtifactKind = Literal[
@@ -30,7 +31,7 @@ class DownloadedArtifactRecord(BaseModel):
     downloaded_at: datetime
     run_id: str | None = None
     worker_id: str | None = None
-    origin: Literal["WEB", "BROWSER", "EMAIL"] = "WEB"
+    origin: Literal["WEB", "BROWSER", "EMAIL", "HOST"] = "WEB"
 
     @field_validator("candidate_id", "source_url", "storage_path", "filename")
     @classmethod
@@ -53,12 +54,12 @@ class WorkerArtifactCandidate(BaseModel):
     )
     kind: WorkerArtifactKind
     description: str = Field(min_length=1, max_length=600)
-    path: str | None = None
-    repository_url: str | None = None
-    repository_ref: str | None = None
-    commit: str | None = None
-    relevant_paths: list[str] = Field(default_factory=list, max_length=20)
-    evidence_tool_call_ids: list[str] = Field(default_factory=list)
+    path: str | None = Field(default=None, max_length=1200)
+    repository_url: str | None = Field(default=None, max_length=2000)
+    repository_ref: str | None = Field(default=None, max_length=300)
+    commit: str | None = Field(default=None, max_length=160)
+    relevant_paths: list[EvidenceRefText] = Field(default_factory=list, max_length=20)
+    evidence_tool_call_ids: list[EvidenceRefText] = Field(default_factory=list, max_length=48)
 
     @field_validator("candidate_id", "description")
     @classmethod
@@ -68,9 +69,10 @@ class WorkerArtifactCandidate(BaseModel):
             raise ValueError("artifact candidate text cannot be empty")
         return normalized
 
-    @field_validator("evidence_tool_call_ids", "relevant_paths")
+    @field_validator("evidence_tool_call_ids", "relevant_paths", mode="before")
     @classmethod
-    def normalize_unique_lists(cls, values: list[str]) -> list[str]:
+    def normalize_unique_lists(cls, values) -> list[str]:
+        values = coerce_text_sequence(values)
         result: list[str] = []
         for value in values:
             normalized = str(value).strip().replace("\\", "/")

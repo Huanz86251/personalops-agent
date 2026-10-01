@@ -60,9 +60,41 @@ class TaskFileAccessMiddleware(AgentMiddleware):
         ):
             raise ValueError("offset must be >= 0 and limit >= 1")
         if self.sandbox is not None:
+            sandbox_path = path
+            if path.startswith("/downloads/"):
+                # `/downloads` is a run/Worker-scoped host registry, not a
+                # directory mounted into the offline Code container.  Verify
+                # ownership, size and digest on every read, then copy only the
+                # requested immutable candidate into the sandbox.
+                from task_files import read_download
+
+                payload = read_download(path, request.state)
+                candidate_id = path.removeprefix("/downloads/")
+                raw_record = next(
+                    (
+                        item
+                        for item in reversed(
+                            request.state.get("worker_downloaded_artifacts") or []
+                        )
+                        if str(item.get("candidate_id") or "") == candidate_id
+                    ),
+                    None,
+                )
+                if raw_record is None:
+                    raise ValueError("Download is not registered to this Worker")
+                filename = str(raw_record.get("filename") or "artifact.bin")
+                if not filename or Path(filename).name != filename:
+                    raise ValueError("Registered download filename is invalid")
+                sandbox_path = (
+                    f"/workspace/.private-downloads/{candidate_id}/{filename}"
+                )
+                uploaded = self.sandbox.upload_files([(sandbox_path, payload)])
+                if len(uploaded) != 1 or uploaded[0].error:
+                    detail = uploaded[0].error if uploaded else "missing upload receipt"
+                    raise ValueError(f"Cannot copy registered download into Code sandbox: {detail}")
             result = self.sandbox.execute(
                 "python /opt/personalops/read_document.py "
-                + shlex.quote(path)
+                + shlex.quote(sandbox_path)
                 + f" --start-page {offset + 1} --max-pages {min(limit, 20)}"
             )
             output = result.output

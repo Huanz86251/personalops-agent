@@ -18,6 +18,7 @@ from langchain_core.outputs import (
     ChatGeneration,
     ChatResult,
 )
+from langchain.agents.middleware import ModelResponse
 from langchain_core.tools import (
     tool,
 )
@@ -34,6 +35,7 @@ from workers.web_worker import (
 from workers.progress import (
     PUBLISH_WORKER_PROGRESS_NAME,
     WorkerProgressMiddleware,
+    _keep_one_progress_call,
     count_tool_calls_since_progress,
 )
 from workers.leadership import WorkerLeadershipBridge
@@ -45,6 +47,21 @@ from workers.wake_policy import LeadershipWakePolicy
 
 
 class FinalizationToolRoutingTests(unittest.TestCase):
+    def test_selector_controlled_progress_defaults_to_not_forced(self):
+        state = {
+            "worker_total_tool_calls": 4,
+            "worker_last_progress_tool_call": 0,
+        }
+        disabled = WorkerProgressMiddleware(
+            progress_checkpoint_resolver=lambda _state: False,
+        )
+        enabled = WorkerProgressMiddleware(
+            progress_checkpoint_resolver=lambda _state: True,
+        )
+
+        self.assertFalse(disabled._progress_is_due(state))
+        self.assertTrue(enabled._progress_is_due(state))
+
     def test_code_finalization_does_not_require_unavailable_web_submit_tool(self):
         names = ("submit_code_for_review", "respond_to_code_review", "submit_continued_code_for_review")
         middleware = WorkerProgressMiddleware(finalization_tools=names)
@@ -54,6 +71,28 @@ class FinalizationToolRoutingTests(unittest.TestCase):
         result = middleware._require_control_request(request)
         self.assertEqual([tool.name for tool in result["tools"]], list(names))
         self.assertEqual(result["tool_choice"], "required")
+
+    def test_progress_call_is_isolated_from_other_parallel_calls(self):
+        message = AIMessage(content="", tool_calls=[
+            {"name": "web_search", "args": {"value": "ignored"}, "id": "other"},
+            {"name": PUBLISH_WORKER_PROGRESS_NAME, "args": {}, "id": "progress"},
+            {"name": PUBLISH_WORKER_PROGRESS_NAME, "args": {}, "id": "extra"},
+        ])
+        response = _keep_one_progress_call(ModelResponse(result=[message]))
+        self.assertEqual(
+            [call["id"] for call in response.result[0].tool_calls],
+            ["progress"],
+        )
+
+    def test_progress_call_is_isolated_across_response_messages(self):
+        response = _keep_one_progress_call(ModelResponse(result=[
+            AIMessage(content="", tool_calls=[
+                {"name": PUBLISH_WORKER_PROGRESS_NAME, "args": {}, "id": "first"}]),
+            AIMessage(content="", tool_calls=[
+                {"name": PUBLISH_WORKER_PROGRESS_NAME, "args": {}, "id": "second"}]),
+        ]))
+        self.assertEqual([[call["id"] for call in message.tool_calls]
+                          for message in response.result], [["first"], []])
 
 
 @tool
@@ -71,6 +110,7 @@ class ProgressScriptModel(
     """Provider-free model that follows the forced progress checkpoint."""
 
     invocation_count: int = 0
+    progress_call_count: int = 1
     current_tool_names: list[str] = Field(
         default_factory=list
     )
@@ -154,40 +194,23 @@ class ProgressScriptModel(
             )
 
         elif invocation_index == 4:
-            message = AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "name": (
-                            PUBLISH_WORKER_PROGRESS_NAME
-                        ),
-                        "args": {
-                            "progress": {
-                                "phase": "researching",
-                                "summary": (
-                                    "Completed four tool calls "
-                                    "and collected initial evidence."
-                                ),
-                                "findings": [
-                                    "The probe returned four results."
-                                ],
-                                "difficulties": [],
-                                "evidence_refs": [
-                                    "artifact://probe-results"
-                                ],
-                                "next_action": (
-                                    "Continue with the assigned task."
-                                ),
-                                "completion_claim": (
-                                    "not_ready"
-                                ),
-                            }
-                        },
-                        "id": "progress-call-1",
-                        "type": "tool_call",
-                    }
-                ],
-            )
+            message = AIMessage(content="", tool_calls=[
+                {
+                    "name": PUBLISH_WORKER_PROGRESS_NAME,
+                    "args": {"progress": {
+                        "phase": "researching",
+                        "summary": f"Progress report {index + 1} after four calls.",
+                        "findings": ["The probe returned four results."],
+                        "difficulties": [],
+                        "evidence_refs": ["artifact://probe-results"],
+                        "next_action": "Continue with the assigned task.",
+                        "completion_claim": "not_ready",
+                    }},
+                    "id": f"progress-call-{index + 1}",
+                    "type": "tool_call",
+                }
+                for index in range(self.progress_call_count)
+            ])
 
         else:
             message = AIMessage(
@@ -295,7 +318,8 @@ class WorkerProgressTests(
             in model.bound_tool_history
             if tool_names
             == [
-                PUBLISH_WORKER_PROGRESS_NAME
+                "ask_user",
+                PUBLISH_WORKER_PROGRESS_NAME,
             ]
         ]
         self.assertEqual(
@@ -310,7 +334,7 @@ class WorkerProgressTests(
         ))
         self.assertEqual(
             model.bound_tool_history[-1],
-            ["submit_for_review"],
+            ["ask_user", "complete_web_step"],
         )
         self.assertEqual(result["worker_finalize_reason"], "NATURAL_EXIT")
         self.assertEqual(result["worker_finalization_model_calls_used"], 1)
@@ -385,7 +409,8 @@ class AsyncWorkerProgressTests(
         )
         self.assertIn(
             [
-                PUBLISH_WORKER_PROGRESS_NAME
+                "ask_user",
+                PUBLISH_WORKER_PROGRESS_NAME,
             ],
             model.bound_tool_history,
         )
@@ -508,6 +533,57 @@ class AsyncWorkerProgressTests(
                     await store.get_pending_worker_directive(
                         "worker-accept-01"
                     )
+                )
+            finally:
+                await store.close()
+
+    async def test_multiple_forced_progress_calls_publish_only_one(self) -> None:
+        # Reproduces the movie trace: one model answer issued three progress
+        # calls against the same state, each otherwise claiming sequence 1.
+        model = ProgressScriptModel(progress_call_count=3)
+        worker = create_web_worker(
+            model,
+            tools=[web_search],
+            progress_every_tool_calls=4,
+            checkpointer=InMemorySaver(),
+        )
+
+        async def accept(_request):
+            return LeadershipDecisionResult(
+                decision=LeadershipDecision(action="ACCEPT", reason="Enough."),
+                model_rounds_used=0,
+            )
+
+        with TemporaryDirectory() as temporary:
+            store = AsyncEventStore(Path(temporary) / "events.sqlite3")
+            await store.start()
+            try:
+                bridge = WorkerLeadershipBridge(
+                    worker,
+                    store,
+                    wake_policy=LeadershipWakePolicy(
+                        single_worker_reports=1,
+                        multi_worker_reports=1,
+                    ),
+                    decision_handler=accept,
+                )
+                result = await bridge.ainvoke(
+                    {
+                        "messages": [{"role": "user", "content": "Report progress."}],
+                        "worker_id": "worker-multi-progress",
+                        "event_id": "event-multi-progress",
+                        "step_id": "1",
+                        "skill_mode": "off",
+                    },
+                    config={"configurable": {"thread_id": "multi-progress-thread"}},
+                )
+                reports = await bridge.read_event_progress("event-multi-progress")
+                self.assertEqual(len(reports), 1)
+                self.assertEqual(reports[0].sequence, 1)
+                self.assertEqual(len(result["worker_progress_reports"]), 1)
+                self.assertEqual(
+                    result["worker_progress_reports"][0]["progress"]["summary"],
+                    "Progress report 1 after four calls.",
                 )
             finally:
                 await store.close()

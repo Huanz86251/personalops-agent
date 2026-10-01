@@ -16,7 +16,6 @@ def repair_state(*, used=0, tool_name="report_general_result"):
         "executor_model_calls_used": 1,
         "executor_tool_run_limit": 1,
         "executor_tool_calls_used": 1,
-        "show_all_toolsets_run_limit": 0,
         "messages": [
             AIMessage(
                 content="",

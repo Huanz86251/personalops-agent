@@ -11,7 +11,7 @@ from langchain.agents.middleware import AgentMiddleware
 ACTIVE = ContextVar('worker_history_archive', default=None)
 ROOT = Path(__file__).resolve().parents[1] / '.agent' / 'worker-history'
 CONTROL = {'report_general_result','submit_code_for_review','respond_to_code_review',
-           'submit_continued_code_for_review','submit_code_review','submit_for_review',
+           'submit_continued_code_for_review','submit_code_review','complete_web_step',
            'StepReport','read_execution_history','publish_reviewed_candidate'}
 
 def execution_records():

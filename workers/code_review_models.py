@@ -8,13 +8,21 @@ the state in LangGraph checkpoints and execute either side in containers.
 from __future__ import annotations
 from runtime_tracing import operation
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic.json_schema import SkipJsonSchema
 from api_handoff import ApiHandoffList, api_field
 from handoff_knowledge import HandoffKnowledge, knowledge_field
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from workers.plan_challenge import PlanChallenge
+from schema_normalization import (
+    EvidenceRefText,
+    ReportItem,
+    coerce_declared_sequences,
+    coerce_sequence,
+    coerce_text_sequence,
+    drop_invalid_auxiliary_fields,
+)
 
 
 CodeReviewLoopStatus = Literal[
@@ -76,6 +84,11 @@ class CodeReviewModel(BaseModel):
         str_strip_whitespace=True,
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_scalar_sequence_fields(cls, value):
+        return coerce_declared_sequences(cls, value)
+
 
 class CodeCandidateRef(CodeReviewModel):
     """Identity fence preventing the Reviewer from testing stale output."""
@@ -90,17 +103,17 @@ class CodeCandidateRef(CodeReviewModel):
 class CodeImplementedInterface(CodeReviewModel):
     interface_id: str = Field(min_length=1)
     actual_contract: dict = Field(default_factory=dict)
-    implementation_location: str = Field(min_length=1)
+    implementation_location: str = Field(min_length=1, max_length=1200)
 
 
 class CodeChangedFile(CodeReviewModel):
-    path: str = Field(min_length=1)
-    change_summary: str = Field(min_length=1)
+    path: str = Field(min_length=1, max_length=1200)
+    change_summary: str = Field(min_length=1, max_length=2000)
 
 
 class CodeSelfCheck(CodeReviewModel):
-    check: str = Field(min_length=1)
-    summary: str = Field(min_length=1)
+    check: str = Field(min_length=1, max_length=1200)
+    summary: str = Field(min_length=1, max_length=2000)
     outcome: Literal["PASSED", "FAILED", "NOT_RUN"]
 
 
@@ -119,41 +132,104 @@ class CodeWorkerSubmission(CodeReviewModel):
 
 
     candidate: CodeCandidateRef
-    summary: str = Field(min_length=1)
+    summary: str = Field(
+        min_length=1, max_length=6000,
+        description="实现结果和主要边界，最多6000字符；不要复制代码或完整日志。",
+    )
+    answer_text: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=32000,
+        description=(
+            "仅在当前代码Step明确要求交付文字说明、分析或草稿且不以文件交付时，"
+            "填写完整正文；不要用一句完成声明代替。无需文字产物时填null。"
+            "这是供Reviewer核对的Worker草稿，不表示已发送给用户。"
+        ),
+    )
     requirement_status: dict[str, Literal["MET", "PARTIAL", "NOT_MET"]]
-    implemented_interfaces: tuple[CodeImplementedInterface, ...] = ()
-    changed_files: tuple[CodeChangedFile, ...] = ()
-    proposed_artifact_paths: tuple[str, ...] = ()
-    self_checks: tuple[CodeSelfCheck, ...] = ()
-    evidence_tool_call_ids: tuple[str, ...] = ()
-    limitations: tuple[str, ...] = ()
+    implemented_interfaces: tuple[CodeImplementedInterface, ...] = Field(default=(), max_length=24)
+    changed_files: tuple[CodeChangedFile, ...] = Field(default=(), max_length=100)
+    proposed_artifact_paths: tuple[EvidenceRefText, ...] = Field(default=(), max_length=100)
+    self_checks: tuple[CodeSelfCheck, ...] = Field(default=(), max_length=50)
+    evidence_tool_call_ids: tuple[EvidenceRefText, ...] = Field(default=(), max_length=100)
+    limitations: tuple[ReportItem, ...] = Field(default=(), max_length=24)
+
+    @model_validator(mode="before")
+    @classmethod
+    def omit_invalid_auxiliary_fields(cls, value):
+        return drop_invalid_auxiliary_fields(
+            cls,
+            value,
+            (
+                "implemented_interfaces",
+                "changed_files",
+                "self_checks",
+                "evidence_tool_call_ids",
+                "limitations",
+            ),
+        )
+
+    @field_validator("implemented_interfaces", "changed_files", "self_checks", mode="before")
+    @classmethod
+    def normalize_object_lists(cls, value):
+        return coerce_sequence(value)
+
+    @field_validator("proposed_artifact_paths", "evidence_tool_call_ids", "limitations", mode="before")
+    @classmethod
+    def normalize_text_lists(cls, value):
+        return coerce_text_sequence(value)
 
 
 class CodeReviewFinding(CodeReviewModel):
     finding_id: str = Field(min_length=1)
     category: CodeFindingCategory
-    summary: str = Field(min_length=1)
-    affected_requirement_ids: tuple[str, ...] = ()
-    related_paths: tuple[str, ...] = ()
+    summary: str = Field(min_length=1, max_length=3000)
+    affected_requirement_ids: tuple[EvidenceRefText, ...] = Field(default=(), max_length=24)
+    related_paths: tuple[EvidenceRefText, ...] = Field(default=(), max_length=50)
+
+    @field_validator("affected_requirement_ids", "related_paths", mode="before")
+    @classmethod
+    def normalize_text_lists(cls, value):
+        return coerce_text_sequence(value)
 
 
 class CodeRepairInstruction(CodeReviewModel):
     round_no: int = Field(ge=1)
     candidate: CodeCandidateRef
-    summary: str = Field(min_length=1)
-    required_changes: tuple[str, ...] = Field(min_length=1)
-    preserve_behaviors: tuple[str, ...] = ()
-    findings: tuple[CodeReviewFinding, ...] = Field(min_length=1)
+    summary: str = Field(min_length=1, max_length=4000)
+    required_changes: tuple[ReportItem, ...] = Field(min_length=1, max_length=24)
+    preserve_behaviors: tuple[ReportItem, ...] = Field(default=(), max_length=24)
+    findings: tuple[CodeReviewFinding, ...] = Field(min_length=1, max_length=24)
+
+    @field_validator("required_changes", "preserve_behaviors", mode="before")
+    @classmethod
+    def normalize_text_lists(cls, value):
+        return coerce_text_sequence(value)
+
+    @field_validator("findings", mode="before")
+    @classmethod
+    def normalize_findings(cls, value):
+        return coerce_sequence(value)
 
 
 class CodeWorkerRepairResponse(CodeReviewModel):
     round_no: int = Field(ge=1)
-    reasons: tuple[str, ...] = ()
+    reasons: tuple[ReportItem, ...] = Field(default=(), max_length=24)
     action: CodeRepairResponseAction
     candidate: CodeCandidateRef
-    summary: str = Field(min_length=1)
-    changed_files: tuple[CodeChangedFile, ...] = ()
-    evidence_tool_call_ids: tuple[str, ...] = ()
+    summary: str = Field(min_length=1, max_length=4000)
+    changed_files: tuple[CodeChangedFile, ...] = Field(default=(), max_length=100)
+    evidence_tool_call_ids: tuple[EvidenceRefText, ...] = Field(default=(), max_length=100)
+
+    @field_validator("reasons", "evidence_tool_call_ids", mode="before")
+    @classmethod
+    def normalize_text_lists(cls, value):
+        return coerce_text_sequence(value)
+
+    @field_validator("changed_files", mode="before")
+    @classmethod
+    def normalize_changed_files(cls, value):
+        return coerce_sequence(value)
 
 
 class CodeRepairExchange(CodeReviewModel):
@@ -163,8 +239,8 @@ class CodeRepairExchange(CodeReviewModel):
 
 class CodeCheckResult(CodeReviewModel):
     check_id: str = Field(min_length=1)
-    description: str = Field(min_length=1)
-    summary: str = Field(min_length=1)
+    description: str = Field(min_length=1, max_length=2000)
+    summary: str = Field(min_length=1, max_length=4000)
     status: CodeCheckStatus
 
 
@@ -173,6 +249,13 @@ class CodeReviewReport(CodeReviewModel):
 
     handoff_apis: ApiHandoffList = api_field()
     handoff_knowledge: SkipJsonSchema[list[HandoffKnowledge]] = knowledge_field()
+    recovery_proposal: SkipJsonSchema[dict[str, Any] | None] = Field(
+        default=None,
+        description=(
+            "Harness-authored second-pass CODE recovery proposal. It is advice "
+            "to the Scheduler, not approval to publish a failed candidate."
+        ),
+    )
     confirmed_plan_challenge: PlanChallenge | None = Field(
         default=None,
         description=(
@@ -183,21 +266,43 @@ class CodeReviewReport(CodeReviewModel):
 
 
     candidate: CodeCandidateRef
-    summary: str = Field(min_length=1)
-    verification_summary: str = Field(min_length=1, description="Actual independent checks and observed results; separate verified work, missing evidence, not attempted and actual failure. Identify scope violations without hiding completed changes.")
-    verified_requirement_ids: tuple[str, ...] = Field(default=(), description="Unique IDs copied from frozen code_task.requirements that were actually verified. PASSED covers every requirement.")
-    verified_interfaces: tuple[CodeImplementedInterface, ...] = ()
-    check_results: tuple[CodeCheckResult, ...] = ()
-    failed_test_summaries: tuple[str, ...] = Field(default=(), description="Observed failing check/error, affected requirement, impact and remaining prerequisite. Missing checks are unverified, not fabricated tool failures.")
-    changed_files: tuple[CodeChangedFile, ...] = ()
-    evidence_refs: tuple[str, ...] = ()
+    summary: str = Field(min_length=1, max_length=6000)
+    verification_summary: str = Field(min_length=1, max_length=8000, description="独立检查及观测结果，最多8000字符；区分已验证、缺证据、未尝试和真实失败。")
+    verified_requirement_ids: tuple[EvidenceRefText, ...] = Field(default=(), max_length=40, description="最多40个冻结 requirement ID；PASSED必须覆盖全部要求。")
+    verified_interfaces: tuple[CodeImplementedInterface, ...] = Field(default=(), max_length=24)
+    check_results: tuple[CodeCheckResult, ...] = Field(default=(), max_length=50)
+    failed_test_summaries: tuple[ReportItem, ...] = Field(default=(), max_length=50, description="最多50项，每项最多2000字符；记录真实失败、影响和剩余前提。")
+    changed_files: tuple[CodeChangedFile, ...] = Field(default=(), max_length=100)
+    evidence_refs: tuple[EvidenceRefText, ...] = Field(default=(), max_length=100)
     verdict: CodeReviewVerdict = Field(description="填写实际检查、失败摘要和evidence_refs后再作出整体结论。")
-    approved_artifact_paths: tuple[str, ...] = ()
-    published_artifact_paths: tuple[str, ...] = ()
-    delivery_location: str | None = None
-    publication_id: str | None = None
-    applied_revision: str | None = None
+    approved_artifact_paths: tuple[EvidenceRefText, ...] = Field(default=(), max_length=100)
+    published_artifact_paths: tuple[EvidenceRefText, ...] = Field(default=(), max_length=100)
+    delivery_location: str | None = Field(default=None, max_length=2000)
+    publication_id: str | None = Field(default=None, max_length=200)
+    applied_revision: str | None = Field(default=None, max_length=200)
     recommended_action: SchedulerCodeAction | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def omit_invalid_auxiliary_fields(cls, value):
+        return drop_invalid_auxiliary_fields(
+            cls,
+            value,
+            ("verified_interfaces", "failed_test_summaries", "changed_files"),
+        )
+
+    @field_validator(
+        "verified_requirement_ids", "failed_test_summaries", "evidence_refs",
+        "approved_artifact_paths", "published_artifact_paths", mode="before",
+    )
+    @classmethod
+    def normalize_text_lists(cls, value):
+        return coerce_text_sequence(value)
+
+    @field_validator("verified_interfaces", "check_results", "changed_files", mode="before")
+    @classmethod
+    def normalize_object_lists(cls, value):
+        return coerce_sequence(value)
 
     @model_validator(mode="after")
     def validate_verdict_action(self) -> "CodeReviewReport":
@@ -232,11 +337,16 @@ class CodeReviewReport(CodeReviewModel):
 
 
 class SchedulerCodeDecision(CodeReviewModel):
-    reason: str = Field(min_length=1, description="先说明审核事实与选择依据，再填写action。")
+    reason: str = Field(default="", max_length=6000, description="可选审核依据；格式错误时Harness会省略，action及条件字段仍严格校验。")
     action: SchedulerCodeAction
-    worker_instruction: str | None = None
-    reviewer_instruction: str | None = None
+    worker_instruction: str | None = Field(default=None, max_length=5000)
+    reviewer_instruction: str | None = Field(default=None, max_length=5000)
     repair_rounds: int | None = Field(default=None, ge=1, le=3)
+
+    @model_validator(mode="before")
+    @classmethod
+    def omit_invalid_auxiliary_fields(cls, value):
+        return drop_invalid_auxiliary_fields(cls, value, ("reason",))
 
     @model_validator(mode="after")
     def validate_action_fields(self) -> "SchedulerCodeDecision":
@@ -264,9 +374,9 @@ class SchedulerContinueDirective(CodeReviewModel):
 
     scheduler_epoch: int = Field(ge=2)
     candidate: CodeCandidateRef
-    reason: str = Field(min_length=1)
-    worker_instruction: str = Field(min_length=1)
-    reviewer_instruction: str = Field(min_length=1)
+    reason: str = Field(min_length=1, max_length=6000)
+    worker_instruction: str = Field(min_length=1, max_length=5000)
+    reviewer_instruction: str = Field(min_length=1, max_length=5000)
     repair_rounds: int = Field(ge=1, le=3)
 
 
@@ -274,12 +384,22 @@ class CodeContinuationSubmission(CodeReviewModel):
     """Worker result sent to Reviewer after Scheduler continuation guidance."""
 
     scheduler_epoch: int = Field(ge=2)
-    reasons: tuple[str, ...] = ()
+    reasons: tuple[ReportItem, ...] = Field(default=(), max_length=24)
     action: CodeContinuationAction
     candidate: CodeCandidateRef
-    summary: str = Field(min_length=1)
-    changed_files: tuple[CodeChangedFile, ...] = ()
-    evidence_tool_call_ids: tuple[str, ...] = ()
+    summary: str = Field(min_length=1, max_length=4000)
+    changed_files: tuple[CodeChangedFile, ...] = Field(default=(), max_length=100)
+    evidence_tool_call_ids: tuple[EvidenceRefText, ...] = Field(default=(), max_length=100)
+
+    @field_validator("reasons", "evidence_tool_call_ids", mode="before")
+    @classmethod
+    def normalize_text_lists(cls, value):
+        return coerce_text_sequence(value)
+
+    @field_validator("changed_files", mode="before")
+    @classmethod
+    def normalize_changed_files(cls, value):
+        return coerce_sequence(value)
 
 
 class SchedulerContinuationRecord(CodeReviewModel):

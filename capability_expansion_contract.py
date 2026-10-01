@@ -1,0 +1,6 @@
+"""Dependency-free constants shared by capability expansion control layers."""
+
+REQUEST_ADDITIONAL_CAPABILITIES_NAME = "request_additional_capabilities"
+CAPABILITY_EXPANSION_REQUESTED = "CAPABILITY_EXPANSION_REQUESTED"
+CAPABILITY_EXPANSION_EXHAUSTED = "CAPABILITY_EXPANSION_EXHAUSTED"
+

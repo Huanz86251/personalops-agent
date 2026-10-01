@@ -152,6 +152,13 @@ class EmailMCPRuntimeTests(unittest.IsolatedAsyncioTestCase):
             runtime.tools,
         )
         self.assertTrue(resolution.is_available)
+        self.assertNotIn("email_create_draft", resolution.tool_names)
+        draft_resolution = DEFAULT_TOOLSET_REGISTRY.resolve(
+            "EMAIL_DRAFTING",
+            runtime.tools,
+        )
+        self.assertTrue(draft_resolution.is_available)
+        self.assertEqual(draft_resolution.tool_names, ("email_create_draft",))
 
         with patch.object(
             runtime,

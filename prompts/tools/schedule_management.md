@@ -1,0 +1,1 @@
+先用 schedule_list 找到真实 schedule_id 和当前状态；重名时依据时间、内容和状态辨认，不猜 ID。只有用户明确要求后才调用 schedule_pause、schedule_resume 或 schedule_delete。使用 schedule_runs 查询真实运行记录；SUBMITTED 只表示投递已提交，不等于用户看到或任务完成。需要创建替代提醒时还必须具有 SCHEDULE_CREATION 能力。

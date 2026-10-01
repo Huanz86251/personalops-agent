@@ -6,8 +6,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, BeforeValida
 
 class ResultSource(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    tool_call_id: str = Field(description='真实来源工具调用引用；当前E编号由Harness恢复。未知引用仅使当前API不通过。')
-    pointer: str = Field(default='', description='JSON字段路径，如/items/0/id；空串是整个结果。')
+    tool_call_id: str = Field(min_length=1, max_length=160, description='真实来源工具调用引用；当前E编号由Harness恢复。未知引用仅使当前API不通过。')
+    pointer: str = Field(default='', max_length=600, description='JSON字段路径，如/items/0/id；空串是整个结果。')
 
     @field_validator('tool_call_id')
     @classmethod
@@ -18,9 +18,9 @@ class ResultSource(BaseModel):
 
 class ApiParameter(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    name: str = Field(min_length=1)
+    name: str = Field(min_length=1, max_length=160)
     required: bool
-    purpose: str
+    purpose: str = Field(min_length=1, max_length=600)
     source: ResultSource | None = Field(default=None, description='参数值的真实来源。未取得填null，不猜值，不复制凭据。')
 
 class ApiHandoffReceipt(BaseModel):
@@ -32,12 +32,12 @@ class ApiHandoffReceipt(BaseModel):
 
 class ApiHandoff(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    name: str = Field(min_length=1)
-    purpose: str = Field(min_length=1)
+    name: str = Field(min_length=1, max_length=200)
+    purpose: str = Field(min_length=1, max_length=1200)
     documentation: ResultSource = Field(description='定位文档中的接口名称字段，值须与name完全相等。')
     parameters: list[ApiParameter] = Field(default_factory=list, max_length=40)
-    call_example: str = Field(description='单个Python调用表达式，参数使用清晰变量占位或数值/布尔常量，不填秘密或猜测值。只展示不执行。')
-    next_action: str = Field(default='', description='可选：接收者还需做什么。接口资料完整且无待办时留空，不强造下一步。')
+    call_example: str = Field(max_length=2000, description='单个Python调用表达式，最多2000字符；参数使用清晰变量占位或数值/布尔常量，不填秘密或猜测值。只展示不执行。')
+    next_action: str = Field(default='', max_length=1200, description='可选，最多1200字符：接收者还需做什么。接口资料完整且无待办时留空。')
 
 ApiHandoffReceipt.model_rebuild()
 
@@ -51,10 +51,10 @@ def parse_api_list(value):
                 set_span_output(span,{'status':'REJECTED','reason':'schema_invalid'})
     return accepted
 
-ApiHandoffList = Annotated[list[ApiHandoff], BeforeValidator(parse_api_list)]
+ApiHandoffList = Annotated[list[ApiHandoff], BeforeValidator(parse_api_list), Field(max_length=20)]
 
 def api_field():
-    return Field(default_factory=list,description='直接填写API列表，每项含name/purpose/documentation/parameters/call_example；next_action为可选待办。包含下一位Worker否则必须重新查找的全部已发现接口，尤其认证、读取、写入和回读接口。无接口交接填[]。Harness逐项标记已验证或失败原因，失败项不会静默删除；文件另走已有候选发布字段。')
+    return Field(default_factory=list,max_length=20,description='最多20项API；每项含name/purpose/documentation/parameters/call_example，next_action为可选待办。包含下一位Worker否则必须重新查找的全部已发现接口。无接口交接填[]。Harness逐项标记已验证或失败原因，失败项不会静默删除；文件另走候选发布字段。')
 
 def pointer_value(value, pointer):
     if not pointer: return value

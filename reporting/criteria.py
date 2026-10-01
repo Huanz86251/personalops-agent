@@ -1,7 +1,9 @@
 """Harness-owned criterion identities; text remains in canonical reports."""
 import json
-from pydantic import BaseModel, Field, create_model
+from pydantic import BaseModel, Field, create_model, field_validator
+from pydantic.json_schema import SkipJsonSchema
 from planning_models import StepReport, CriterionStatus
+from schema_normalization import EvidenceRefText, ReportItem, coerce_text_sequence, derive_step_status
 
 
 def criterion_registry(criteria):
@@ -10,28 +12,41 @@ def criterion_registry(criteria):
 
 class CriterionReferenceResult(BaseModel):
     criterion_id: str = Field(description="Copy C1/C2 from the current Step contract. Never invent IDs.")
-    evidence: list[str] = Field(default_factory=list, description="先引用已登记的E工具结果或A产物，再填写status；失败调用只能支持失败，不能支持成功。")
+    evidence: list[EvidenceRefText] = Field(default_factory=list, max_length=24, description="先引用已登记的E普通工具结果、W开头的具体网页结果或A产物，最多24个，再填写status；失败调用只能支持失败，不能支持成功。")
     status: CriterionStatus = Field(description="完成evidence后再判断MET/PARTIAL/NOT_MET/UNKNOWN。")
+
+    @field_validator("evidence", mode="before")
+    @classmethod
+    def normalize_evidence(cls, value):
+        return coerce_text_sequence(value)
 
 
 # Keep the established tool name, but do not ask the model to copy criterion prose.
 ReferencedStepReport = create_model(
     "StepReport", __base__=StepReport,
-    criterion_results=(list[CriterionReferenceResult], Field(default_factory=list)),
-    evidence=(list[str], Field(default_factory=list, description="Registered E/A references only, no URLs or invented locators.")),
-    errors=(list[str], Field(default_factory=list, description="Observed call/result error and its impact, with evidence reference. Not attempted is not an error; never infer API unavailability from missing evidence.")),
-    unresolved_items=(list[str], Field(default_factory=list, description="For each remaining criterion: what is missing, whether attempted, and the prerequisite needed. Do not erase work already verified.")),
-    next_action=(str | None, Field(default=None, description="Smallest next decision for Scheduler, based on actual remaining work. Do not privately restart General/Web or repeat successful writes.")),
+    status=(SkipJsonSchema[str], Field(
+        default="BLOCKED",
+        description="Harness根据criterion_results确定；模型不要填写。",
+    )),
+    criterion_results=(list[CriterionReferenceResult], Field(default_factory=list, max_length=24)),
+    evidence=(list[EvidenceRefText], Field(default_factory=list, max_length=48, description="最多48个已登记E/W/A编号；不要填写URL或自造定位符。")),
+    errors=(list[ReportItem], Field(default_factory=list, max_length=24, description="最多24项、每项最多2000字符；记录真实调用错误和影响。")),
+    unresolved_items=(list[ReportItem], Field(default_factory=list, max_length=24, description="最多24项、每项最多2000字符；写缺项、是否尝试及必要前提。")),
+    next_action=(str | None, Field(default=None, max_length=4000, description="Scheduler的最小下一步，最多4000字符；不要私自重启Worker。")),
     approved_artifact_refs=(list[str], Field(default_factory=list, max_length=12, description="Only registered A references whose content/use was verified. Harness publishes; reviewer does not invent shared paths.")),
 )
 
 
-def normalize_report(value, criteria, refs):
+def normalize_report(value, criteria, refs, aliases=None, *, mode="strict"):
+    if mode not in {"strict", "balanced"}:
+        raise ValueError("review evidence mode must be strict or balanced")
     if hasattr(value, "model_dump"):
         value = value.model_dump()
     value = dict(value)
     contract = criterion_registry(criteria)
     indexed = {}
+    normalization_notes = []
+    invalid_criterion_ids = set()
     for raw in value.get("criterion_results", []):
         item = dict(raw)
         key = item.pop("criterion_id", None)
@@ -39,33 +54,102 @@ def normalize_report(value, criteria, refs):
         if key is None:
             matches = [k for k, text in contract.items() if text == item.get("criterion")]
             if len(matches) != 1:
-                raise ValueError("Use an unambiguous criterion_id from the current contract")
+                if mode == "strict":
+                    raise ValueError("Use an unambiguous criterion_id from the current contract")
+                normalization_notes.append("ignored criterion row without an unambiguous current criterion_id")
+                continue
             key = matches[0]
-        if key not in contract or key in indexed:
-            raise ValueError(f"Unknown or duplicate criterion_id: {key}")
+        if key not in contract:
+            if mode == "strict":
+                raise ValueError(f"Unknown or duplicate criterion_id: {key}")
+            normalization_notes.append(f"ignored unknown criterion_id {key}")
+            continue
+        if key in indexed or key in invalid_criterion_ids:
+            if mode == "strict":
+                raise ValueError(f"Unknown or duplicate criterion_id: {key}")
+            indexed.pop(key, None)
+            invalid_criterion_ids.add(key)
+            normalization_notes.append(f"replaced duplicate criterion_id {key} with UNKNOWN")
+            continue
         item["criterion"] = contract[key]
         item["criterion_id"] = key
         indexed[key] = item
     if set(indexed) != set(contract):
-        raise ValueError("Report must cover every current criterion exactly once")
+        if mode == "strict":
+            raise ValueError("Report must cover every current criterion exactly once")
+        for key, text in contract.items():
+            if key not in indexed:
+                indexed[key] = {
+                    "criterion": text,
+                    "criterion_id": key,
+                    "status": "UNKNOWN",
+                    "evidence": [],
+                }
+                normalization_notes.append(f"synthesized missing criterion_id {key} as UNKNOWN")
     inverse = {short: canonical for canonical, short in refs.items()}
-    def resolve(values):
+    def resolve(values, *, field_name):
         result = []
         for ref in values:
+            ref = (aliases or {}).get(ref, ref)
             if ref in inverse:
                 ref = inverse[ref]
             elif ref not in refs:
-                raise ValueError(f"Unknown evidence reference: {ref}")
+                if mode == "strict":
+                    raise ValueError(f"Unknown evidence reference: {ref}")
+                normalization_notes.append(f"dropped unknown {field_name} reference {ref}")
+                continue
             if ref not in result:
                 result.append(ref)
         return result
-    value["evidence"] = resolve(value.get("evidence", []))
-    value["approved_artifact_refs"] = resolve(value.get("approved_artifact_refs", []))
-    if any(not refs[ref].startswith("A") for ref in value["approved_artifact_refs"]):
-        raise ValueError("Only registered artifact references can be approved")
-    for item in indexed.values():
-        item["evidence"] = resolve(item.get("evidence", []))
+    value["evidence"] = resolve(value.get("evidence", []), field_name="evidence")
+    value["approved_artifact_refs"] = resolve(
+        value.get("approved_artifact_refs", []), field_name="artifact"
+    )
+    invalid_approvals = [
+        ref for ref in value["approved_artifact_refs"]
+        if not refs[ref].startswith("A")
+    ]
+    if invalid_approvals:
+        if mode == "strict":
+            raise ValueError("Only registered artifact references can be approved")
+        value["approved_artifact_refs"] = [
+            ref for ref in value["approved_artifact_refs"]
+            if ref not in invalid_approvals
+        ]
+        normalization_notes.append("dropped non-artifact approval references")
+    unresolved = list(value.get("unresolved_items", []) or [])
+    for key, item in indexed.items():
+        item["evidence"] = resolve(
+            item.get("evidence", []), field_name=f"criterion {key} evidence"
+        )
+        if mode == "balanced" and item.get("status") == "MET" and not item["evidence"]:
+            item["status"] = "UNKNOWN"
+            if contract[key] not in unresolved:
+                unresolved.append(contract[key])
+            normalization_notes.append(f"downgraded unsupported MET criterion {key} to UNKNOWN")
     value["criterion_results"] = [indexed[key] for key in contract]
+    if value["criterion_results"]:
+        value["status"] = derive_step_status(
+            item.get("status", "UNKNOWN")
+            for item in value["criterion_results"]
+        )
+        if (
+            value["status"] == "BLOCKED"
+            and any(note.startswith("downgraded unsupported MET") for note in normalization_notes)
+        ):
+            # The attempt produced a claim but its citation was unusable. This
+            # is partial progress, unlike a wholly absent/unattempted report.
+            value["status"] = "PARTIAL"
+    else:
+        value["status"] = value.get("status") or "BLOCKED"
+    if mode == "balanced":
+        value["unresolved_items"] = unresolved
+        if normalization_notes:
+            errors = list(value.get("errors", []) or [])
+            errors.append(
+                "Harness balanced normalization: " + "; ".join(normalization_notes)
+            )
+            value["errors"] = errors
     return StepReport.model_validate(value)
 
 
@@ -102,17 +186,58 @@ def validate_worker_claim_coverage(state, claims):
         )
 
 
+def complete_missing_worker_claims(state, claims):
+    """Fill omitted frozen criteria without inventing success or evidence.
+
+    Missing rows are a form-shape defect, not a reason to rerun business tools
+    or repeatedly ask the model to repair the same table.  Unknown and
+    duplicate identities remain hard errors because they cannot be mapped
+    deterministically to the frozen contract.
+    """
+    from workers.submission import WorkerCriterionClaim
+
+    contract = worker_registry(state)
+    if not contract:
+        return list(claims)
+    identities = [getattr(claim, "criterion_id", None) for claim in claims]
+    unknown = [key for key in identities if key not in contract]
+    duplicates = sorted({key for key in identities if key and identities.count(key) > 1})
+    if unknown or duplicates:
+        raise ValueError(
+            "criterion_claims contains unknown or duplicate HARNESS_CRITERIA IDs; "
+            f"unknown={unknown}, duplicates={duplicates}"
+        )
+    indexed = {
+        claim.criterion_id: claim
+        for claim in claims
+        if claim.criterion_id in contract
+    }
+    return [
+        indexed.get(key)
+        or WorkerCriterionClaim(
+            criterion_id=key,
+            criterion=text,
+            evidence_tool_call_ids=[],
+            conclusion=(
+                "Worker未提交本项判断或证据；Harness按UNKNOWN保守处理。"
+            ),
+            status="UNKNOWN",
+        )
+        for key, text in contract.items()
+    ]
+
+
 def criterion_claim_repair_feedback(state, error):
     """Give the model the exact frozen IDs and a short model-facing repair shape."""
     contract = worker_registry(state)
     rows = [
-        {"criterion_id": key, "evidence_tool_call_ids": [], "conclusion": "填写该项实际结果"}
+        {"criterion_id": key, "evidence_tool_call_ids": [], "conclusion": "填写该项实际结果", "status": "UNKNOWN"}
         for key in contract
     ]
     return (
         "REPORT_SCHEMA_REJECTED\n"
         f"错误：{error}\n"
-        "必须逐项覆盖冻结验收编号；先填 evidence_tool_call_ids，再填 conclusion。没有证据时保留空列表并如实写未完成，不能省略整张验收表。\n"
+        "必须逐项覆盖冻结验收编号；先填 evidence_tool_call_ids，再填 conclusion 和 status。没有证据时保留空列表并如实写未完成，不能省略整张验收表。\n"
         f"criterion_claims 最小示例：{json.dumps(rows, ensure_ascii=False, separators=(',', ':'))}\n"
         "保留已完成的业务结果，只重新提交报告；不要重新调用业务API。"
     )

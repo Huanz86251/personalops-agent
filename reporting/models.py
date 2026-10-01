@@ -36,6 +36,7 @@ class ReviewTaskContract(BaseModel):
     step_assignment: str
     success_criteria: list[str]
     artifact_outputs: list[StepArtifactOutput] = Field(default_factory=list)
+    user_interactions: list[dict[str, Any]] = Field(default_factory=list)
 
     @computed_field
     @property
@@ -55,6 +56,7 @@ class ReviewAttempt(BaseModel):
     stop_reason: str
     summary: str
     final_conclusion: str
+    answer_text: str | None = None
     criterion_claims: list[WorkerCriterionClaim] = Field(
         default_factory=list,
     )

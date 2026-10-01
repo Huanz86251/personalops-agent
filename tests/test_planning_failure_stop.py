@@ -29,17 +29,28 @@ class Model(fixture.ScriptedCodePlanningModel):
         async def respond(messages):
             self.calls.append(schema.__name__)
             if schema.__name__ == "SkillChoice":
-                return {"parsed": {"skill_ids": [], "reason": "Offline baseline"}}
+                request = json.loads(messages[0]["content"])
+                selected = (
+                    ["plan-task-dependencies"]
+                    if self.mode != "direct" and request.get("role") == "scheduler"
+                    else []
+                )
+                return {"parsed": {"skill_ids": selected, "reason": "Offline baseline",
+                                   "execution_route": "DIRECT" if self.mode == "direct" else "PLAN"}}
             if schema.__name__ == "SupervisorDecision":
                 self.supervisor_calls += 1
                 if self.mode == "timeout":
                     raise TimeoutError("offline timeout")
                 if self.mode == "fail" or (self.mode == "repair" and self.supervisor_calls == 1):
                     return {"parsed": {"action": "INVALID"}, "raw": AIMessage(content='{"action":"INVALID"}')}
-                if self.mode == "final":
-                    return {"parsed": {"action": "FINAL", "final_answer": "Direct answer"}}
             return await original.ainvoke(messages)
         return RunnableLambda(respond)
+
+    async def ainvoke(self, messages, config=None):
+        if self.mode == "direct":
+            self.calls.append("DirectAnswer")
+            return AIMessage(content="Direct answer")
+        raise AssertionError("Plain model invocation is only expected for DIRECT.")
 
 
 class FailureStopTests(unittest.IsolatedAsyncioTestCase):
@@ -66,7 +77,7 @@ class FailureStopTests(unittest.IsolatedAsyncioTestCase):
         result, model, code = await self.run_case("fail")
         self.assertEqual(result["final_status"], "FAILED")
         self.assertEqual(code.calls, 0)
-        self.assertEqual(model.calls, ["ScopeContract"] * 3 + ["SkillChoice"] + ["SupervisorDecision"] * 4)
+        self.assertEqual(model.calls, ["SkillChoice"] + ["ScopeContract"] * 3 + ["SupervisorDecision"] * 4)
         self.assertEqual(result["planning_failure"]["attempts"], 4)
         self.assertEqual(len(result["planning_failure"]["errors"]), 4)
         self.assertEqual(result["overall_stop_reason"], "supervisor_generation_failed")
@@ -77,7 +88,7 @@ class FailureStopTests(unittest.IsolatedAsyncioTestCase):
         result, model, code = await self.run_case("timeout")
         self.assertEqual(result["final_status"], "FAILED")
         self.assertEqual(code.calls, 0)
-        self.assertEqual(model.calls, ["ScopeContract"] * 3 + ["SkillChoice", "SupervisorDecision"])
+        self.assertEqual(model.calls, ["SkillChoice"] + ["ScopeContract"] * 3 + ["SupervisorDecision"])
         self.assertIn("offline timeout", result["final_answer"])
 
     async def test_valid_repair_still_executes_code(self):
@@ -87,7 +98,9 @@ class FailureStopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(code.received_contract)
 
     async def test_valid_direct_answer_is_not_marked_failed(self):
-        result, model, code = await self.run_case("final")
+        result, model, code = await self.run_case("direct")
         self.assertEqual(result["final_status"], "COMPLETED")
         self.assertEqual(code.calls, 0)
         self.assertEqual(result["final_answer"], "Direct answer")
+        self.assertEqual(model.calls, ["SkillChoice", "DirectAnswer"])
+        self.assertEqual(result["overall_stop_reason"], "direct_answer")

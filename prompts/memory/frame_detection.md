@@ -4,5 +4,4 @@
 
 例：输入“阿哈默德是我的导师，他让我三周内写完文档”可返回 person_relation 与 task 两个 frame；“以后叫我小黄”返回 profile；输入“把这句话翻译成中文”返回空 frames。
 
-输出格式（JSON Schema）：
-{{schema}}
+按已注册的 MemoryFramePlan 结构输出。每个输入 candidate_id 都必须出现一次；没有长期价值时保留该 candidate_id 并令 frames=[]。

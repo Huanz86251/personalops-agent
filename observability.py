@@ -400,7 +400,17 @@ def _curated_span_name(name: str) -> str:
         return aliases[name]
     prefix = "step_report.step_"
     if name.startswith(prefix):
-        return "Step Reporter / Step " + name[len(prefix):]
+        suffix = name[len(prefix):]
+        parts = suffix.split(".")
+        label = "Step Reporter / Step " + parts[0]
+        for part in parts[1:]:
+            if part.startswith("attempt_"):
+                label += " / Attempt " + part.removeprefix("attempt_")
+            elif part.startswith("repair_"):
+                repair = part.removeprefix("repair_")
+                if repair != "0":
+                    label += " / Repair " + repair
+        return label
     if name.startswith("model_call.round_"):
         return "Agent / Model Round " + name.removeprefix("model_call.round_")
     if name.startswith("memory."):
@@ -829,21 +839,23 @@ def trace_span(
                 yield span
 
         except BaseException as error:
-            # 记录业务异常，
-            # 但绝对不能吞掉或改变异常类型。
-            span.record_exception(
-                error
-            )
+            # LangGraph uses GraphInterrupt as a resumable control-flow signal.
+            # It must remain visible, but it is an intentional pause rather than
+            # a failed Scheduler node.
+            try:
+                from langgraph.errors import GraphInterrupt
+            except ImportError:
+                GraphInterrupt = ()  # type: ignore[assignment]
 
-            span.set_status(
-                Status(
-                    StatusCode.ERROR,
-
-                    str(
-                        error
-                    ),
-                )
-            )
+            if isinstance(error, GraphInterrupt):
+                span.add_event("Planning graph paused for external input")
+                span.set_attribute("business.status", "PAUSED")
+                span.set_attribute("control_flow.expected_interrupt", True)
+                span.set_status(Status(StatusCode.OK))
+            else:
+                # 记录业务异常，但绝对不能吞掉或改变异常类型。
+                span.record_exception(error)
+                span.set_status(Status(StatusCode.ERROR, str(error)))
 
             raise
 

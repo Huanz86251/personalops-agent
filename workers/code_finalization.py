@@ -68,7 +68,13 @@ class CodeWorkerBudgetMiddleware(DynamicExecutionBudgetMiddleware):
         messages = list(state.get("messages", []))
         last = messages[-1]
         calls = getattr(last, "tool_calls", [])
-        allowed = [c for c in calls if c.get("name") == self.terminal_name(state)][:1]
+        from step_user_question import ASK_USER_NAME
+        ask_calls = [c for c in calls if c.get("name") == ASK_USER_NAME]
+        allowed = (
+            ask_calls[:1]
+            if ask_calls
+            else [c for c in calls if c.get("name") == self.terminal_name(state)][:1]
+        )
         # WorkerProgressMiddleware counts all finalization calls. Schema
         # repairs have their own reserve and must not consume business rounds.
         if state.get("worker_finalize_reason") == "SCHEMA_REPAIR":
@@ -100,11 +106,15 @@ class CodeWorkerProgressMiddleware(WorkerProgressMiddleware):
 
     def _require_control_request(self, request):
         if request.state.get("worker_finalize_requested") and not request.state.get("worker_review_requested"):
+            from step_user_question import ASK_USER_NAME
             name = self.terminal_name(request.state)
-            tools = [t for t in request.tools if self._tool_name(t) == name]
-            if len(tools) != 1:
+            tools = [
+                t for t in request.tools
+                if self._tool_name(t) in {name, ASK_USER_NAME}
+            ]
+            if name not in {self._tool_name(tool) for tool in tools}:
                 raise RuntimeError(f"Code finalization requires {name}")
-            return request.override(tools=tools, tool_choice=name)
+            return request.override(tools=tools, tool_choice="required")
         return super()._require_control_request(request)
 
 

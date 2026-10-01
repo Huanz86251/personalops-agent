@@ -19,7 +19,6 @@ from memory_extraction_models import (
     ProjectRecord,
     TaskRecord,
     TypedRecordBase,
-    compact_schema,
     selected_output_schema,
     validate_typed_records,
 )
@@ -31,7 +30,7 @@ from memory_graph import (
 )
 from memory_lexical import MemoryBM25Index
 from prompt_loader import (
-    render_structured_prompt,
+    load_prompt,
     render_prompt,
 )
 import logging
@@ -262,6 +261,35 @@ def _message_content_to_text(
     return str(
         content
     )
+
+
+async def _invoke_memory_structured(model, messages, schema):
+    """Use provider schema enforcement when verified, otherwise preserve raw JSON."""
+
+    from structured_output_policy import (
+        supports_strict_json_schema,
+        with_provider_structured_output,
+    )
+
+    if not supports_strict_json_schema(model):
+        response = await model.ainvoke(messages)
+        return None, _message_content_to_text(response.content)
+
+    response = await with_provider_structured_output(
+        model,
+        schema,
+        include_raw=True,
+        fallback_method="json_mode",
+    ).ainvoke(messages)
+    if not isinstance(response, dict):
+        return response, ""
+    if response.get("parsing_error") is not None:
+        raise RuntimeError("记忆结构化输出未通过Provider Schema校验。") from response["parsing_error"]
+    raw = response.get("raw")
+    raw_text = _message_content_to_text(getattr(raw, "content", ""))
+    return response.get("parsed"), raw_text
+
+
 def _extract_json_object(
     text: str,
 ) -> str:
@@ -564,17 +592,26 @@ class MemoryResolution(
         str
     ] = Field(
         default_factory=list,
+        max_length=32,
+        description="仅MERGE或SUPERSEDE填写输入中的真实memory_id；其他动作填空列表。",
     )
 
     final_content: (
         str
         | None
-    ) = None
+    ) = Field(
+        default=None,
+        max_length=1000,
+        description="ADD/COEXIST/MERGE/SUPERSEDE的最终记忆正文；IGNORE填null。",
+    )
 
     final_memory_type: (
         MemoryType
         | None
-    ) = None
+    ) = Field(
+        default=None,
+        description="最终类型仅限profile、preference、relationship、task或project；IGNORE填null。",
+    )
     final_valid_from: (
         str
         | None
@@ -2391,13 +2428,14 @@ class MemoryService:
                 for candidate_id, value in batch_values
             ],
         }
-        system_prompt = render_prompt(
-            "memory/frame_detection",
-            schema=json.dumps(
-                compact_schema(MemoryFramePlan.model_json_schema()),
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ),
+        from structured_output_policy import textual_schema_fallback
+        frame_schema_guidance = textual_schema_fallback(
+            self.model,
+            MemoryFramePlan,
+            heading="输出格式（JSON Schema）：",
+        )
+        system_prompt = load_prompt("memory/frame_detection") + (
+            ("\n" + frame_schema_guidance) if frame_schema_guidance else ""
         )
         initial_messages = [
             {"role": "system", "content": system_prompt},
@@ -2407,13 +2445,21 @@ class MemoryService:
             },
         ]
         with trace_span("Memory Extractor / Frame Plan", input_value={"candidate_count": len(batch_values)}) as frame_span:
-            first_response = await self.model.ainvoke(initial_messages)
-            set_span_output(frame_span, {"response": _message_content_to_text(first_response.content)})
-        first_text = _message_content_to_text(first_response.content)
+            parsed_plan, first_text = await _invoke_memory_structured(
+                self.model,
+                initial_messages,
+                MemoryFramePlan,
+            )
+            set_span_output(frame_span, {"response": first_text})
         with trace_span("Memory Extractor / Validate Frame Plan") as validation_span:
             try:
-                first_json = _extract_json_object(first_text)
-                plan = MemoryFramePlan.model_validate_json(first_json)
+                plan = (
+                    parsed_plan
+                    if isinstance(parsed_plan, MemoryFramePlan)
+                    else MemoryFramePlan.model_validate(parsed_plan)
+                    if parsed_plan is not None
+                    else MemoryFramePlan.model_validate_json(_extract_json_object(first_text))
+                )
                 frame_map = self._validate_frame_plan(
                     plan, [candidate_id for candidate_id, _ in batch_values]
                 )
@@ -2426,24 +2472,35 @@ class MemoryService:
             return plan, []
 
         typed_schema = selected_output_schema(selected_types)
-        typed_prompt = render_prompt(
-            "memory/typed_extraction",
-            schema=json.dumps(typed_schema, ensure_ascii=False, separators=(",", ":")),
+        typed_schema_guidance = textual_schema_fallback(
+            self.model,
+            typed_schema,
+            heading="输出格式（JSON Schema）：",
         )
+        typed_prompt = load_prompt("memory/typed_extraction") + (
+            ("\n" + typed_schema_guidance) if typed_schema_guidance else ""
+        )
+        first_exchange_text = first_text or plan.model_dump_json()
         # Preserve the exact first request as the prefix. DeepSeek remains stateless,
         # but this layout makes the repeated prefix eligible for provider caching.
         second_messages = [
             *initial_messages,
-            {"role": "assistant", "content": first_text},
+            {"role": "assistant", "content": first_exchange_text},
             {"role": "user", "content": typed_prompt},
         ]
         with trace_span("Memory Extractor / Typed Fields", input_value={"selected_types": sorted(selected_types)}) as typed_span:
-            second_response = await self.model.ainvoke(second_messages)
-            set_span_output(typed_span, {"response": _message_content_to_text(second_response.content)})
-        second_text = _message_content_to_text(second_response.content)
+            parsed_records, second_text = await _invoke_memory_structured(
+                self.model,
+                second_messages,
+                typed_schema,
+            )
+            set_span_output(typed_span, {"response": second_text})
         try:
-            second_json = _extract_json_object(second_text)
-            raw_payload = json.loads(second_json)
+            raw_payload = (
+                parsed_records
+                if isinstance(parsed_records, dict)
+                else json.loads(_extract_json_object(second_text))
+            )
             records = validate_typed_records(
                 raw_payload, allowed_frame_types=selected_types,
             )
@@ -3541,8 +3598,16 @@ class MemoryService:
             ],
         }
 
-        system_prompt = render_structured_prompt(
-            "memory/resolution", MemoryResolution,
+        from structured_output_policy import textual_schema_fallback
+        resolution_schema_guidance = textual_schema_fallback(
+            self.model,
+            MemoryResolution,
+            heading="输出格式（JSON Schema）：",
+        )
+        system_prompt = load_prompt("memory/resolution") + (
+            ("\n" + resolution_schema_guidance)
+            if resolution_schema_guidance
+            else ""
         )
 
         with trace_span(
@@ -3581,7 +3646,8 @@ class MemoryService:
                 },
         ) as resolver_span:
 
-            response = await self.model.ainvoke(
+            parsed_resolution, response_text = await _invoke_memory_structured(
+                self.model,
                 [
                     {
                         "role": "system",
@@ -3598,13 +3664,8 @@ class MemoryService:
                             ensure_ascii=False,
                         ),
                     },
-                ]
-            )
-
-            response_text = (
-                _message_content_to_text(
-                    response.content
-                )
+                ],
+                MemoryResolution,
             )
 
             json_text: (
@@ -3613,18 +3674,13 @@ class MemoryService:
             ) = None
 
             try:
-                json_text = (
-                    _extract_json_object(
-                        response_text
-                    )
-                )
-
-                resolution = (
-                    MemoryResolution
-                    .model_validate_json(
-                        json_text
-                    )
-                )
+                if isinstance(parsed_resolution, MemoryResolution):
+                    resolution = parsed_resolution
+                elif parsed_resolution is not None:
+                    resolution = MemoryResolution.model_validate(parsed_resolution)
+                else:
+                    json_text = _extract_json_object(response_text)
+                    resolution = MemoryResolution.model_validate_json(json_text)
 
             except (
                     RuntimeError,

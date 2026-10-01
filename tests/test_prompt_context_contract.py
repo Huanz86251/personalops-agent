@@ -145,9 +145,26 @@ class PromptContextContractTests(unittest.IsolatedAsyncioTestCase):
                 "step_id": 1, "status": "FAILED", "summary": "报表已写入但未验收",
                 "stop_reason": "缺少回读", "secret_token": "never-copy-this",
             }],
+            "final_review_decision": {
+                "action": "FINAL",
+                "status": "COMPLETED",
+                "review_reason": "最终审核确认回读已满足。",
+                "criterion_reviews": [{
+                    "criterion_id": "C1",
+                    "status": "MET",
+                    "observed_result": "最终材料包含回读结果。",
+                    "missing_requirement": None,
+                    "evidence_refs": ["E1"],
+                }],
+                "final_answer": "不要复制到内部摘要的用户正文",
+                "unmet_success_criteria": [],
+            },
         })
         self.assertIn("报表已写入但未验收", material)
+        self.assertIn("最终审核确认回读已满足", material)
+        self.assertIn('"status": "MET"', material)
         self.assertNotIn("给用户的原文", material)
+        self.assertNotIn("不要复制到内部摘要的用户正文", material)
         self.assertNotIn("never-copy-this", material)
         context = PlanningContextPack(
             current_time="2026-09-18", user_request="请修复上一轮报表",
@@ -322,6 +339,70 @@ class PromptContextContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("routine", second_messages[3]["content"])
         self.assertNotIn("episode", second_messages[3]["content"])
         self.assertIn("preferred_name", second_messages[3]["content"])
+
+    async def test_verified_memory_model_uses_provider_schema_without_prompt_copy(self):
+        first = {
+            "candidates": [{
+                "candidate_id": "candidate-001",
+                "frames": [{"frame_id": "f1", "frame_type": "profile"}],
+            }],
+        }
+        second = {"records": [{
+            "candidate_id": "candidate-001",
+            "frame_id": "f1",
+            "record_type": "profile",
+            "summary": "用户希望被称为小黄",
+            "importance": "medium",
+            "confidence": "high",
+            "field": "preferred_name",
+            "value": "小黄",
+            "valid_from": None,
+            "valid_to": None,
+        }]}
+
+        class StrictMemoryModel:
+            model_name = "qwen3.8-flash"
+
+            def __init__(self):
+                self.payloads = [first, second]
+                self.requests = []
+                self.options = []
+
+            def with_structured_output(self, schema, **kwargs):
+                self.options.append(kwargs)
+
+                async def invoke(messages):
+                    payload = self.payloads.pop(0)
+                    parsed = schema.model_validate(payload) if hasattr(schema, "model_validate") else payload
+                    self.requests.append(messages)
+                    return {
+                        "parsed": parsed,
+                        "parsing_error": None,
+                        "raw": AIMessage(content=json.dumps(payload, ensure_ascii=False)),
+                    }
+
+                return SimpleNamespace(ainvoke=invoke)
+
+        model = StrictMemoryModel()
+        service = MemoryService(
+            store=SimpleNamespace(),
+            retrieval_models=SimpleNamespace(),
+            model=model,
+            timezone_name="UTC",
+        )
+        plan, records = await service.extract_progressive_batch([(
+            "candidate-001",
+            {
+                "queued_at": "2026-09-23T10:00:00+08:00",
+                "raw_user_text": "以后叫我小黄",
+            },
+        )])
+
+        self.assertEqual(plan.candidates[0].frames[0].frame_type, "profile")
+        self.assertEqual(records[0].summary, "用户希望被称为小黄")
+        self.assertNotIn('"properties"', model.requests[0][0]["content"])
+        self.assertNotIn('"$defs"', model.requests[1][-1]["content"])
+        self.assertTrue(all(item["method"] == "json_schema" for item in model.options))
 
     async def test_typed_extraction_does_not_call_cloud_conflict_resolver(self):
         service = SimpleNamespace(

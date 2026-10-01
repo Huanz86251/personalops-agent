@@ -124,7 +124,6 @@ class BarrierWorker:
                 "messages": [AIMessage(content=f"Completed {worker_id}")],
                 "executor_model_calls_used": 1,
                 "executor_tool_calls_used": 1,
-                "show_all_toolsets_calls_used": 0,
                 "worker_submission": {
                     "submitted_at": "2026-09-03T00:00:00+00:00",
                     "worker_id": worker_id,
@@ -139,6 +138,27 @@ class BarrierWorker:
                         "unresolved_items": [],
                     },
                     "resolved_evidence": [],
+                },
+                "web_step_report": {
+                    "submitted_at": "2026-09-03T00:00:01+00:00",
+                    "worker_id": worker_id,
+                    "report": {
+                        "step_id": 1,
+                        "status": "COMPLETED",
+                        "summary": f"Completed {worker_id}",
+                        "stop_reason": "Parallel branch completed.",
+                        "criterion_results": [{
+                            "criterion_id": "C1",
+                            "criterion": "Return all three findings.",
+                            "status": "MET",
+                            "evidence": [],
+                        }],
+                        "confirmed_results": [f"Finding from {worker_id}"],
+                        "assessment_source": "WEB_SELF_REPORT",
+                    },
+                    "resolved_evidence": [],
+                    "approved_artifact_candidate_ids": [],
+                    "normalization_notes": [],
                 },
             }
         finally:
@@ -212,7 +232,7 @@ class PlanningParallelExecutionTests(unittest.IsolatedAsyncioTestCase):
                     str(record.get("key", "")).startswith("transient:")
                     for record in final_context.scheduler_session["records"]
                 ))
-                self.assertTrue(model.reporter_messages)
+                self.assertFalse(model.reporter_messages)
             finally:
                 await store.close()
 
@@ -311,11 +331,10 @@ class PlanningParallelExecutionTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(result["final_status"], "COMPLETED")
                 self.assertEqual(worker.thread_ids, [])
-                self.assertEqual(len(model.reporter_messages), 1)
-                reporter_prompt = str(model.reporter_messages[0])
+                self.assertEqual(len(model.reporter_messages), 0)
+                report_text = str(result["completed_step_reports"][0])
                 for assignment_key in ("first", "second", "third"):
-                    self.assertIn(assignment_key, reporter_prompt)
-                    self.assertIn(f"Recovered {assignment_key}", reporter_prompt)
+                    self.assertIn(f"Recovered {assignment_key}", report_text)
                 recovered = await store.require_worker_group(group.group_id)
                 self.assertEqual(
                     recovered.snapshot["review_status"],
@@ -367,10 +386,10 @@ class PlanningParallelExecutionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(set(worker.thread_ids)), 3)
                 self.assertEqual(sum(worker.model_limits), 9)
                 self.assertEqual(sum(worker.tool_limits), 9)
-                self.assertEqual(len(model.reporter_messages), 1)
-                reporter_prompt = str(model.reporter_messages[0])
+                self.assertEqual(len(model.reporter_messages), 0)
+                report_text = str(result["completed_step_reports"][0])
                 for assignment_key in ("first", "second", "third"):
-                    self.assertIn(assignment_key, reporter_prompt)
+                    self.assertIn(assignment_key, report_text)
 
                 stored = await store.require_worker_group(
                     "group:event-parallel:step:1:execution:1"

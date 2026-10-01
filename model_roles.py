@@ -9,14 +9,24 @@ from urllib.parse import urlsplit
 
 
 ROLE_DEFAULTS = {
-    "skill_selector": "regular",
+    "skill_selector": "regular", "capability_selector": "regular", "host_file_judge": "regular",
     "general": "regular", "web": "regular", "code": "hard",
-    "code_reviewer": "hard", "reporter": "regular", "web_reporter": "regular",
+    "code_reviewer": "hard", "reporter": "regular",
     "scope_resolver": "hard", "scheduler": "hard", "code_scheduler": "hard", "replanner": "hard",
     "final_reviewer": "hard", "worker_leader": "hard", "title": "regular",
     "summary": "summary", "general_summary": "summary", "web_summary": "summary",
     "code_summary": "summary", "code_reviewer_summary": "summary",
     "extraction": "extraction",
+}
+DEFAULT_NUMERIC_THINKING_BUDGETS = {
+    "web": 500,
+    "reporter": 500,
+    "final_reviewer": 500,
+}
+NON_THINKING_CONTROL_ROLES = {
+    "skill_selector",
+    "capability_selector",
+    "host_file_judge",
 }
 PROVIDER_KEY_ENVS = {
     "openai": "OPENAI_API_KEY", "deepseek": "DEEPSEEK_API_KEY",
@@ -99,12 +109,11 @@ def load_role_models(settings) -> dict[str, RoleModelSettings]:
             url = urlsplit(base_url)
             if url.scheme not in {"http", "https"} or not url.hostname or url.username or url.password or url.query or url.fragment:
                 raise ValueError(f"{prefix}BASE_URL must be an HTTP(S) API base URL without credentials or query")
-        thinking = os.getenv(prefix + "THINKING_ENABLED", str(False if role == "skill_selector" else default_thinking)).strip().lower()
+        thinking = os.getenv(prefix + "THINKING_ENABLED", str(False if role in {"skill_selector", "capability_selector", "host_file_judge"} else default_thinking)).strip().lower()
         if thinking not in {"true", "false"}:
             raise ValueError(f"{prefix}THINKING_ENABLED must be true or false")
         default_effort = (
-            "medium" if role == "scope_resolver" and provider == "qwen" and model.startswith("qwen3.8-")
-            else "low" if provider == "qwen" and model.startswith("qwen3.8-") and thinking == "true"
+            "low" if provider == "qwen" and model.startswith("qwen3.8-") and thinking == "true"
             else ""
         )
         effort = os.getenv(prefix + "REASONING_EFFORT", default_effort).strip() or None
@@ -123,17 +132,39 @@ def load_role_models(settings) -> dict[str, RoleModelSettings]:
         if not isinstance(extra, dict) or set(extra) & {"model", "messages", "stream", "max_tokens", "max_completion_tokens"}:
             raise ValueError(f"{prefix}EXTRA_BODY_JSON cannot override model/messages/stream/token limits")
         is_flash37 = provider == 'qwen' and (model == 'qwen3.7-flash' or model.startswith('qwen3.7-flash-'))
+        supports_numeric_budget = provider == "qwen" and (
+            model.startswith("qwen3.7-") or model.startswith("qwen3.8-")
+        )
         max_output = _integer(
             prefix + "MAX_TOKENS",
             settings.memory_extraction_max_tokens if role == "extraction"
-            else 512 if role == "skill_selector"
+            else 768 if role == "capability_selector"
+            else 512 if role in {"skill_selector", "host_file_judge"}
             else 4096 if role == "scope_resolver"
             else settings.cloud_llm_max_tokens,
             1, 131072,
         )
-        if is_flash37:
-            role_budget = selector_budget if role == 'skill_selector' and flash_budget else flash_budget
-            # Single authoritative switch for all Flash 3.7 roles, including selectors.
+        explicit_budget = os.getenv(prefix + "THINKING_BUDGET", "").strip()
+        if explicit_budget and not supports_numeric_budget:
+            raise ValueError(
+                f"{prefix}THINKING_BUDGET requires a Qwen3.7/Qwen3.8 model"
+            )
+        role_budget = None
+        if supports_numeric_budget:
+            if explicit_budget:
+                role_budget = _integer(prefix + "THINKING_BUDGET", 0, 0, 262144)
+            elif role in NON_THINKING_CONTROL_ROLES:
+                role_budget = 0
+            elif role == "scope_resolver" and model.startswith("qwen3.8-"):
+                # Scope resolution intentionally keeps the coarser medium tier.
+                role_budget = None
+            elif role in DEFAULT_NUMERIC_THINKING_BUDGETS:
+                role_budget = DEFAULT_NUMERIC_THINKING_BUDGETS[role]
+            elif is_flash37:
+                role_budget = flash_budget
+        if role_budget is not None:
+            # Short control-plane classifications stay non-thinking. Numeric
+            # budgets are mutually exclusive with Qwen3.8 reasoning_effort.
             thinking = 'true' if role_budget else 'false'
             effort = None
             for option in ('enable_thinking', 'thinking_budget', 'reasoning_effort'):
@@ -141,9 +172,6 @@ def load_role_models(settings) -> dict[str, RoleModelSettings]:
             extra['enable_thinking'] = bool(role_budget)
             if role_budget:
                 extra['thinking_budget'] = role_budget
-                # Preserve the selector's 512-token answer allowance.
-                if not os.getenv(prefix + 'MAX_TOKENS', '').strip() and role == 'skill_selector':
-                    max_output += role_budget
                 if max_output <= role_budget:
                     raise ValueError(f'{prefix}MAX_TOKENS must exceed thinking_budget to leave room for the answer')
             token_param = 'max_completion_tokens'

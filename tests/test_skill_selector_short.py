@@ -48,4 +48,4 @@ class ReviewerShortTests(unittest.TestCase):
         snap=prepare_skills_sync(model,role='step_reporter',task='AppWorld task review',topics=['appworld'],mode='dynamic')
         self.assertEqual([s.name for s in snap.selected],['review-appworld-results'])
         self.assertIn('原文',skill_prompt(snap))
-        self.assertNotIn('read_review_material(reference=',model.selection_requests[0][0]['content'])
+        self.assertNotIn('read_review_materials(requests=',model.selection_requests[0][0]['content'])

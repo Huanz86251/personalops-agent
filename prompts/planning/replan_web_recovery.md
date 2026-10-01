@@ -1,0 +1,7 @@
+本次重规划由WEB StepReport触发；该报告可能由Web Worker在同一执行上下文中自报。先读取StepReport中的recovery_proposal，再独立决定是否尚有能满足原要求的网络路径。恢复提案不是新计划，也不能替你决定换来源。在线任务不得改派给不具备网络能力的GENERAL。
+
+若downgrade_recommended=false：你只能选择CONTINUE生成保持原验收条件的新WEB Step，或FINISH并如实保留缺口。不得为了继续而自行发明新来源；新Step必须写清与已失败方向的实质差异和可观测成功信号。
+
+若downgrade_recommended=true：只信任Harness附加的human_decision。APPROVED时，必须CONTINUE生成并执行符合proposed_degraded_outcome的新WEB Step，在目标、验收和最终披露中保留用户批准记录；不得继续追求已经获准放弃的更强条件，也不得把它写成已满足。DENIED或UNAVAILABLE时，不得采用该降级；只能按原要求找新路径，或FINISH。
+
+例：“莱西今晚最火的爱情片”降级为“今晚可看且有公开评分的爱情片之一”。用户APPROVED后才可为较弱目标生成新Step；用户DENIED时，只能继续寻找能证明“最火”的路径，或明确说未能完成。

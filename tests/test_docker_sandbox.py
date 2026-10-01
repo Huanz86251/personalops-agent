@@ -8,12 +8,14 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from workers.docker_sandbox import (
     CodeSandboxManager,
     CodeSandboxPair,
     CodeSandboxError,
     CodeSandboxPolicy,
+    DockerCLI,
     DockerSandboxBackend,
     _decode_docker_stream,
 )
@@ -39,9 +41,13 @@ class FakeDockerCLI:
         self.commands: list[list[str]] = []
         self.daemon_checks = 0
         self.inspect_output: bytes | None = None
+        self.closed = False
 
     def ensure_daemon(self) -> None:
         self.daemon_checks += 1
+
+    def close(self) -> None:
+        self.closed = True
 
     def host_path(self, path: Path) -> str:
         return "/host/" + path.name
@@ -189,6 +195,7 @@ class DockerSandboxLifecycleTests(unittest.TestCase):
         handoff_commands = cli.commands[before:]
 
         self.assertEqual(pair.active_role, "REVIEWER")
+        self.assertEqual(cli.daemon_checks, 2)
         self.assertEqual(
             handoff_commands,
             [
@@ -200,6 +207,14 @@ class DockerSandboxLifecycleTests(unittest.TestCase):
         same = manager.handoff(pair, "REVIEWER")
         self.assertEqual(same, pair)
         self.assertEqual(len(cli.commands), before)
+
+    def test_manager_close_releases_owned_cli_resources(self) -> None:
+        cli = FakeDockerCLI()
+        manager = CodeSandboxManager(cli=cli)
+
+        manager.close()
+
+        self.assertTrue(cli.closed)
 
     def test_cleanup_targets_only_owned_pair_resources(self) -> None:
         cli = FakeDockerCLI()
@@ -374,6 +389,27 @@ class DockerSandboxLifecycleTests(unittest.TestCase):
 
 
 class DockerSandboxBackendTests(unittest.TestCase):
+    def test_windows_runtime_lease_is_single_and_explicitly_closed(self) -> None:
+        process = MagicMock()
+        process.poll.return_value = None
+        with (
+            patch(
+                "workers.docker_sandbox.docker_prefix",
+                return_value=["wsl", "-d", "Ubuntu", "--exec", "docker"],
+            ),
+            patch("workers.docker_sandbox.subprocess.Popen", return_value=process) as popen,
+        ):
+            cli = DockerCLI("Ubuntu")
+            cli.run = MagicMock(return_value=completed(["version"]))
+
+            cli.ensure_daemon()
+            cli.ensure_daemon()
+            cli.close()
+
+        popen.assert_called_once()
+        process.terminate.assert_called_once()
+        process.wait.assert_called_once_with(timeout=5)
+
     def test_wsl_utf16_launcher_warning_is_removed_from_stderr(self) -> None:
         warning = "wsl: localhost proxy warning\r\n".encode("utf-16-le")
         payload = warning + b"real container error\n"

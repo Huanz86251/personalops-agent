@@ -17,12 +17,21 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from schema_normalization import (
+    ConciseReportItem,
+    EvidenceRefText,
+    ReportItem,
+    coerce_sequence,
+    coerce_text_sequence,
+    coerce_json_mapping,
+    coerce_declared_sequences,
+    derive_final_status,
+    drop_invalid_auxiliary_fields,
+    normalize_supervisor_decision_payload,
+)
 
 
-SupervisorAction = Literal[
-    "FINAL",
-    "PLAN",
-]
+SupervisorAction = Literal["PLAN"]
 
 
 ReplanAction = Literal[
@@ -125,6 +134,11 @@ class PlanningModel(
         str_strip_whitespace=True,
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_scalar_sequence_fields(cls, value):
+        return coerce_declared_sequences(cls, value)
+
 
 _NULLISH_STRINGS = {
     "", "null", "none", "nil", "false", "n/a", "undefined", "aull",
@@ -142,7 +156,19 @@ def _normalize_optional_value(value: Any) -> Any:
 
 def _normalize_optional_list(value: Any) -> Any:
     normalized = _normalize_optional_value(value)
-    return [] if normalized is None else normalized
+    if normalized is None:
+        return []
+    # PlanningModel's generic scalar-to-sequence normalization may already
+    # have wrapped a provider sentinel such as false/"null" in a one-item
+    # list.  Remove only those explicit nullish sentinels; never guess or
+    # rewrite a substantive item.
+    if isinstance(normalized, (list, tuple, set, frozenset)):
+        return [
+            item
+            for item in normalized
+            if _normalize_optional_value(item) is not None
+        ]
+    return normalized
 
 
 class DialogueMessage(
@@ -318,6 +344,8 @@ class WorkerAssignment(
 
     objective: str = Field(
         min_length=1,
+        max_length=5000,
+        description="并行分支的独立目标，最多5000字符。",
     )
 
 
@@ -336,7 +364,7 @@ class StepArtifactOutput(PlanningModel):
     )
     description: str = Field(min_length=1, max_length=600)
     disposition: ArtifactDisposition = Field(default="INTERNAL_HANDOFF", description="INTERNAL_HANDOFF is runtime-managed internal evidence: target_path must be null. USER_DELIVERABLE is a user file: target_path must be a safe relative path.")
-    target_path: str | None = Field(default=None, description="Must be null for INTERNAL_HANDOFF. Required for USER_DELIVERABLE: non-empty relative file path, no absolute path or '..' components.")
+    target_path: str | None = Field(default=None, max_length=1200, description="Must be null for INTERNAL_HANDOFF. Required for USER_DELIVERABLE: non-empty relative file path, no absolute path or '..' components.")
     required: bool = True
 
     @model_validator(mode="after")
@@ -383,6 +411,8 @@ class CodeRequirement(
 
     statement: str = Field(
         min_length=1,
+        max_length=2000,
+        description="单条可核验代码要求，最多2000字符。",
     )
 
 
@@ -407,6 +437,8 @@ class CodeInterfaceRequirement(
 
     description: str = Field(
         min_length=1,
+        max_length=2000,
+        description="接口的可观察合同，最多2000字符。",
     )
 
     details: dict[
@@ -444,21 +476,21 @@ class CodeTaskContract(
     )
 
     validation_expectations: list[
-        str
+        ConciseReportItem
     ] = Field(
         default_factory=list,
         max_length=20,
     )
 
     implementation_guidance: list[
-        str
+        ConciseReportItem
     ] = Field(
         default_factory=list,
         max_length=20,
     )
 
     non_goals: list[
-        str
+        ConciseReportItem
     ] = Field(
         default_factory=list,
         max_length=12,
@@ -739,7 +771,10 @@ class TargetSetSpec(PlanningModel):
     result_entity: str = Field(
         min_length=1,
         max_length=80,
-        description="读取并展开该条件后参与集合运算的对象类型；参与同一运算的集合必须一致。",
+        description=(
+            "必填在每个sets项内：读取并展开该条件后参与集合运算的对象类型；"
+            "必须与target_entity一致，不要在target_selection顶层重复填写result_entity。"
+        ),
     )
 
 
@@ -749,7 +784,10 @@ class TargetSelection(PlanningModel):
     target_entity: str = Field(
         min_length=1,
         max_length=80,
-        description="最终允许读取，以及在MUTATION时允许修改和验收的对象类型。",
+        description=(
+            "最终允许读取，以及在MUTATION时允许修改和验收的对象类型。"
+            "target_selection顶层没有result_entity字段；result_entity只填写在每个sets项内。"
+        ),
     )
     effect_mode: EffectMode = Field(
         default="MUTATION",
@@ -890,14 +928,16 @@ class PlanStep(
 
     objective: str = Field(
         min_length=1,
-        description="当前步骤目标，保留与该步骤有关的原请求范围、筛选条件及例外，不扩大对象集合。",
+        max_length=6000,
+        description="当前步骤目标，最多6000字符；保留原请求范围、筛选条件及例外，不扩大对象集合。",
     )
 
     success_criteria: list[
-        str
+        ReportItem
     ] = Field(
         min_length=1,
-        description="可核验条件，包含该步骤的对象范围及用户要求保留不变的内容。",
+        max_length=24,
+        description="最多24条可核验条件，每条最多2000字符；保留对象范围及原要求。",
     )
 
     tool_access: ToolAccessMode = Field(
@@ -931,7 +971,7 @@ class PlanStep(
     execution_guidance: (
         str
         | None
-    ) = None
+    ) = Field(default=None, max_length=4000)
 
     api_suggestion: "SchedulerApiSuggestion | None" = Field(
         default=None,
@@ -943,6 +983,18 @@ class PlanStep(
         ),
     )
 
+    requires_host_file_access: bool = Field(
+        default=False,
+        description=(
+            "当前Step是否需要浏览、搜索、读取、导入或发送用户电脑上的既有文件。"
+            "Worker拥有隔离工作区，但默认不能访问主机目录；用户提到本机、电脑、"
+            "Downloads、Desktop、Documents或要求把本机文件发回时填true。"
+            "普通附件、Worker工作区文件、网络下载和AppWorld任务填false。"
+            "这里只声明需求，不指定路径、工具或授权结果；精确路径与理由由Worker提出，"
+            "Harness再独立审批。"
+        ),
+    )
+
     target_selection: TargetSelection | None = Field(
         default=None,
         description="复杂范围任务的结构化对象集合合同。出现同时、其中、或、排除、only/all/except等组合条件时填写；简单单集合任务可为null。不得写未经确认的API名。",
@@ -950,10 +1002,18 @@ class PlanStep(
 
     # The whole Step uses one Worker capability class. SINGLE may select any
     # available kind; V1 PARALLEL is deliberately limited to WEB.
-    worker_kind: WorkerKind = Field(default="GENERAL", description="CODE requires code_task and artifact_outputs=[]; WEB/GENERAL require code_task=null and may declare artifact_outputs.")
+    worker_kind: WorkerKind = Field(
+        default="GENERAL",
+        description=(
+            "WEB is required for public internet search, public static information, changing/current information, webpages, and online source verification. "
+            "GENERAL has no web_search or browser capability and must not be used as an internet fallback; it handles given context, local documents, configured business tools, and simple app operations. "
+            "CODE implements or executes code and local-file transformations and is offline by default. "
+            "CODE requires code_task and artifact_outputs=[]; WEB/GENERAL require code_task=null and may declare artifact_outputs."
+        ),
+    )
     skill_topics: list[str] = Field(
         default_factory=list, max_length=3,
-        description="Optional method topics: documents, research, implementation, verification, appworld. These do not grant tools or change acceptance criteria.",
+        description="Optional method topics, e.g. documents, research, cinema, movie-reviews, implementation, verification, appworld. These do not grant tools or change acceptance criteria.",
     )
 
     # CODE Step的Scheduler契约。它会原样交给Code Worker和Reviewer，
@@ -984,6 +1044,10 @@ class PlanStep(
     ] = Field(
         default_factory=list,
         max_length=3,
+        description=(
+            "仅PARALLEL填写2到3个独立分支；SINGLE必须省略或填[]，"
+            "SINGLE直接执行Step objective。"
+        ),
     )
 
     # V1 intentionally supports one deterministic barrier: every Worker slot
@@ -1066,34 +1130,55 @@ class PlanStep(
 class SupervisorDecision(
     PlanningModel
 ):
-    """初始Hard Supervisor的决定。"""
+    """初始Hard Supervisor只负责生成执行计划。
 
-    action: SupervisorAction
+    简单稳定问题是否直接回答，已经由上游Skill/Scale Selector决定；
+    进入本Schema就意味着必须规划，不能再次选择直接答复。
+    """
 
-    # FINAL时使用。
-    final_answer: (
-        str
-        | None
-    ) = None
+    action: SupervisorAction = Field(
+        default="PLAN",
+        description="固定为PLAN；简单直接回答已由上游分流，本节点只生成可执行计划。",
+    )
 
-    # PLAN时使用。
     plan_objective: (
         str
         | None
-    ) = Field(default=None, description="PLAN的完整目标：保留用户原请求的对象范围、筛选条件、条件间关系与例外，不扩大操作范围。")
+    ) = Field(default=None, max_length=8000, description="PLAN的完整目标，最多8000字符：保留用户原请求的对象范围、筛选条件、条件间关系与例外，不扩大操作范围。")
 
     plan_success_criteria: list[
-        str
+        ReportItem
     ] = Field(
         default_factory=list,
-        description="逐项覆盖原请求的范围、筛选条件及例外；按原关系组合条件，不只验证动作已执行。",
+        max_length=24,
+        description="最多24项、每项最多2000字符；逐项覆盖原请求范围、筛选条件及例外。",
     )
 
     steps: list[
         PlanStep
     ] = Field(
         default_factory=list,
+        max_length=24,
+        description=(
+            "一到24个可验收Step；同一角色、同一对象、连续依赖的动作应合并，"
+            "只有角色切换、独立交付、并行汇合或上下文隔离时才拆分。"
+        ),
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_deterministic_plan_shape(cls, value):
+        return normalize_supervisor_decision_payload(value)
+
+    @field_validator("plan_success_criteria", mode="before")
+    @classmethod
+    def normalize_plan_criteria(cls, value):
+        return coerce_text_sequence(value)
+
+    @field_validator("steps", mode="before")
+    @classmethod
+    def normalize_steps(cls, value):
+        return coerce_sequence(value)
 
     @model_validator(
         mode="after",
@@ -1101,29 +1186,7 @@ class SupervisorDecision(
     def validate_action_fields(
         self,
     ) -> "SupervisorDecision":
-        """检查FINAL和PLAN的字段组合。"""
-
-        if self.action == "FINAL":
-            if not self.final_answer:
-                raise ValueError(
-                    "FINAL必须提供final_answer。"
-                )
-
-            if (
-                self.plan_objective
-                or self.plan_success_criteria
-                or self.steps
-            ):
-                raise ValueError(
-                    "FINAL不能同时提供Plan字段。"
-                )
-
-            return self
-
-        if self.final_answer:
-            raise ValueError(
-                "PLAN不能提供final_answer。"
-            )
+        """检查计划字段完整性。"""
 
         if not self.plan_objective:
             raise ValueError(
@@ -1153,16 +1216,24 @@ class StepCriterionResult(
 
     criterion: str = Field(
         min_length=1,
+        max_length=4000,
+        description="冻结验收标准原文，最多4000字符。",
     )
 
     evidence: list[
-        str
+        EvidenceRefText
     ] = Field(
         default_factory=list,
-        description="先列出支持或限制本项判断的短证据编号与观测，再填写status。",
+        max_length=24,
+        description="先列出支持或限制本项判断的短证据编号，最多24个，再填写status。",
     )
 
     status: CriterionStatus
+
+    @field_validator("evidence", mode="before")
+    @classmethod
+    def normalize_evidence(cls, value):
+        return coerce_text_sequence(value)
 
 
 class StepArtifactReport(
@@ -1172,11 +1243,22 @@ class StepArtifactReport(
 
     path: str = Field(
         min_length=1,
+        max_length=1200,
     )
 
     description: str = Field(
         min_length=1,
+        max_length=2000,
+        description="产物用途和内容摘要，最多2000字符。",
     )
+
+
+class StepSourceLink(PlanningModel):
+    """Harness-resolved public source bound to one concrete evidence ref."""
+
+    evidence_ref: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    href: str = Field(min_length=1)
 
 
 class WorkerContribution(
@@ -1186,17 +1268,19 @@ class WorkerContribution(
 
     worker_id: str = Field(
         min_length=1,
+        max_length=160,
     )
 
     contribution: str = Field(
         min_length=1,
+        max_length=4000,
     )
 
 
 class StepReport(
     PlanningModel
 ):
-    """Simple Step Reporter生成的压缩报告。"""
+    """Role-specific Step closure report consumed by Scheduler and Final Reviewer."""
 
     handoff_apis: ApiHandoffList = api_field()
     handoff_api_receipts: SkipJsonSchema[list[ApiHandoffReceipt]] = Field(
@@ -1204,6 +1288,20 @@ class StepReport(
         description="Harness-authored per-API validation receipts, including rejected leads and reasons.",
     )
     handoff_knowledge: SkipJsonSchema[list[HandoffKnowledge]] = Field(default_factory=list, description="Worker-authored reusable knowledge preserved by the Harness; not a separate verification verdict.")
+    recovery_proposal: SkipJsonSchema[dict[str, Any] | None] = Field(
+        default=None,
+        description=(
+            "Structured recovery proposal. It may come from an independent Reviewer "
+            "or, for WEB, from the Web Worker's same-context self-report. It only "
+            "advises the Scheduler and never rewrites the frozen Step by itself."
+        ),
+    )
+    source_links: SkipJsonSchema[list[StepSourceLink]] = Field(
+        default_factory=list,
+        description=(
+            "Harness从已解析Web证据生成的公开链接；Reporter不填写。"
+        ),
+    )
 
 
     step_id: int = Field(
@@ -1212,11 +1310,20 @@ class StepReport(
 
     summary: str = Field(
         min_length=1,
-        description="先概括实际完成与未完成情况，再填写整体status。",
+        max_length=8000,
+        description="完整概括实际完成、事实与缺口，最多8000字符；整体status由Harness派生。",
+    )
+    answer_text: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=32000,
+        description="请填null；Harness会用当前Worker提交的完整文字草稿覆盖此字段。它不是独立验收结论，也不代表已发送给用户。",
     )
 
     stop_reason: str = Field(
         min_length=1,
+        max_length=4000,
+        description="本Step停止原因，最多4000字符。",
     )
 
     status: StepStatus
@@ -1225,7 +1332,13 @@ class StepReport(
         StepCriterionResult
     ] = Field(
         default_factory=list,
+        max_length=24,
     )
+
+    @field_validator("criterion_results", mode="before")
+    @classmethod
+    def normalize_criterion_results_container(cls, value):
+        return coerce_sequence(value)
 
     @field_validator("criterion_results")
     @classmethod
@@ -1235,27 +1348,37 @@ class StepReport(
                 for i, item in enumerate(values, 1)]
 
     confirmed_results: list[
-        str
+        ReportItem
     ] = Field(
         default_factory=list,
+        max_length=24,
+        description="最多24项，每项最多2000字符；保留最终答复需要的事实和限定。",
     )
 
-    assessment_source: Literal["INDEPENDENT_REVIEW", "GENERAL_SELF_REPORT", "RUNTIME_FAILURE"] = "INDEPENDENT_REVIEW"
+    assessment_source: Literal[
+        "INDEPENDENT_REVIEW",
+        "GENERAL_SELF_REPORT",
+        "WEB_SELF_REPORT",
+        "RUNTIME_FAILURE",
+    ] = "INDEPENDENT_REVIEW"
 
     completed_work: list[
-        str
+        ConciseReportItem
     ] = Field(
         default_factory=list,
+        max_length=24,
+        description="最多24项，每项最多1200字符；写动作及其真实结果。",
     )
 
     artifacts: list[
         StepArtifactReport
     ] = Field(
         default_factory=list,
+        max_length=24,
     )
 
-    # Generic Reporter selects immutable candidate references. The Harness
-    # Publisher, not the model, converts these into shared handoff paths.
+    # The closing role selects immutable candidate references. The Harness
+    # Publisher, not any model, converts these into shared handoff paths.
     approved_artifact_refs: list[str] = Field(
         default_factory=list,
         max_length=12,
@@ -1275,24 +1398,31 @@ class StepReport(
         WorkerContribution
     ] = Field(
         default_factory=list,
+        max_length=24,
     )
 
     evidence: list[
-        str
+        EvidenceRefText
     ] = Field(
         default_factory=list,
+        max_length=48,
+        description="最多48个已登记证据编号。",
     )
 
     errors: list[
-        str
+        ReportItem
     ] = Field(
         default_factory=list,
+        max_length=24,
+        description="最多24项，每项最多2000字符；只记录真实错误与影响。",
     )
 
     unresolved_items: list[
-        str
+        ReportItem
     ] = Field(
         default_factory=list,
+        max_length=24,
+        description="最多24项，每项最多2000字符；保留未完成要求与必要下一步。",
     )
 
     # Reporter只能建议Replan，
@@ -1302,6 +1432,7 @@ class StepReport(
         | None
     ) = Field(
         default=None,
+        max_length=4000,
         description="先说明原计划哪项前提失效及已有依据，再填写request_replan。无需重规划时填null。",
     )
 
@@ -1310,7 +1441,35 @@ class StepReport(
     next_action: (
         str
         | None
-    ) = None
+    ) = Field(default=None, max_length=4000)
+
+    @model_validator(mode="before")
+    @classmethod
+    def omit_invalid_auxiliary_fields(cls, value):
+        return drop_invalid_auxiliary_fields(
+            cls,
+            value,
+            (
+                "completed_work",
+                "worker_contributions",
+                "evidence",
+                "errors",
+                "next_action",
+            ),
+        )
+
+    @field_validator(
+        "confirmed_results", "completed_work", "approved_artifact_refs",
+        "evidence", "errors", "unresolved_items", mode="before",
+    )
+    @classmethod
+    def normalize_text_containers(cls, value):
+        return coerce_text_sequence(value)
+
+    @field_validator("artifacts", "worker_contributions", mode="before")
+    @classmethod
+    def normalize_object_containers(cls, value):
+        return coerce_sequence(value)
 
     @model_validator(
         mode="after",
@@ -1356,18 +1515,28 @@ class ReplanDecision(
 
     reason: str = Field(
         min_length=1,
+        max_length=8000,
         description=(
             "先说明已有事实、剩余问题和选择该动作的依据；对照用户原话，"
             "指出Scope或旧计划中需要纠正的可疑解释（若有）。"
-            "只可修正解释，不得放宽原始范围、阈值或禁止事项；"
+            "默认只可修正解释，不得放宽原始范围、阈值或禁止事项。"
+            "若审核报告带有结构化recovery_proposal，只能根据Harness附加的"
+            "human_decision处理降级：APPROVED时必须采用并执行该精确方案；DENIED或"
+            "UNAVAILABLE都不得采用或换一种说法重提。不能把降级冒充完全满足。"
             "无法满足时明确写出未满足项，再填写action。"
         ),
     )
 
-    action: ReplanAction
+    action: ReplanAction = Field(
+        description=(
+            "CONTINUE提交新的remaining_steps；RETURN_TO_WORKER仅驳回计划异议并填写"
+            "worker_instruction；FINISH停止继续安排。"
+        ),
+    )
 
     worker_instruction: str | None = Field(
         default=None,
+        max_length=5000,
         description=(
             "仅RETURN_TO_WORKER填写：说明为什么驳回本次计划异议，以及原Worker"
             "继续执行时必须保留的范围边界。不猜API。"
@@ -1378,13 +1547,23 @@ class ReplanDecision(
         PlanStep
     ] = Field(
         default_factory=list,
+        max_length=24,
         description=(
             "CONTINUE时填写后续Step：可纠正Scope或旧Step误加的条件、调整执行路径，"
             "但每个Step的目标与验收必须保留用户原话的对象、范围、时间或数量门槛、"
-            "排除项和禁止事项；不能以较弱的近似结果替代。"
+            "排除项和禁止事项。只有审核报告提供结构化recovery_proposal、"
+            "human_decision.status为APPROVED时，必须CONTINUE并生成与批准内容"
+            "完全一致、带明确披露的降级Step；DENIED或UNAVAILABLE时"
+            "必须维持原合同。原始未满足项仍保留到最终验收，不能以较弱近似结果"
+            "冒充完全满足。"
             "RETURN_TO_WORKER或FINISH时留空。"
         ),
     )
+
+    @field_validator("remaining_steps", mode="before")
+    @classmethod
+    def normalize_remaining_steps(cls, value):
+        return coerce_sequence(value)
 
     @model_validator(
         mode="after",
@@ -1426,16 +1605,29 @@ class FinalCriterionReview(PlanningModel):
     """Final Reviewer对一条冻结验收标准的证据判断。"""
 
     criterion_id: str = Field(min_length=1)
-    evidence_refs: list[str] = Field(default_factory=list)
+    evidence_refs: list[EvidenceRefText] = Field(
+        default_factory=list,
+        max_length=48,
+        description="最多48个Harness登记的证据编号。",
+    )
     observed_result: str = Field(
         min_length=1,
-        description="先写实际看到的结果；没有证据时明确写未观察到。",
+        max_length=4000,
+        description="先写实际看到的结果，最多4000字符；没有证据时明确写未观察到。",
     )
     missing_requirement: str | None = Field(
         default=None,
+        max_length=3000,
         description="仍缺少的要求；已满足时填null。不能在这里猜修复方法或API。",
     )
-    status: CriterionStatus
+    status: CriterionStatus = Field(
+        description="仅按当前证据选择MET、PARTIAL、NOT_MET或UNKNOWN；证据不足不得填MET。",
+    )
+
+    @field_validator("evidence_refs", mode="before")
+    @classmethod
+    def normalize_evidence_refs(cls, value):
+        return coerce_text_sequence(value)
 
 
 class FinalWorkerRepairRequest(PlanningModel):
@@ -1443,16 +1635,23 @@ class FinalWorkerRepairRequest(PlanningModel):
 
     step_id: int = Field(ge=1)
     worker_kind: WorkerKind
-    failed_criterion_ids: list[str] = Field(min_length=1)
-    evidence_refs: list[str] = Field(default_factory=list)
+    failed_criterion_ids: list[EvidenceRefText] = Field(min_length=1, max_length=24)
+    evidence_refs: list[EvidenceRefText] = Field(default_factory=list, max_length=48)
     observed_problem: str = Field(
         min_length=1,
+        max_length=4000,
         description="说明已经观察到的缺口或矛盾，不提供API猜测或执行步骤。",
     )
     missing_requirement: str = Field(
         min_length=1,
+        max_length=4000,
         description="说明验收还缺什么可观察结果，不提供直接操作建议。",
     )
+
+    @field_validator("failed_criterion_ids", "evidence_refs", mode="before")
+    @classmethod
+    def normalize_reference_lists(cls, value):
+        return coerce_text_sequence(value)
 
 
 class FinalReviewDecision(
@@ -1476,12 +1675,19 @@ class FinalReviewDecision(
     review_reason: str = Field(
         default="依据当前可见证据完成最终审核。",
         min_length=1,
-        description="先概括原始要求、已确认事实和主要缺口，再填写任何决定。",
+        max_length=8000,
+        description="先概括原始要求、已确认事实和主要缺口，最多8000字符，再填写决定。",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def omit_invalid_auxiliary_fields(cls, value):
+        return drop_invalid_auxiliary_fields(cls, value, ("review_reason",))
 
     criterion_reviews: list[FinalCriterionReview] = Field(
         default_factory=list,
-        description="逐项写证据、观测、缺口和状态；证据不足不能补猜。",
+        max_length=24,
+        description="逐项写证据、观测、缺口和状态，最多24项；证据不足不能补猜。",
     )
 
     repair_request: FinalWorkerRepairRequest | None = Field(
@@ -1493,27 +1699,43 @@ class FinalReviewDecision(
     replan_reason: (
         str
         | None
-    ) = Field(default=None, description="先填写判断依据：REPLAN写已有进展、剩余阻塞和可执行补救；FINAL填null。仅replan_available=true可选REPLAN。")
+    ) = Field(default=None, max_length=6000, description="先填写判断依据，最多6000字符：REPLAN写已有进展、剩余阻塞和可执行补救；FINAL填null。仅replan_available=true可选REPLAN。")
 
     action: FinalReviewAction = Field(description="完成证据判断后，只选FINAL、RETURN_TO_WORKER或REPLAN；此阶段不输出PLAN或steps。")
 
     # FINAL时使用。
-    status: (
+    status: SkipJsonSchema[
         FinalReviewStatus
         | None
-    ) = Field(default=None, description="FINAL必填完成状态；REPLAN必须省略或为null。")
+    ] = Field(default=None, description="Harness根据criterion_reviews派生；模型不要填写。")
 
     final_answer: (
         str
         | None
-    ) = Field(default=None, description="FINAL必填用户答复；REPLAN必须省略或为null。")
+    ) = Field(default=None, min_length=1, max_length=48000, description="FINAL必填可直接发送给用户的完整答复，最多48000字符；REPLAN填null。")
 
     unmet_success_criteria: list[
-        str
+        ReportItem
     ] = Field(
         default_factory=list,
-        description="仅FINAL列出未满足条件；REPLAN必须省略或为[]，未完成项写入replan_reason。",
+        max_length=24,
+        description="仅FINAL列出未满足条件，最多24项、每项最多2000字符；REPLAN填[]。",
     )
+
+    @field_validator("criterion_reviews", mode="before")
+    @classmethod
+    def normalize_criterion_reviews(cls, value):
+        return coerce_sequence(value)
+
+    @field_validator("repair_request", mode="before")
+    @classmethod
+    def normalize_repair_request(cls, value):
+        return coerce_json_mapping(value)
+
+    @field_validator("unmet_success_criteria", mode="before")
+    @classmethod
+    def normalize_unmet_success_criteria(cls, value):
+        return coerce_text_sequence(value)
 
     @model_validator(
         mode="after",
@@ -1524,9 +1746,13 @@ class FinalReviewDecision(
         """检查FINAL和REPLAN的字段组合。"""
 
         if self.action == "FINAL":
-            if self.status is None:
-                raise ValueError(
-                    "FINAL必须提供status。"
+            if self.criterion_reviews:
+                self.status = derive_final_status(
+                    item.status for item in self.criterion_reviews
+                )
+            elif self.status is None:
+                self.status = (
+                    "PARTIAL" if self.unmet_success_criteria else "COMPLETED"
                 )
 
             if not self.final_answer:

@@ -5,6 +5,7 @@ metadata:
   roles: "code"
   topics: "implementation"
   required-tools: "read_file execute"
+  required-toolsets: "SOFTWARE_DEVELOPMENT"
   exclusive: "true"
 ---
 

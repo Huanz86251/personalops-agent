@@ -68,7 +68,9 @@ class MusicPipelineModel:
         async def respond(messages):
             prompt = str(messages)
             if schema.__name__ == "SkillChoice":
-                return {"parsed": schema.model_validate({"skill_ids": [], "reason": "Offline fixture"}), "raw": None, "parsing_error": None}
+                request = json.loads(messages[0]["content"])
+                selected = ["plan-task-dependencies"] if request.get("role") == "scheduler" else []
+                return {"parsed": schema.model_validate({"skill_ids": selected, "reason": "Offline fixture"}), "raw": None, "parsing_error": None}
             if schema.__name__ == "SupervisorDecision":
                 payload = {
                     "action": "PLAN",
@@ -277,11 +279,48 @@ class ParallelWebRuntime:
                         "sha256": hashlib.sha256(payload).hexdigest(),
                     }
                 )
+            confirmed = {
+                "modern": "Modern direction: modular electronic-music cards.",
+                "classical": "Classical direction: repertoire and teacher profiles.",
+                "accessible": "Accessible direction: clear beginner pathways.",
+            }[direction]
+            web_report = {
+                "submitted_at": "2026-09-04T00:00:01+00:00",
+                "worker_id": worker_id,
+                "report": {
+                    "step_id": 1,
+                    "status": "COMPLETED",
+                    "summary": f"Completed the {direction} research branch.",
+                    "stop_reason": "Branch evidence was collected.",
+                    "criterion_results": [{
+                        "criterion_id": "C1",
+                        "criterion": WEB_CRITERION,
+                        "status": "MET",
+                        "evidence": [call_id],
+                    }],
+                    "confirmed_results": [confirmed],
+                    "assessment_source": "WEB_SELF_REPORT",
+                    "completed_work": [f"Researched {direction}."],
+                    "evidence": [call_id],
+                },
+                "resolved_evidence": [{
+                    "tool_call_id": call_id,
+                    "tool_name": "web_search",
+                    "arguments": {"query": f"{direction} music course"},
+                    "result": json.dumps(
+                        {"title": direction, "href": url}
+                    ),
+                    "result_chars": 120,
+                }],
+                "approved_artifact_candidate_ids": (
+                    ["laixi-design-reference"] if direction == "modern" else []
+                ),
+                "normalization_notes": [],
+            }
             return {
                 "messages": [AIMessage(content=f"Found {url}")],
                 "executor_model_calls_used": 1,
                 "executor_tool_calls_used": 1,
-                "show_all_toolsets_calls_used": 0,
                 "worker_submission": {
                     "submitted_at": "2026-09-04T00:00:00+00:00",
                     "worker_id": worker_id,
@@ -314,6 +353,7 @@ class ParallelWebRuntime:
                     ],
                     "resolved_artifacts": resolved_artifacts,
                 },
+                "web_step_report": web_report,
             }
         finally:
             self.active -= 1
@@ -389,7 +429,6 @@ class ResearchAwareCodeRuntime:
             "messages": [AIMessage(content=report.summary)],
             "executor_model_calls_used": 3,
             "executor_tool_calls_used": 4,
-            "show_all_toolsets_calls_used": 0,
             "code_review_loop": loop.model_dump(mode="json"),
             "code_review_report": report.model_dump(mode="json"),
         }
@@ -449,7 +488,7 @@ class WebToCodePipelineTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(result["final_status"], "COMPLETED")
                 self.assertEqual(web_runtime.max_active, 3)
-                self.assertEqual(model.reporter_calls, 1)
+                self.assertEqual(model.reporter_calls, 0)
                 self.assertEqual(len(result["handoff_publication_receipts"]), 1)
                 self.assertEqual(
                     result["handoff_publication_receipts"][0]["output_id"],

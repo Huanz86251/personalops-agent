@@ -10,7 +10,7 @@ from reporting.general_gate import general_review_reasons
 from reporting.models import ReviewAttempt
 from workers.code_review_models import CodeCandidateRef, CodeReviewReport
 from workers.plan_challenge import PlanChallenge
-from workers.submission import WorkerSubmission, submit_for_review
+from workers.submission import WorkerSubmission, complete_web_step
 
 
 def _challenge() -> PlanChallenge:
@@ -108,7 +108,7 @@ def test_exhausted_challenge_budget_is_rejected_before_review():
         state={"worker_plan_challenges_remaining": 0},
         tool_call_id="submit-1",
     )
-    command = submit_for_review.func(submission, runtime)
+    command = complete_web_step.func(submission, runtime)
     assert "budget is exhausted" in command.update["messages"][0].content
 
 
@@ -116,7 +116,12 @@ def test_worker_and_reviewer_prompts_explain_the_bounded_route():
     worker_prompt = load_prompt("workers/general_worker")
     reporter_prompt = load_prompt("reporters/step_report")
     scheduler_prompt = load_prompt("planning/scheduler")
+    scope_contract_prompt = load_prompt("planning/scheduler_scope_contract")
     assert "不要轻易提出异议" in worker_prompt
     assert "ReviewAttempt含plan_challenge" in reporter_prompt
-    assert "ScopeContract" in scheduler_prompt
+    # Scope rules are a conditional prompt block. Simple CONTINUE requests
+    # must not pay for or be biased by a contract that does not exist.
+    assert "ScopeContract" not in scheduler_prompt
+    assert "ScopeContract" in scope_contract_prompt
+    assert "execution_guidance" in scope_contract_prompt
     assert "execution_guidance" in scheduler_prompt

@@ -1,0 +1,5 @@
+当前StepReport包含用户明确批准的降级合同。这个批准不是可选建议：你必须选择CONTINUE并立即生成执行该批准结果的新Step；不得选择FINISH、继续追求已经被批准放弃的更强条件，或再次询问同一降级。
+
+把recovery_proposal.proposed_degraded_outcome逐字复制到第一个新Step的objective或success_criteria中，把user_visible_disclosure逐字复制到该Step的success_criteria或execution_guidance中。新Step只能执行获批的精确较弱范围，不得再次扩大、缩小或换一种说法改变它。保留preserved_results，避免重复已验证工作；仍需正常执行和验收，用户批准不等于Worker已经完成。
+
+例：原合同要求PDF+HTML，用户批准“只交付PDF，HTML明确未交付”。你必须创建执行并验收PDF交付的新Step，同时保留“HTML明确未交付”的披露；不能继续要求HTML，也不能因为PDF曾经生成过就跳过新合同下的验收。

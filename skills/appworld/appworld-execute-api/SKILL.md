@@ -5,6 +5,7 @@ metadata:
   roles: "general"
   topics: "appworld"
   required-tools: "appworld_discover appworld_execute"
+  required-toolsets: "APPWORLD"
 ---
 
 # 模拟应用执行策略

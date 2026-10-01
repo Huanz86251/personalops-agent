@@ -1,9 +1,9 @@
-"""Owner-bound file export requests. Models cannot approve or choose recipients.
+"""Owner-bound file export requests. Models cannot choose recipients.
 
 No network or filesystem work at import time. An authenticated ingress creates
-the event scope; the General runtime only proposes a local snapshot. Only a
-separate owner command can upload it. SENDING is deliberately not retryable:
-after an ambiguous response we prefer a missed delivery to a duplicate export.
+the event scope; General can directly send a file from the configured outbox.
+SENDING is deliberately not retryable: after an ambiguous response we prefer
+a missed delivery to a duplicate export.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from uuid import uuid4
 
 from feishu_attachments import safe_name
 
-UPLOAD_LIMIT = 30_000_000  # Conservative decimal MB, IM file upload endpoint.
+PLATFORM_UPLOAD_LIMIT = 30_000_000  # Conservative decimal MB, IM file upload endpoint.
 SOURCE_LIMIT = 100_000_000
 MAX_FILES = 100
 TTL_SECONDS = 15 * 60
@@ -52,11 +52,23 @@ class ExportPolicy:
     owners: frozenset[str] = frozenset()
     chats: frozenset[str] = frozenset()
     roots: tuple[Path, ...] = ()
+    max_upload_bytes: int = PLATFORM_UPLOAD_LIMIT
 
     def __post_init__(self):
         object.__setattr__(
             self, "roots", tuple(Path(root).resolve() for root in self.roots)
         )
+        if (
+            not isinstance(self.max_upload_bytes, int)
+            or isinstance(self.max_upload_bytes, bool)
+            or self.max_upload_bytes <= 0
+        ):
+            raise ValueError("文件发送上限必须大于 0 字节。")
+
+    @property
+    def effective_upload_limit(self):
+        # A local setting may be stricter, but cannot raise Feishu's API cap.
+        return min(self.max_upload_bytes, PLATFORM_UPLOAD_LIMIT)
 
     @classmethod
     def from_env(cls):
@@ -74,15 +86,26 @@ class ExportPolicy:
             if not path.is_absolute() or str(path).startswith(("\\\\", "//")):
                 raise ValueError("导出目录必须是本地绝对路径。")
             roots.append(path.resolve())
+        raw_max_mb = os.environ.get("FEISHU_EXPORT_MAX_FILE_MB", "30").strip()
+        try:
+            max_mb = int(raw_max_mb)
+        except ValueError as error:
+            raise ValueError("FEISHU_EXPORT_MAX_FILE_MB 必须是正整数（MB）。") from error
+        if max_mb <= 0:
+            raise ValueError("FEISHU_EXPORT_MAX_FILE_MB 必须是正整数（MB）。")
         return cls(
             frozenset(strings("FEISHU_EXPORT_OWNER_IDS")),
             frozenset(strings("FEISHU_EXPORT_CHAT_IDS")),
             tuple(roots),
+            max_mb * 1_000_000,
         )
 
     @property
     def enabled(self):
-        return bool(self.owners and self.chats and self.roots)
+        # Source paths are authorized per operation by the independent Judge.
+        # ``roots`` is retained as a deployment compatibility field but no
+        # longer acts as the user-delivery boundary.
+        return bool(self.owners and self.chats)
 
     def authorize(self, sender, chat):
         if not self.enabled or sender not in self.owners or chat not in self.chats:
@@ -111,12 +134,23 @@ def export_event_scope(identity):
 
 
 @contextmanager
-def export_general_scope():
-    token = _role.set("general")
+def export_worker_scope(worker_kind: str):
+    normalized = str(worker_kind).strip().lower()
+    if normalized not in {"general", "web", "code"}:
+        raise ValueError("文件发送执行角色必须是 general、web 或 code。")
+    token = _role.set(normalized)
     try:
         yield
     finally:
         _role.reset(token)
+
+
+@contextmanager
+def export_general_scope():
+    """Backward-compatible spelling for the General runtime."""
+
+    with export_worker_scope("general"):
+        yield
 
 
 def export_tool_available():
@@ -130,14 +164,19 @@ def export_tool_available():
         return False
 
 
+def current_export_identity() -> ExportIdentity | None:
+    """Return the authenticated run-scoped identity; never infer a recipient."""
+    return _identity.get()
+
+
 async def request_export(path, event_id):
     identity = _identity.get()
     if (
         not export_tool_available()
-        or _role.get() != "general"
+        or _role.get() not in {"general", "web", "code"}
         or identity.event_id != event_id
     ):
-        raise ExportDenied("只能在已验证飞书任务的 General 执行环境中申请文件发送。")
+        raise ExportDenied("只能在已验证飞书任务的 Worker 执行环境中申请文件发送。")
     return await _service.request(identity, path)
 
 
@@ -178,16 +217,10 @@ class ExportService:
                 "只接受允许目录内的本地绝对路径，不接受 URL、网络共享或任务虚拟路径。"
             )
         # Inspect the original chain as well as the resolved target, rejecting
-        # Windows junctions/reparse points, Unix symlinks and NTFS ADS.
+        # Windows junctions/reparse points, Unix symlinks and NTFS ADS.  The
+        # directory allowlist was intentionally removed: external disclosure
+        # is controlled by the independent per-operation Judge instead.
         for part in (path, *path.parents):
-            name = part.name.lower()
-            if (
-                name in DENIED_PARTS
-                or name.startswith(".env")
-                or name in {"id_rsa", "id_ed25519"}
-                or name.endswith((".pem", ".key", ".pfx"))
-            ):
-                raise ExportDenied("路径包含凭据或运行时私有目录，禁止导出。")
             if ":" in part.name:
                 raise ExportDenied("不支持特殊文件流。")
             info = part.lstat()
@@ -197,8 +230,6 @@ class ExportService:
             ):
                 raise ExportDenied("不允许导出符号链接或目录联接。")
         resolved = path.resolve(strict=True)
-        if not any(resolved.is_relative_to(root) for root in self.policy.roots):
-            raise ExportDenied("该路径不在本机配置的允许导出目录中。")
         info = resolved.stat()
         if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
             raise ExportDenied("只支持普通文件和目录。")
@@ -208,6 +239,13 @@ class ExportService:
 
     def _snapshot(self, raw_path):
         source = self._check_path(raw_path)
+        upload_limit = self.policy.effective_upload_limit
+        limit_reason = (
+            "飞书平台上限"
+            if upload_limit == PLATFORM_UPLOAD_LIMIT
+            else "本机配置上限"
+        )
+        limit_label = f"{upload_limit / 1_000_000:g} MB（{upload_limit} 字节，{limit_reason}）"
         files = []
         if source.is_dir():
             # Do not silently omit secrets, oversized files or deep subtrees.
@@ -240,6 +278,11 @@ class ExportService:
         total = 0
         for file in sorted(files):
             size = file.stat().st_size
+            if not source.is_dir() and size > upload_limit:
+                raise ExportDenied(
+                    f"文件大小 {size} 字节超过单次发送上限 {limit_label}；"
+                    "系统已拦截，未上传。请先询问用户是否允许拆分，不要自行拆分或重发。"
+                )
             total += size
             if total > SOURCE_LIMIT:
                 raise ExportDenied("原文件合计不得超过 100 MB。")
@@ -251,8 +294,8 @@ class ExportService:
                     "bytes": size,
                 }
             )
-        if not source.is_dir() and (total == 0 or total > UPLOAD_LIMIT):
-            raise ExportDenied("飞书机器人单文件上传限 30 MB，且不能发送空文件。")
+        if not source.is_dir() and total == 0:
+            raise ExportDenied("不能发送空文件；文件没有上传。")
         objects = self.root / "objects"
         objects.mkdir(parents=True, exist_ok=True)
         snapshot = objects / (uuid4().hex + ".blob")
@@ -290,9 +333,11 @@ class ExportService:
                                     if copied > SOURCE_LIMIT:
                                         raise ExportDenied("读取期间文件超过 100 MB。")
                                     output.write(chunk)
-                                    if target.tell() > UPLOAD_LIMIT:
+                                    if target.tell() > upload_limit:
                                         raise ExportDenied(
-                                            "发送文件（目录为 ZIP）超过飞书 30 MB 上限。"
+                                            "发送文件（目录为 ZIP）超过单次发送上限 "
+                                            f"{limit_label}；"
+                                            "系统已拦截，未上传。请先询问用户是否允许拆分。"
                                         )
                             finally:
                                 if archive:
@@ -306,8 +351,12 @@ class ExportService:
                 finally:
                     if archive:
                         archive.close()
-            if not 0 < snapshot.stat().st_size <= UPLOAD_LIMIT:
-                raise ExportDenied("发送文件必须非空且不超过 30 MB。")
+            if not 0 < snapshot.stat().st_size <= upload_limit:
+                raise ExportDenied(
+                    "发送文件必须非空且不超过单次发送上限 "
+                    f"{limit_label}；未上传。"
+                    "如果超限，请先询问用户是否允许拆分。"
+                )
             filename = safe_name(
                 source.name + ".zip" if source.is_dir() else source.name
             )
@@ -338,7 +387,7 @@ class ExportService:
         if len(self._query("SELECT id FROM exports WHERE status='PENDING'")) >= 8:
             snapshot.unlink()
             raise ExportDenied(
-                "最多保留 8 个待确认文件申请，请先确认、拒绝或等待过期。"
+                "最多保留 8 个未完成的文件发送请求，请稍后再试。"
             )
         request_id = "fx_" + uuid4().hex[:24]
         self._query(
@@ -373,9 +422,9 @@ class ExportService:
             "bytes": row["size"],
             "sha256": row["sha256"],
             "message_id": row["message_id"],
-            "instruction": f"请在原飞书会话发送 /file_approve {row['id']}；拒绝用 /file_reject {row['id']}。"
+            "instruction": "文件正在准备发送；只有 SENT 且存在飞书 message_id 才算交付成功。"
             if status == "PENDING"
-            else "以状态和飞书 message_id 判断结果，不要声称待确认文件已发送。",
+            else "以状态和飞书 message_id 判断结果，不要把未确认的发送结果说成成功。",
         }
 
     async def request(self, identity, path):
@@ -383,26 +432,14 @@ class ExportService:
         async with self._lock:
             await asyncio.to_thread(self.cleanup)
             row = await asyncio.to_thread(self._prepare, identity, path)
-            if row["status"] == "PENDING" and row["expires"] >= time.time():
-                manifest = json.loads(row["manifest"])
-                details = "\n".join(
-                    f"- {json.dumps(x['name'], ensure_ascii=False)} ({x['bytes']} 字节)"
-                    for x in manifest
-                )
-                text = (
-                    f"文件发送待确认（15 分钟内有效）\n来源：{json.dumps(row['source'], ensure_ascii=False)}\n"
-                    f"发送到当前会话：{row['chat_id']}\n发送文件：{json.dumps(row['filename'], ensure_ascii=False)}\n"
-                    f"大小：{row['size']} 字节；文件数：{len(manifest)}\nSHA-256：{row['sha256']}\n"
-                    f"{details}\n确认将发送上述快照，即使原文件后来变化。\n{self._view(row)['instruction']}"
-                )
-                result = await self.channel.send(
-                    row["chat_id"],
-                    {"text": text},
-                    {"uuid": row["id"] + "_notice", "receive_id_type": "chat_id"},
-                )
-                if not result.success:
-                    raise ExportDenied("确认提示发送失败，文件尚未上传。请重新申请。")
-            return self._view(row)
+        if row["status"] == "PENDING":
+            # The owner/chat/outbox configuration is standing authorization.
+            # The host still verifies the immutable snapshot and atomically
+            # claims it before uploading; no per-file approval is needed.
+            return await self.decide(
+                row["id"], identity.sender_id, identity.chat_id, approve=True
+            )
+        return self._view(row)
 
     def cleanup(self):
         rows = self._query(
@@ -441,7 +478,7 @@ class ExportService:
                 )
                 self.cleanup()
                 return {**self._view(row), "status": "REJECTED"}
-            # Re-check current operator policy. Upload the approved immutable
+            # Re-check current operator policy. Upload the prepared immutable
             # snapshot, not the possibly changed source file.
             self._check_path(row["source"])
             snapshot = self.root / "objects" / row["snapshot"]
@@ -452,7 +489,7 @@ class ExportService:
             ):
                 raise ExportDenied("待发送快照校验失败，禁止上传。")
             # Atomically claim even when two application processes receive an
-            # approval. A crash from here remains SENDING and is never retried.
+            # send. A crash from here remains SENDING and is never retried.
             claimed = self._query(
                 "UPDATE exports SET status='SENDING' WHERE id=? AND status='PENDING' RETURNING id",
                 (request_id,),
@@ -464,9 +501,17 @@ class ExportService:
             from lark_channel.channel.types import MediaSource, OutboundFile
 
             try:
+                # ``lark_channel`` intentionally derives the upload filename
+                # from ``MediaSource.path`` for file sources.  Our immutable
+                # snapshot has a random ``.blob`` basename, so passing it as a
+                # file source would silently replace the user-facing filename
+                # supplied below.  A buffer source preserves the verified
+                # snapshot bytes while allowing ``file_name`` to remain the
+                # original sanitized name (for example, ``resume.pdf``).
+                snapshot_bytes = await asyncio.to_thread(snapshot.read_bytes)
                 key = await asyncio.wait_for(
                     self.channel.upload_media(
-                        MediaSource(kind="file", path=str(snapshot)),
+                        MediaSource(kind="buffer", buffer=snapshot_bytes),
                         kind="file",
                         file_name=row["filename"],
                         file_type="stream",

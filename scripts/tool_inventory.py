@@ -13,7 +13,7 @@ from langchain_core.utils.function_calling import convert_to_openai_tool
 from mcp_runtime import PLAYWRIGHT_ALLOWED_TOOLS
 from tools import ALL_TOOLS
 from workers.code_worker import CODE_WORKER_FILESYSTEM_TOOLS
-from workers.general_worker import DEEP_AGENT_FILE_TOOLS, LEGACY_TOOL_NAMES
+from workers.general_worker import DEEP_AGENT_FILE_TOOLS, GENERAL_EXCLUDED_TOOL_NAMES
 from workers.web_worker import WEB_BUSINESS_TOOL_NAMES
 from toolsets import DEFAULT_TOOLSET_REGISTRY
 
@@ -23,7 +23,7 @@ def inventory():
     for current in ALL_TOOLS:
         name = current.name
         roles = []
-        if name not in LEGACY_TOOL_NAMES:
+        if name not in GENERAL_EXCLUDED_TOOL_NAMES:
             roles.append("GENERAL")
         if name in WEB_BUSINESS_TOOL_NAMES:
             roles.append("WEB")
@@ -34,7 +34,7 @@ def inventory():
                 "condition": "owner/chat/roots configured + authenticated event; upload requires separate confirmation"
                 if name == "send_local_file_to_feishu"
                 else "registered; role filter applies",
-                "legacy_only": name in LEGACY_TOOL_NAMES and not roles,
+                "excluded_from_general": name in GENERAL_EXCLUDED_TOOL_NAMES and not roles,
                 "metadata": current.metadata or {},
                 "schema": convert_to_openai_tool(current),
             }
@@ -72,7 +72,7 @@ def inventory():
             "GENERAL": ["report_general_result"],
             "WEB": [
                 "publish_worker_progress",
-                "submit_for_review",
+                "complete_web_step",
                 "download_web_artifact",
             ],
             "CODE_WORKER": [

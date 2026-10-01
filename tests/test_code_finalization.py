@@ -25,14 +25,16 @@ class CodeFinalizationTests(unittest.TestCase):
         result = graph.invoke({"messages": [{"role": "user", "content": "Implement feature"}],
             "code_task": contract().model_dump(mode="json"), "code_candidate": candidate().model_dump(mode="json"),
             "code_review_loop": create_code_review_loop(candidate=candidate(), worker_checkpoint_id="w", reviewer_checkpoint_id="r").model_dump(mode="json"),
-            "executor_model_run_limit": model_limit, "executor_tool_run_limit": tool_limit,
-            "show_all_toolsets_run_limit": 0})
+            "executor_model_run_limit": model_limit, "executor_tool_run_limit": tool_limit})
         return model, result
 
     def test_last_round_submits_not_met_without_spending_review_reserve(self):
         model, result = self.run_worker([submission()], 1, 0)
         self.assertEqual(model.invocation_count, 1)
-        self.assertEqual(model.bound_tool_names, ["submit_code_for_review"])
+        self.assertEqual(
+            model.bound_tool_names,
+            ["ask_user", "submit_code_for_review"],
+        )
         self.assertEqual(result["executor_model_calls_used"], 1)
         self.assertEqual(result["code_worker_submission"]["submission"]["requirement_status"], {"feature_works": "NOT_MET"})
         self.assertNotIn("code_review_report", result)

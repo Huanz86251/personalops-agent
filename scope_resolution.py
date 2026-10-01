@@ -4,10 +4,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from functools import lru_cache
 from typing import Any, Mapping
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from observability import set_span_attributes, set_span_output, trace_span
 from planning_models import PlanningContextPack, ScopeContract
@@ -16,6 +17,12 @@ from scope_intent_classifier import ScopeIntentClassifier
 
 
 DEFAULT_SCOPE_RESOLVER_MAX_ATTEMPTS = 3
+
+
+class ScopeResolutionContinue(BaseModel):
+    """The request is simple enough to continue without a ScopeContract."""
+
+    model_config = ConfigDict(extra="forbid")
 
 
 class ScopeResolutionFailure(ValueError):
@@ -63,6 +70,47 @@ def _raw_content(response: Mapping[str, Any]) -> str:
     raw = response.get("raw")
     content = raw.get("content") if isinstance(raw, Mapping) else getattr(raw, "content", None)
     return content if isinstance(content, str) else ""
+
+
+def _message_content(response: Any) -> str:
+    content = (
+        response.get("content") if isinstance(response, Mapping)
+        else getattr(response, "content", None)
+    )
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            str(item.get("text") or "") if isinstance(item, Mapping) else str(item)
+            for item in content
+        )
+    return ""
+
+
+def _is_continue_output(value: Any) -> bool:
+    """Accept a cheap CONTINUE answer without making its spelling a failure mode."""
+
+    if isinstance(value, Mapping):
+        for key in ("action", "decision", "status", "result"):
+            if key in value and _is_continue_output(value.get(key)):
+                return True
+        return False
+    text = str(value or "").strip()
+    if not text:
+        return False
+    try:
+        decoded = json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        decoded = None
+    if decoded is not None and decoded != text:
+        return _is_continue_output(decoded)
+    normalized = re.sub(r"[\s\[\](){}'\"`]+", "", text).upper()
+    return normalized == "CONTINUE"
+
+
+def _tool_calls(response: Any) -> list[Mapping[str, Any]]:
+    calls = response.get("tool_calls") if isinstance(response, Mapping) else getattr(response, "tool_calls", None)
+    return [call for call in (calls or []) if isinstance(call, Mapping)]
 
 
 def _finish_reason(response: Mapping[str, Any]) -> str:
@@ -131,33 +179,59 @@ async def resolve_scope_contract(
     model,
     user_request: str,
     current_time: str = "unknown",
-) -> tuple[ScopeContract, int]:
-    """Resolve a contract, retrying only truncated or invalid structured output."""
+) -> tuple[ScopeContract | None, int, str]:
+    """Choose CONTINUE or resolve a contract, retrying only malformed output."""
+    from structured_output_policy import textual_schema_fallback
+    schema_guidance = textual_schema_fallback(model, ScopeContract)
     messages = [
-        {"role": "system", "content": render_prompt(
-            "planning/scope_resolver_system",
-            schema=json.dumps(
-                ScopeContract.model_json_schema(),
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ),
-        )},
+        {
+            "role": "system",
+            "content": render_prompt("planning/scope_resolver_system")
+            + (("\n" + schema_guidance) if schema_guidance else ""),
+        },
         {"role": "user", "content": render_prompt(
             "planning/scope_resolver_request",
             current_time=current_time,
             user_request=user_request,
         )},
     ]
-    structured = model.with_structured_output(
-        ScopeContract, method="json_mode", include_raw=True,
-    )
+    # Production models get two explicit, compact actions.  The empty
+    # ScopeResolutionContinue tool costs only `{}` and avoids manufacturing a
+    # large contract for ordinary one-object lookups.  The structured-output
+    # fallback remains for test doubles and providers without tool binding.
+    decision_model = None
+    bind_tools = getattr(model, "bind_tools", None)
+    if callable(bind_tools):
+        try:
+            from structured_output_policy import strict_tool_schema_options
+            decision_model = bind_tools(
+                [ScopeResolutionContinue, ScopeContract],
+                tool_choice="any",
+                parallel_tool_calls=False,
+                **strict_tool_schema_options(model),
+            )
+        except (TypeError, ValueError, NotImplementedError):
+            decision_model = None
+    structured = None
+    if decision_model is None:
+        from structured_output_policy import with_provider_structured_output
+        structured = with_provider_structured_output(
+            model,
+            ScopeContract,
+            include_raw=True,
+            fallback_method="json_mode",
+        )
     attempts = 0
     conversation = list(messages)
     last_error: BaseException | None = None
     for attempt in range(1, _max_attempts() + 1):
         attempts = attempt
         try:
-            response = await structured.ainvoke(conversation)
+            response = await (
+                decision_model.ainvoke(conversation)
+                if decision_model is not None
+                else structured.ainvoke(conversation)
+            )
         except Exception as error:
             truncated = _is_truncation({}, error)
             if truncated or _is_structured_output_error(error):
@@ -180,18 +254,41 @@ async def resolve_scope_contract(
                 ) from error
 
         try:
+            if decision_model is not None:
+                calls = _tool_calls(response)
+                if len(calls) == 1:
+                    call = calls[0]
+                    name = str(call.get("name") or "")
+                    args = call.get("args") or {}
+                    if name == ScopeResolutionContinue.__name__:
+                        ScopeResolutionContinue.model_validate(args)
+                        return None, attempts, "CONTINUE"
+                    if name == ScopeContract.__name__:
+                        return ScopeContract.model_validate(args), attempts, "CONTRACT"
+                    raise ValueError(f"Unknown Scope Resolver decision tool: {name}")
+                content = _message_content(response)
+                if _is_continue_output(content):
+                    return None, attempts, "CONTINUE"
+                if content.strip():
+                    return ScopeContract.model_validate_json(content), attempts, "CONTRACT"
+                raise ValueError("Scope Resolver must choose CONTINUE or ScopeContract")
             if isinstance(response, ScopeContract):
-                return response, attempts
+                return response, attempts, "CONTRACT"
             if not isinstance(response, Mapping):
                 raise TypeError("Scope Resolver did not return a structured mapping")
             parsing_error = response.get("parsing_error")
             if parsing_error is not None:
                 raw_content = _raw_content(response)
+                if _is_continue_output(raw_content):
+                    return None, attempts, "CONTINUE"
                 if raw_content.strip():
                     contract = ScopeContract.model_validate_json(raw_content)
-                    return contract, attempts
+                    return contract, attempts, "CONTRACT"
                 raise parsing_error
-            return ScopeContract.model_validate(response.get("parsed")), attempts
+            parsed = response.get("parsed")
+            if _is_continue_output(parsed):
+                return None, attempts, "CONTINUE"
+            return ScopeContract.model_validate(parsed), attempts, "CONTRACT"
         except Exception as error:
             last_error = error
             if attempt >= _max_attempts():
@@ -245,26 +342,33 @@ async def prepare_scope_context(
     if route["label"] == "REQUIRES_SCOPE_CONTRACT":
         try:
             with trace_span(
-                "Scope Resolver / Qwen structured contract",
+                "Scope Resolver / CONTINUE or contract",
                 kind="chain",
                 input_value={
-                    "schema": "ScopeContract",
+                    "schema": "ScopeResolutionContinue | ScopeContract",
                     "request_chars": len(context.user_request),
                 },
             ) as resolver_span:
-                contract, model_calls = await resolve_scope_contract(
+                contract, model_calls, resolver_decision = await resolve_scope_contract(
                     model,
                     context.user_request,
                     context.current_time_context(),
                 )
                 set_span_attributes(
                     resolver_span, **{
-                        "scope.resolution_status": "ok",
+                        "scope.resolution_status": resolver_decision.lower(),
                         "scope.resolution_attempts": model_calls,
                     }
                 )
-                set_span_output(resolver_span, contract)
-            route = {**route, "resolver_status": "ok"}
+                set_span_output(resolver_span, {
+                    "decision": resolver_decision,
+                    "scope_contract": contract,
+                })
+            route = {
+                **route,
+                "resolver_status": "continued" if resolver_decision == "CONTINUE" else "ok",
+                "resolver_decision": resolver_decision,
+            }
         except Exception as error:
             model_calls = getattr(error, "attempts", model_calls or 0)
             route = {

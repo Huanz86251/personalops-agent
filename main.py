@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import threading
 from dataclasses import dataclass, field
 
 from concurrent.futures import (
@@ -15,6 +16,23 @@ from uuid import uuid4
 from feishu_attachments import AttachmentIngressError, FeishuAttachmentStore, PreparedInbound
 from knowledge_rag.ingress import RagUploadInbox
 from feishu_exports import ExportService, configure_exports, export_event_scope
+from host_file_access import (
+    HOST_FILE_ACCESS,
+    HostFileApprovalRequest,
+    HostFilePolicy,
+    configure_host_file_human_notifier,
+    configure_host_file_policy,
+)
+from recovery_approval import (
+    RECOVERY_APPROVALS,
+    RecoveryApprovalRequest,
+    configure_recovery_human_notifier,
+)
+from step_user_question import (
+    STEP_USER_QUESTIONS,
+    StepUserQuestionRequest,
+    configure_step_user_question_notifier,
+)
 from path import AGENT_DATA_ROOT
 
 from dotenv import load_dotenv
@@ -76,7 +94,6 @@ NOISY_LOGGER_NAMES = (
 
     "mcp",
 
-    "ddgs",
 
     "sentence_transformers",
     "transformers",
@@ -164,6 +181,7 @@ from lark_channel import (
     FeishuChannel,
     new_card,
 )
+from lark_channel.channel.config import MarkdownConverter, OutboundConfig
 from lark_channel.core.enum import (
     LogLevel,
 )
@@ -174,9 +192,11 @@ from conversation_runtime import (
     ConversationRuntime,
 )
 from progress_events import (
+    OperationInactivityTimeoutError,
     ProgressCallback,
     ProgressEvent,
     render_progress_event,
+    run_with_progress_keepalive,
 )
 from eventing import (
     AgentEvent,
@@ -243,6 +263,44 @@ APPLICATION_LOOP: (
     | None
 ) = None
 
+# A cancelled coroutine cannot terminate a blocking call already running in a
+# Python executor thread. After all durable stores and external runtimes enter
+# their ordinary shutdown path, this bounded failsafe prevents such an orphan
+# (including a vendor SDK start thread) from keeping the desktop process alive
+# forever. It is disarmed when asyncio.run() returns normally.
+SHUTDOWN_FAILSAFE_CANCEL = threading.Event()
+SHUTDOWN_FAILSAFE_ARMED = False
+SHUTDOWN_FAILSAFE_SECONDS = 30.0
+
+
+def _arm_shutdown_failsafe() -> None:
+    global SHUTDOWN_FAILSAFE_ARMED
+    if SHUTDOWN_FAILSAFE_ARMED:
+        return
+    SHUTDOWN_FAILSAFE_ARMED = True
+    SHUTDOWN_FAILSAFE_CANCEL.clear()
+
+    def _force_exit_if_needed() -> None:
+        if SHUTDOWN_FAILSAFE_CANCEL.wait(SHUTDOWN_FAILSAFE_SECONDS):
+            return
+        logger.error(
+            "正常关闭已等待%s秒，仍有底层线程未退出；"
+            "持久化资源已经进入关闭流程，现强制结束进程。",
+            int(SHUTDOWN_FAILSAFE_SECONDS),
+        )
+        logging.shutdown()
+        os._exit(0)
+
+    threading.Thread(
+        target=_force_exit_if_needed,
+        name="agent-shutdown-failsafe",
+        daemon=True,
+    ).start()
+
+
+def _disarm_shutdown_failsafe() -> None:
+    SHUTDOWN_FAILSAFE_CANCEL.set()
+
 
 # 保存从飞书SDK线程提交到
 # Agent主事件循环中的消息任务。
@@ -296,11 +354,85 @@ feishu_channel = (
         log_level=(
             LogLevel.WARNING
         ),
+        # Final answers are sent as Markdown posts. Use explicit rich-text
+        # nodes so bold/list formatting is not client-version dependent.
+        outbound=OutboundConfig(
+            markdown_converter=MarkdownConverter(tag_md_mode="structured"),
+        ),
     )
 )
 
 FEISHU_EXPORTS = ExportService(AGENT_DATA_ROOT / "feishu-exports", settings.feishu_export, feishu_channel)
 configure_exports(FEISHU_EXPORTS)
+configure_host_file_policy(HostFilePolicy.from_env())
+
+
+async def _notify_host_file_permission(
+    chat_id: str,
+    request: HostFileApprovalRequest,
+) -> None:
+    result = await _send_text(
+        chat_id,
+        (
+            "任务请求把文件发送到当前飞书会话，独立审批器无法确定是否已被原始请求清楚授权。\n"
+            f"操作：{request.operation}\n"
+            f"路径：{request.path}\n"
+            f"当前步骤：{request.current_step}\n"
+            f"用途：{request.worker_reason}\n\n"
+            "请只回复“允许”或“拒绝”。本次决定只适用于当前任务、该操作和该路径。"
+        ),
+    )
+    if not getattr(result, "success", False):
+        raise RuntimeError(
+            "本机文件审批问题发送失败，任务不会进入无提示的无限等待。"
+        )
+
+
+configure_host_file_human_notifier(_notify_host_file_permission)
+
+
+async def _notify_step_user_question(
+    chat_id: str,
+    request: StepUserQuestionRequest,
+) -> None:
+    result = await _send_text(
+        chat_id,
+        (
+            f"{request.role} 在继续当前任务前需要您补充一项信息：\n\n"
+            f"{request.question}\n\n"
+            "请直接回复答案；回复会返回当前处理角色并从原位置继续，"
+            "不会创建新任务。"
+        ),
+    )
+    if not getattr(result, "success", False):
+        raise RuntimeError(
+            "用户问题发送失败，任务不会进入无提示的无限等待。"
+        )
+
+
+configure_step_user_question_notifier(_notify_step_user_question)
+
+
+async def _notify_recovery_permission(
+    chat_id: str,
+    request: RecoveryApprovalRequest,
+) -> None:
+    result = await _send_text(
+        chat_id,
+        (
+            f"第{request.step_id}步（{request.worker_kind}）建议降低一项原始要求。\n\n"
+            f"{request.user_confirmation_request}\n\n"
+            "请只回复“允许”或“拒绝”。允许只适用于上面这一个具体降级方案；"
+            "拒绝后 Scheduler 只能继续尝试满足原要求，或如实结束。"
+        ),
+    )
+    if not getattr(result, "success", False):
+        raise RuntimeError(
+            "降级审批问题发送失败，任务不会进入无提示的无限等待。"
+        )
+
+
+configure_recovery_human_notifier(_notify_recovery_permission)
 
 
 logger.info(
@@ -429,7 +561,7 @@ def _resolve_feishu_menu_text(message: Any, text: str) -> tuple[str, bool]:
 async def _send_text(
     chat_id: str,
     text: str,
-) -> None:
+) -> Any:
     """向当前飞书会话发送纯文本。"""
 
     normalized_text = (
@@ -441,7 +573,7 @@ async def _send_text(
             "Agent没有生成可发送的文字。"
         )
 
-    await feishu_channel.send(
+    return await feishu_channel.send(
         chat_id,
 
         {
@@ -450,6 +582,29 @@ async def _send_text(
             ),
         },
     )
+
+
+async def _send_final_answer(chat_id: str, text: str) -> None:
+    """Render only a task's final answer as Feishu rich text."""
+
+    answer = text.strip()
+    if not answer:
+        await _send_text(chat_id, text)
+        return
+    try:
+        result = await feishu_channel.send(chat_id, {"markdown": answer})
+        if result.success:
+            return
+        error = result.error
+        logger.warning(
+            "飞书最终答复富文本被拒绝，降级为纯文本 | code=%s | raw_code=%s | hint=%s",
+            getattr(error, "code", None),
+            getattr(error, "raw_code", None),
+            getattr(error, "hint", None),
+        )
+    except Exception:
+        logger.exception("飞书最终答复富文本发送失败，降级为纯文本")
+    await _send_text(chat_id, answer)
 
 
 async def _send_card(
@@ -560,13 +715,43 @@ def _build_progress_callback(
         str
         | None
     ) = None
+    # Feishu text/post messages have a finite per-message edit budget. Rotate
+    # before the platform's hard limit so long-running Agents never get stuck
+    # displaying an old keepalive pulse forever.
+    progress_message_edit_count = 0
+    max_progress_message_edits = 15
+    progress_owner_loop = asyncio.get_running_loop()
+    progress_lock = asyncio.Lock()
 
-    async def progress_callback(
+    def _result_raw_code(result: object) -> int | None:
+        error = getattr(result, "error", None)
+        raw_code = getattr(error, "raw_code", None)
+        if raw_code is None:
+            raw = getattr(result, "raw", None)
+            if isinstance(raw, dict):
+                raw_code = raw.get("code")
+        try:
+            return int(raw_code) if raw_code is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    async def _create_progress_message(payload: dict[str, str]):
+        result = await feishu_channel.send(normalized_chat_id, payload)
+        message_id = str(getattr(result, "message_id", "") or "").strip()
+        if getattr(result, "success", False) and message_id:
+            return message_id
+        logger.warning(
+            "飞书进度消息创建失败，Agent主任务将继续执行 | raw_code=%s",
+            _result_raw_code(result),
+        )
+        return None
+
+    async def _send_progress_locked(
         event: ProgressEvent,
     ) -> None:
         """首次发送进度消息，后续原地更新同一条消息。"""
 
-        nonlocal progress_message_id
+        nonlocal progress_message_id, progress_message_edit_count
 
         if not isinstance(
             event,
@@ -602,43 +787,20 @@ def _build_progress_callback(
         }
 
         try:
-            # 第一次：创建进度消息，
-            # 并保存飞书返回的message_id。
-            if progress_message_id is None:
-                result = await (
-                    feishu_channel.send(
-                        normalized_chat_id,
-                        progress_payload,
-                    )
-                )
-
-                message_id = str(
-                    getattr(
-                        result,
-                        "message_id",
-                        "",
-                    )
-                    or ""
-                ).strip()
-
-                if not (
-                    getattr(
-                        result,
-                        "success",
-                        False,
-                    )
-                    and message_id
-                ):
-                    logger.warning(
-                        "飞书进度消息首次发送失败，"
-                        "Agent主任务将继续执行"
-                    )
-
+            # 第一次或当前消息接近编辑上限：创建一条续接消息。
+            if (
+                progress_message_id is None
+                or progress_message_edit_count >= max_progress_message_edits
+            ):
+                if progress_message_id is not None:
+                    progress_payload = {
+                        "text": "进度续接：\n" + progress_text,
+                    }
+                message_id = await _create_progress_message(progress_payload)
+                if message_id is None:
                     return
-
-                progress_message_id = (
-                    message_id
-                )
+                progress_message_id = message_id
+                progress_message_edit_count = 0
 
             # 后续：修改之前创建的同一条消息。
             else:
@@ -655,18 +817,34 @@ def _build_progress_callback(
                     "success",
                     False,
                 ):
+                    raw_code = _result_raw_code(result)
                     logger.warning(
                         "飞书进度消息更新失败，"
-                        "Agent主任务将继续执行"
+                        "Agent主任务将继续执行 | raw_code=%s",
+                        raw_code,
                     )
+                    # The old message can never be edited again after these
+                    # terminal lifecycle failures. Continue in a fresh message
+                    # instead of leaving the UI frozen on an old heartbeat.
+                    if raw_code in {230011, 230072, 230075, 230110}:
+                        message_id = await _create_progress_message({
+                            "text": "进度续接：\n" + progress_text,
+                        })
+                        if message_id is None:
+                            return
+                        progress_message_id = message_id
+                        progress_message_edit_count = 0
+                    else:
+                        return
+                else:
+                    progress_message_edit_count += 1
 
-                    return
-
-        except Exception:
+        except Exception as error:
             # 进度展示失败不能影响Agent主任务。
             logger.warning(
                 "飞书进度消息发送或更新失败，"
-                "Agent主任务将继续执行",
+                "Agent主任务将继续执行 | error_type=%s",
+                type(error).__name__,
                 exc_info=False,
             )
 
@@ -675,6 +853,29 @@ def _build_progress_callback(
         sent_event_keys.add(
             event_key
         )
+
+    async def progress_callback(event: ProgressEvent) -> None:
+        # Parallel Workers share one Feishu message. Serialize create/edit and
+        # deduplication so two branches cannot create competing messages. Some
+        # LangChain callbacks may be delivered from a collaborator event loop;
+        # always bring the mutable message state back to its owning app loop.
+        async def _deliver_on_owner_loop() -> None:
+            async with progress_lock:
+                await _send_progress_locked(event)
+
+        current_loop = asyncio.get_running_loop()
+        if current_loop is progress_owner_loop:
+            await _deliver_on_owner_loop()
+            return
+        submitted = asyncio.run_coroutine_threadsafe(
+            _deliver_on_owner_loop(),
+            progress_owner_loop,
+        )
+        try:
+            await asyncio.wrap_future(submitted)
+        except asyncio.CancelledError:
+            submitted.cancel()
+            raise
 
     return progress_callback
 async def _start_command(
@@ -700,9 +901,8 @@ async def _start_command(
         f"{conflicts['open_pairs']} 对，高置信 {conflicts['high_priority_groups']} 组） · "
         "清理中可用 `A`、`B`、`跳过`、`退出`\n\n"
         "**文件交付**\n"
-        "`/approve 编号`、`/reject 编号 [原因]`；飞书文件回传使用 "
-        "`/file_whoami`、`/file_status 编号`、`/file_approve 编号`、"
-        "`/file_reject 编号`\n\n"
+        "`/approve 编号`、`/reject 编号 [原因]`；授权目录内的文件回传无需二次批准，"
+        "可用 `/file_whoami` 查看身份、`/file_status 编号` 查询发送状态\n\n"
         "任何输入状态都可发送 `/exit` 或“退出”离开。"
     )
     buttons = _control_buttons()
@@ -1351,30 +1551,54 @@ async def _run_feishu_event(
             _build_progress_callback(reply_target_id),
         )
         FEISHU_EVENT_CONTEXTS[event.event_id] = context
-    _, progress_callback = context
+    # Freshly queued events already have an in-memory context, while restart
+    # recovery rebuilds one from the durable event.  Both paths must bind the
+    # reply target used by the Agent call and Human-Loop keepalive predicate.
+    reply_target_id, progress_callback = context
     await asyncio.to_thread(FEISHU_ATTACHMENTS.materialize, event)
     logger.info(
         "EVENT START | event_id=%s | action=%s",
         event.event_id,
         event.action.value,
     )
-    with export_event_scope(await asyncio.to_thread(FEISHU_ATTACHMENTS.export_identity, event)):
-        return await conversation_runtime.ask(
-            user_text=event.payload_text,
-            channel=FEISHU_CHANNEL,
-            external_chat_id=OWNER_EXTERNAL_CHAT_ID,
-            progress_callback=progress_callback,
-            event_id=event.event_id,
-            target_conversation_id=event.conversation_id,
-            pause_control=pause_control,
-            bypass_conversation_lock=(event.action is EventAction.INSERT),
-            resume_from_checkpoint=resume_from_checkpoint,
-            replacement_target_event_id=(
-                event.target_event_id
-                if event.action is EventAction.REPLACE
-                else None
-            ),
-        )
+    async def run_agent(observed_progress: ProgressCallback) -> str:
+        with export_event_scope(await asyncio.to_thread(FEISHU_ATTACHMENTS.export_identity, event)):
+            return await conversation_runtime.ask(
+                user_text=event.payload_text,
+                channel=FEISHU_CHANNEL,
+                external_chat_id=OWNER_EXTERNAL_CHAT_ID,
+                reply_target_id=reply_target_id,
+                progress_callback=observed_progress,
+                event_id=event.event_id,
+                target_conversation_id=event.conversation_id,
+                pause_control=pause_control,
+                bypass_conversation_lock=(event.action is EventAction.INSERT),
+                resume_from_checkpoint=resume_from_checkpoint,
+                replacement_target_event_id=(
+                    event.target_event_id
+                    if event.action is EventAction.REPLACE
+                    else None
+                ),
+            )
+
+    return await run_with_progress_keepalive(
+        run_agent,
+        progress_callback,
+        inactivity_timeout_seconds=(
+            settings.worker_runtime.worker_inactivity_timeout_seconds
+        ),
+        code_inactivity_timeout_seconds=(
+            settings.worker_runtime.code_inactivity_timeout_seconds
+        ),
+        waiting_for_user=lambda: any(
+            service.has_pending(reply_target_id)
+            for service in (
+                STEP_USER_QUESTIONS,
+                HOST_FILE_ACCESS,
+                RECOVERY_APPROVALS,
+            )
+        ),
+    )
 
 
 async def _deliver_feishu_event_result(event: AgentEvent, result: str) -> None:
@@ -1391,7 +1615,7 @@ async def _deliver_feishu_event_result(event: AgentEvent, result: str) -> None:
         )
         return
     chat_id, _ = context
-    await _send_text(chat_id, result)
+    await _send_final_answer(chat_id, result)
     logger.info(
         "EVENT COMPLETE | event_id=%s | %s",
         event.event_id,
@@ -1415,9 +1639,17 @@ async def _deliver_feishu_event_failure(
     if context is None:
         return
     chat_id, _ = context
+    if isinstance(error, OperationInactivityTimeoutError):
+        failure_text = (
+            "当前任务连续"
+            f"{int(error.timeout_seconds)}秒没有出现新的模型、工具、规划或审核活动，"
+            "系统已将其判定为卡死并停止本轮执行。已完成记录仍然保留。"
+        )
+    else:
+        failure_text = "Agent处理这条排队任务时出现了问题，详细错误已经记录。"
     await _send_text(
         chat_id,
-        "Agent处理这条排队任务时出现了问题，详细错误已经记录。",
+        failure_text,
     )
 
 
@@ -1890,6 +2122,24 @@ async def handle_feishu_message(
     sender_id = str(getattr(getattr(message, "sender", None), "open_id", "") or "")
     user_text, from_menu = _resolve_feishu_menu_text(message, user_text)
     command, _ = _parse_command(user_text)
+    step_questions = globals().get("STEP_USER_QUESTIONS")
+    if command is None and step_questions is not None:
+        question_reply = step_questions.consume_user_reply(chat_id, user_text)
+        if question_reply.handled:
+            await _send_text(chat_id, question_reply.reply)
+            return
+    host_file_access = globals().get("HOST_FILE_ACCESS")
+    if command is None and host_file_access is not None:
+        permission_reply = host_file_access.consume_user_reply(chat_id, user_text)
+        if permission_reply.handled:
+            await _send_text(chat_id, permission_reply.reply)
+            return
+    recovery_approvals = globals().get("RECOVERY_APPROVALS")
+    if command is None and recovery_approvals is not None:
+        recovery_reply = recovery_approvals.consume_user_reply(chat_id, user_text)
+        if recovery_reply.handled:
+            await _send_text(chat_id, recovery_reply.reply)
+            return
     if from_menu and command not in {"rag", "exit"}:
         # Choosing a different menu action must not leave an earlier one-shot
         # RAG upload or text-input mode waiting for an unrelated next message.
@@ -2105,6 +2355,7 @@ async def run_application() -> None:
         await asyncio.Event().wait()
 
     finally:
+        _arm_shutdown_failsafe()
         conversation_runtime.schedule_service.disable_dispatch()
         # 第一步：阻止飞书SDK继续提交新的Agent任务。
         APPLICATION_LOOP = None
@@ -2191,14 +2442,17 @@ def main() -> None:
     """启动飞书个人Agent。"""
 
     try:
-        asyncio.run(
-            run_application()
-        )
+        try:
+            asyncio.run(
+                run_application()
+            )
 
-    except KeyboardInterrupt:
-        logger.info(
-            "收到退出信号，程序已停止"
-        )
+        except KeyboardInterrupt:
+            logger.info(
+                "收到退出信号，程序已停止"
+            )
+    finally:
+        _disarm_shutdown_failsafe()
 
 
 if __name__ == "__main__":

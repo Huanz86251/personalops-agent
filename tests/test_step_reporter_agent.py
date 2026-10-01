@@ -5,13 +5,16 @@ from __future__ import annotations
 import json
 import unittest
 from datetime import datetime, timezone
+from unittest.mock import AsyncMock, patch
 
 from planning_models import PlanStep
 from reporting import (
     build_step_review_packet,
     materialize_worker_review_trace,
 )
-from step_execution import run_step_reporter
+from step_execution import _reporter_evidence_manifest, run_step_reporter
+from reporting.criteria import normalize_report
+from reporting.materials import build_material_reader
 from workers.submission import (
     ResolvedToolEvidence,
     WorkerCriterionClaim,
@@ -84,6 +87,38 @@ def sample_submission_record() -> WorkerSubmissionRecord:
 
 
 class StepReviewPacketTests(unittest.TestCase):
+    def test_reporter_manifest_keeps_every_registered_evidence_row(self) -> None:
+        record = sample_submission_record().model_copy(deep=True)
+        record.resolved_evidence = [
+            ResolvedToolEvidence(
+                tool_call_id=f"call-{index}",
+                tool_name="cinema_showtimes",
+                arguments={"cinema": index},
+                result=(f"影院{index}: " + "x" * 1400),
+                result_chars=1405,
+            )
+            for index in range(1, 7)
+        ]
+        packet = build_step_review_packet(
+            user_request="查六家影院",
+            plan_objective="核对六家影院的排片",
+            current_step=sample_step(),
+            current_attempt={
+                "attempt": 1,
+                "worker_submission": record.model_dump(mode="json"),
+                "finish_reason": "READY_FOR_REVIEW",
+            },
+            stop_reason="Worker submitted.",
+        )
+        refs = {f"call-{index}": f"E{index}" for index in range(1, 7)}
+        manifest = _reporter_evidence_manifest(packet, refs)
+
+        self.assertEqual([row["reference"] for row in manifest], [f"E{i}" for i in range(1, 7)])
+        self.assertTrue(all(len(row["preview"]) <= 700 for row in manifest))
+        self.assertTrue(all(row["preview_source"] == "HARNESS_DIRECT_TOOL_RESULT" for row in manifest))
+        self.assertTrue(all(row["preview_truncated"] for row in manifest))
+        self.assertTrue(all(row["full_text_available_via_read_review_materials"] for row in manifest))
+
     def test_durable_review_trace_excludes_messages_and_bounds_evidence(self) -> None:
         record = sample_submission_record().model_dump(mode="json")
         record["resolved_evidence"][0]["result"] = "x" * 7000
@@ -220,6 +255,130 @@ class StepReviewPacketTests(unittest.TestCase):
 
 
 class StepReporterAgentTests(unittest.IsolatedAsyncioTestCase):
+    async def test_replan_report_gets_role_specific_recovery_proposal(self) -> None:
+        step = sample_step().model_copy(update={"worker_kind": "GENERAL"})
+        packet = build_step_review_packet(
+            user_request="Find a cinema, or explain the verified limitation.",
+            plan_objective="Return verified cinema information.",
+            current_step=step,
+            current_attempt={
+                "attempt": 1,
+                "worker_submission": sample_submission_record().model_dump(mode="json"),
+                "finish_reason": "READY_FOR_REVIEW",
+                "stop_reason": "Worker submitted for review.",
+            },
+            stop_reason="Worker submitted for review.",
+        )
+        model = FakeReporterModel(
+            {
+                "step_id": 1,
+                "status": "PARTIAL",
+                "summary": "The available result does not satisfy the frozen criterion.",
+                "stop_reason": "Independent review found a material gap.",
+                "criterion_results": [
+                    {
+                        "criterion": "Find one cinema source with tool evidence.",
+                        "status": "NOT_MET",
+                        "evidence": [],
+                    }
+                ],
+                "confirmed_results": [],
+                "completed_work": ["Reviewed the submitted result."],
+                "artifacts": [],
+                "approved_artifact_refs": [],
+                "worker_contributions": [],
+                "evidence": [],
+                "errors": [],
+                "unresolved_items": ["No accepted source evidence."],
+                "next_action": "Ask Scheduler to choose a safe fallback.",
+                "request_replan": True,
+                "replan_reason": "The original path did not produce accepted evidence.",
+            }
+        )
+        proposal = {
+            "proposal_kind": "GENERAL",
+            "reason": "No accepted source evidence is available.",
+            "preserved_results": [],
+            "downgrade_recommended": False,
+            "downgrade_reason": None,
+            "proposed_degraded_outcome": None,
+            "user_visible_disclosure": None,
+            "user_confirmation_request": None,
+            "affected_criterion_ids": ["C1"],
+            "blocked_requirements": ["Find one verified source."],
+            "external_state_impact": "No external state change.",
+            "preserved_safety_boundaries": [],
+        }
+        recovery_call = AsyncMock(return_value=(proposal, 1, None))
+
+        with patch("review_recovery.build_recovery_proposal", recovery_call):
+            result = await run_step_reporter(
+                model,
+                current_step=step,
+                review_packet=packet,
+                max_model_rounds=2,
+                model_output_max_tokens=1024,
+            )
+
+        self.assertEqual(result.report.recovery_proposal, proposal)
+        self.assertEqual(result.model_rounds_used, 2)
+        recovery_call.assert_awaited_once()
+        self.assertEqual(recovery_call.await_args.kwargs["worker_kind"], "GENERAL")
+
+    async def test_material_reader_accepts_public_evidence_alias(self) -> None:
+        packet = build_step_review_packet(
+            user_request="Find a cinema.",
+            plan_objective="Return verified cinema information.",
+            current_step=sample_step(),
+            current_attempt={
+                "attempt": 1,
+                "worker_submission": sample_submission_record().model_dump(mode="json"),
+                "finish_reason": "READY_FOR_REVIEW",
+                "stop_reason": "Worker submitted for review.",
+            },
+            stop_reason="Worker submitted for review.",
+        )
+        reader, _ = build_material_reader(
+            packet,
+            {"E1": "evidence:call-1"},
+        )
+
+        result = await reader.ainvoke({
+            "requests": [{"reference": "E1", "offset": 0}],
+        })
+
+        self.assertIn("Cinema", result)
+
+    def test_material_alias_is_normalized_without_business_retry(self) -> None:
+        report = normalize_report(
+            {
+                "step_id": 1,
+                "status": "COMPLETED",
+                "summary": "Verified.",
+                "stop_reason": "Review complete.",
+                "criterion_results": [
+                    {"criterion_id": "C1", "evidence": ["M1"], "status": "MET"}
+                ],
+                "confirmed_results": ["Verified one source."],
+                "completed_work": ["Reviewed evidence."],
+                "artifacts": [],
+                "approved_artifact_refs": [],
+                "worker_contributions": [],
+                "evidence": ["M1"],
+                "errors": [],
+                "unresolved_items": [],
+                "request_replan": False,
+                "replan_reason": None,
+            },
+            sample_step().success_criteria,
+            {"call-1": "E1"},
+            aliases={"M1": "E1"},
+        )
+
+        self.assertEqual(report.status, "COMPLETED")
+        self.assertEqual(report.evidence, ["call-1"])
+        self.assertEqual(report.criterion_results[0].evidence, ["call-1"])
+
     async def test_reporter_reads_packet_and_returns_planner_handoff(self) -> None:
         packet = build_step_review_packet(
             user_request="Find a cinema.",
@@ -299,6 +458,77 @@ class StepReporterAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(contracts), 1)
         for criterion in sample_step().success_criteria:
             self.assertIn(criterion, contracts[0])
+
+    async def test_web_result_reference_reaches_reporter_without_becoming_e_number(self) -> None:
+        record = sample_submission_record().model_copy(deep=True)
+        record.submission.criterion_claims[0].evidence_tool_call_ids = ["WA2"]
+        result_text = json.dumps({
+            "source_ref": "WA2",
+            "title": "Cinema result two",
+            "href": "https://example.com/two",
+            "body": "Observed listing",
+        })
+        record.resolved_evidence = [ResolvedToolEvidence(
+            tool_call_id="WA2",
+            tool_name="web_search",
+            arguments={
+                "source_ref": "WA2",
+                "search_arguments": {"query": "cinema"},
+            },
+            result=result_text,
+            result_chars=len(result_text),
+        )]
+        packet = build_step_review_packet(
+            user_request="Find a cinema.",
+            plan_objective="Return verified cinema information.",
+            current_step=sample_step(),
+            current_attempt={
+                "attempt": 1,
+                "worker_submission": record.model_dump(mode="json"),
+                "finish_reason": "READY_FOR_REVIEW",
+                "stop_reason": "Worker submitted for review.",
+            },
+            stop_reason="Worker submitted for review.",
+        )
+        model = FakeReporterModel({
+            "step_id": 1,
+            "status": "COMPLETED",
+            "summary": "The exact cited Web Search row supports the criterion.",
+            "stop_reason": "Independent review completed.",
+            "criterion_results": [{
+                "criterion": "Find one cinema source with tool evidence.",
+                "status": "MET",
+                "evidence": ["WA2"],
+            }],
+            "confirmed_results": ["One source was confirmed."],
+            "completed_work": ["Reviewed the cited Web Search row."],
+            "artifacts": [],
+            "approved_artifact_refs": [],
+            "worker_contributions": [{
+                "worker_id": "worker-a",
+                "contribution": "Found and cited the source.",
+            }],
+            "evidence": ["WA2"],
+            "errors": [],
+            "unresolved_items": [],
+            "next_action": "Continue to the next planned Step.",
+            "request_replan": False,
+            "replan_reason": None,
+        })
+
+        reviewed = await run_step_reporter(
+            model,
+            current_step=sample_step(),
+            review_packet=packet,
+            max_model_rounds=2,
+            model_output_max_tokens=1024,
+        )
+
+        self.assertEqual(reviewed.report.evidence, ["WA2"])
+        self.assertEqual(reviewed.report.criterion_results[0].evidence, ["WA2"])
+        prompt = "\n".join(m["content"] for m in model.structured.messages[0])
+        self.assertIn('"tool_call_id": "WA2"', prompt)
+        self.assertNotIn('"tool_call_id": "E1"', prompt)
 
 
 if __name__ == "__main__":

@@ -30,7 +30,7 @@ from workers.progress import (
     WorkerProgressState,
     publish_worker_progress,
 )
-from workers.submission import SUBMIT_FOR_REVIEW_NAME, submit_for_review
+from workers.submission import COMPLETE_WEB_STEP_NAME, complete_web_step
 from tools.web_artifacts import (
     DOWNLOAD_WEB_ARTIFACT_NAME,
     create_download_web_artifact_tool,
@@ -40,8 +40,17 @@ from tools.web_artifacts import (
 WEB_WORKER_NAME = "web_worker"
 WEB_BUSINESS_TOOL_NAMES = frozenset(
     {"get_current_time", "web_search", "find_github_mirror", "fetch_webpage",
-     "attachment_to_text", "ocr_image"}
+     "attachment_to_text", "ocr_image", "search_1688_products",
+     "list_cinemas", "list_city_movies", "get_cinema_showtimes", "get_movie_showtimes",
+     "host_list_files", "host_search_files", "host_import_file",
+     "send_local_file_to_feishu"}
 )
+from feishu_exports import export_tool_available
+from tools.capability_expansion import (
+    REQUEST_ADDITIONAL_CAPABILITIES_NAME,
+    request_additional_capabilities,
+)
+from step_user_question import ASK_USER_NAME, create_ask_user_tool
 BROWSER_TOOL_PREFIX = "browser_"
 
 
@@ -68,9 +77,11 @@ def select_web_worker_tools(
         if name in seen_names:
             raise ValueError(f"web_worker received duplicate tool name: {name}")
         seen_names.add(name)
-        if name in WEB_BUSINESS_TOOL_NAMES or name.startswith(
-            BROWSER_TOOL_PREFIX
-        ):
+        if name == "send_local_file_to_feishu" and not export_tool_available():
+            continue
+        if (name in WEB_BUSINESS_TOOL_NAMES
+                or name.startswith(BROWSER_TOOL_PREFIX)
+                or name.startswith("maps_")):
             selected.append(current_tool)
 
     selected_names = {_tool_name(tool) for tool in selected}
@@ -99,7 +110,12 @@ def create_web_worker(
     web_tools = with_knowledge_tool(select_web_worker_tools(tools))
     if any(
         _tool_name(tool)
-        in {PUBLISH_WORKER_PROGRESS_NAME, SUBMIT_FOR_REVIEW_NAME}
+        in {
+            PUBLISH_WORKER_PROGRESS_NAME,
+            COMPLETE_WEB_STEP_NAME,
+            REQUEST_ADDITIONAL_CAPABILITIES_NAME,
+            ASK_USER_NAME,
+        }
         for tool in web_tools
     ):
         raise ValueError("Web control tool was supplied as a business tool.")
@@ -114,24 +130,44 @@ def create_web_worker(
 
     resolved_backend = backend or StateBackend()
     resolved_permissions = list(permissions or ())
+    resolved_middleware = list(middleware or ())
+    progress_checkpoint_resolver = None
+    for current_middleware in resolved_middleware:
+        if not getattr(
+            current_middleware,
+            "select_web_progress_checkpoint",
+            False,
+        ):
+            continue
+        candidate = getattr(
+            current_middleware,
+            "progress_checkpoint_required",
+            None,
+        )
+        if callable(candidate):
+            progress_checkpoint_resolver = candidate
+            break
+    ask_user = create_ask_user_tool("WEB_WORKER")
     graph = create_deep_agent(
         model=model,
         tools=[
             *web_tools,
             download_tool,
+            ask_user,
+            request_additional_capabilities,
             publish_worker_progress,
-            submit_for_review,
+            complete_web_step,
         ],
         system_prompt=load_prompt("workers/web_worker"),
         backend=resolved_backend,
         permissions=resolved_permissions,
         middleware=[
-            *(middleware or ()),
+            *resolved_middleware,
             KnowledgeMiddleware('Web Agent'),
             ExecutionHistoryMiddleware(),
             ExecutionStateMiddleware(),
             WorkerCompactionMiddleware(summary_model if summary_model is not None else model),
-            RoleSkillsMiddleware(model, "web", [*DEEP_AGENT_FILE_TOOLS, *(_tool_name(t) for t in web_tools)],
+            RoleSkillsMiddleware(model, "web", [*DEEP_AGENT_FILE_TOOLS, ASK_USER_NAME, *(_tool_name(t) for t in web_tools)],
                                  policies=middleware or (), backend=resolved_backend),
             WorkerRuntimeContextMiddleware(),
             TaskFileAccessMiddleware(),
@@ -145,6 +181,7 @@ def create_web_worker(
                 every_tool_calls=progress_every_tool_calls,
                 finalization_model_rounds=finalization_model_rounds,
                 schema_repair_max_rounds=schema_repair_max_rounds,
+                progress_checkpoint_resolver=progress_checkpoint_resolver,
             ),
             EvidenceReferenceMiddleware(),
         ],

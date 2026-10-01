@@ -51,19 +51,19 @@ def planning_settings(*, max_step_attempts: int = 1) -> PlanningSettings:
 
 
 class ArtifactWorker:
-    def __init__(self, source: Path) -> None:
+    def __init__(self, source: Path, *, web_report_status: str = "COMPLETED") -> None:
         self.source = source
+        self.web_report_status = web_report_status
         self.calls = 0
 
     async def ainvoke(self, input_state, config=None):
         self.calls += 1
         payload = self.source.read_bytes()
         worker_id = input_state["worker_id"]
-        return {
+        result = {
             "messages": [AIMessage(content="Prepared a reusable research note.")],
             "executor_model_calls_used": 1,
             "executor_tool_calls_used": 1,
-            "show_all_toolsets_calls_used": 0,
             "worker_submission": {
                 "submitted_at": "2026-09-04T00:00:00+00:00",
                 "worker_id": worker_id,
@@ -93,10 +93,55 @@ class ArtifactWorker:
                 ],
             },
         }
+        if str(input_state.get("worker_kind") or "WEB").upper() == "WEB":
+            completed = self.web_report_status == "COMPLETED"
+            result["web_step_report"] = {
+                "submitted_at": "2026-09-04T00:00:01+00:00",
+                "worker_id": worker_id,
+                "report": {
+                    "step_id": input_state["step_id"],
+                    "status": self.web_report_status,
+                    "summary": (
+                        "The note was checked in the existing Web Worker context."
+                        if completed
+                        else "The saved evidence was insufficient."
+                    ),
+                    "stop_reason": "Web Worker submitted its own final StepReport.",
+                    "criterion_results": [
+                        {
+                            "criterion_id": "C1",
+                            "criterion": "Publish one reviewed note.",
+                            "status": "MET" if completed else "UNKNOWN",
+                            "evidence": [],
+                        }
+                    ],
+                    "confirmed_results": (
+                        ["One note was approved."] if completed else []
+                    ),
+                    "assessment_source": "WEB_SELF_REPORT",
+                    "unresolved_items": (
+                        [] if completed else ["A reliable source is still missing."]
+                    ),
+                    "next_action": (
+                        None if completed else "Scheduler may choose a different route."
+                    ),
+                },
+                "resolved_evidence": [],
+                "approved_artifact_candidate_ids": (
+                    ["research-note"] if completed else []
+                ),
+                "normalization_notes": [],
+            }
+        return result
 
 
 class PublicationModel:
-    def __init__(self, *, worker_kind="WEB", step_status="COMPLETED"):
+    def __init__(
+        self,
+        *,
+        worker_kind="WEB",
+        step_status="COMPLETED",
+    ):
         self.worker_kind = worker_kind
         self.step_status = step_status
         self.schemas = []
@@ -104,7 +149,9 @@ class PublicationModel:
     def with_structured_output(self, schema, **kwargs):
         async def respond(messages):
             if schema.__name__ == "SkillChoice":
-                return {"parsed": {"skill_ids": [], "reason": "Offline publication fixture has no matching skill"}}
+                request = json.loads(messages[0]["content"])
+                selected = ["plan-task-dependencies"] if request.get("role") == "scheduler" else []
+                return {"parsed": {"skill_ids": selected, "reason": "Offline publication fixture"}}
             self.schemas.append(schema.__name__)
             prompt = str(messages)
             if schema.__name__ == "SupervisorDecision":
@@ -233,7 +280,7 @@ class PlanningHandoffPublicationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(receipts, [])
         self.assertIn("required artifacts", checked.errors[0])
 
-    async def test_reporter_selection_is_published_by_harness_once(self):
+    async def test_web_self_report_selection_is_published_by_harness_once(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "private-source" / "research.md"
@@ -243,9 +290,7 @@ class PlanningHandoffPublicationTests(unittest.IsolatedAsyncioTestCase):
             await store.start()
             try:
                 model = PublicationModel()
-                independent_reporter = PublicationModel()
                 graph = build_planning_graph(
-                    role_models={"web_reporter": independent_reporter},
                     simple_model=model,
                     hard_model=model,
                     worker_registry=WorkerAgentRegistry.general_worker_first(
@@ -270,7 +315,6 @@ class PlanningHandoffPublicationTests(unittest.IsolatedAsyncioTestCase):
                     config={"configurable": {"progress_callback": ignore_progress}},
                 )
 
-                self.assertIn("StepReport", independent_reporter.schemas)
                 self.assertNotIn("StepReport", model.schemas)
                 report = result["completed_step_reports"][0]
                 self.assertEqual(report.status, "COMPLETED")
@@ -347,7 +391,7 @@ class PlanningHandoffPublicationTests(unittest.IsolatedAsyncioTestCase):
             await store.start()
             try:
                 model = PublicationModel(step_status="BLOCKED")
-                worker = ArtifactWorker(source)
+                worker = ArtifactWorker(source, web_report_status="BLOCKED")
                 graph = build_planning_graph(
                     simple_model=model,
                     hard_model=model,

@@ -5,6 +5,7 @@ metadata:
   roles: "general web"
   topics: "documents"
   required-tools: "attachment_to_text"
+  required-toolsets: "DOCUMENT_READING"
   exclusive: "true"
 ---
 

@@ -40,6 +40,7 @@ Desktop.ini
 .agent/
 .models/
 workspace/
+/feishu-outbox/
 
 # Databases, logs, caches, and traces
 *.db

@@ -1120,7 +1120,7 @@ async def ask_worker(
     # Code repair. Keep the role's skill snapshot/history, not old counters.
     for counter in (
         "executor_model_calls_used", "executor_tool_calls_used",
-        "show_all_toolsets_calls_used", "skill_preparation_calls_used", "worker_compaction_calls_used",
+        "skill_preparation_calls_used", "worker_compaction_calls_used",
     ):
         input_state.setdefault(counter, 0)
 
@@ -1189,11 +1189,6 @@ async def ask_worker(
                     )
                 ),
 
-                "show_all_toolsets_run_limit": (
-                    resolved_state_update.get(
-                        "show_all_toolsets_run_limit"
-                    )
-                ),
             },
         },
 
@@ -1234,12 +1229,6 @@ async def ask_worker(
                 )
             ),
 
-            "agent.show_all_toolsets_run_limit": (
-                resolved_state_update.get(
-                    "show_all_toolsets_run_limit",
-                    0,
-                )
-            ),
         },
     ) as span:
 
@@ -1256,6 +1245,24 @@ async def ask_worker(
         # forward pause/recovery controls, but cannot redirect the checkpoint.
         worker_configurable["thread_id"] = thread_id
         from trace_callbacks import callbacks
+        from progress_events import LiveToolProgressHandler
+        progress_callback = worker_configurable.get("progress_callback")
+        progress_handlers = []
+        if callable(progress_callback):
+            raw_step_id = resolved_state_update.get("step_id")
+            step_id = (
+                int(raw_step_id)
+                if str(raw_step_id or "").isdigit() and int(raw_step_id) > 0
+                else None
+            )
+            progress_handlers.append(
+                LiveToolProgressHandler(
+                    progress_callback,
+                    step_id=step_id,
+                    worker_id=str(resolved_state_update.get("worker_id") or thread_id),
+                    worker_role=trace_role,
+                )
+            )
         from workers.history_archive import history_scope
         with shared_code_scope(shared_owner), history_scope(thread_id.split(':step_', 1)[0], thread_id):
             result = await agent.ainvoke(
@@ -1263,7 +1270,7 @@ async def ask_worker(
 
                 config={
                     "configurable": worker_configurable,
-                    "callbacks": callbacks(),
+                    "callbacks": callbacks(progress_handlers),
                     "metadata": {"runtime.model_role": trace_role, "trace.owner": "personalops",
                                  **{"runtime." + k: v for k, v in identities(resolved_state_update).items()}},
                 },
@@ -1343,12 +1350,6 @@ async def ask_worker(
                 "executor_tool_calls_used"
             )
 
-            show_all_toolsets_calls_used = (
-                result.get(
-                    "show_all_toolsets_calls_used"
-                )
-            )
-
             leadership_model_rounds = result.get(
                 "worker_leadership_model_rounds_used",
                 0,
@@ -1424,22 +1425,6 @@ async def ask_worker(
                     "tool_call_count"
                 ] = tool_calls_used
 
-            if (
-                isinstance(
-                    show_all_toolsets_calls_used,
-                    int,
-                )
-                and not isinstance(
-                    show_all_toolsets_calls_used,
-                    bool,
-                )
-            ):
-                execution_summary[
-                    "show_all_toolsets_call_count"
-                ] = (
-                    show_all_toolsets_calls_used
-                )
-
         set_span_attributes(
             span,
 
@@ -1483,6 +1468,21 @@ async def ask_worker(
         )
 
         if return_details:
+            review_messages = [
+                *(
+                    result.get("worker_archived_messages", [])
+                    if isinstance(result, dict)
+                    else []
+                ),
+                *result_messages,
+            ]
+            from reporting.context import _tool_audit
+            from workers.submission import resolve_all_tool_evidence
+
+            tool_audit, tool_audit_available = _tool_audit(
+                {"messages": review_messages}
+            )
+            review_evidence = resolve_all_tool_evidence(review_messages)
             details = {
                 "general_result": result.get("general_result") if isinstance(result, dict) else None,
                 "final_answer": (
@@ -1502,6 +1502,16 @@ async def ask_worker(
                 "execution_summary": (
                     execution_summary
                 ),
+
+                # Harness-owned review records are derived from the complete
+                # Worker execution, not from evidence IDs selected by the
+                # Worker in its final report.
+                "tool_audit": tool_audit,
+                "tool_audit_available": tool_audit_available,
+                "review_evidence": [
+                    item.model_dump(mode="json")
+                    for item in review_evidence
+                ],
 
                 "worker_terminal_action": (
                     result.get("worker_terminal_action")
@@ -1546,6 +1556,8 @@ async def ask_worker(
             # checkpoint are deliberately not forwarded.
             if isinstance(result, dict):
                 for key in (
+                    "web_step_report",
+                    "web_step_report_error",
                     "code_worker_submission",
                     "code_review_loop",
                     "code_review_report",

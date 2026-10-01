@@ -43,6 +43,97 @@ class ScriptedModel:
 
 
 class ProgressiveSchedulerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_user_approved_downgrade_must_be_executed(self):
+        outcome = "推荐一部今晚可看且有公开评分的爱情片，不声称热度第一"
+        disclosure = "没有证据证明该影片是最火的。"
+
+        class ApprovedModel:
+            def __init__(self):
+                self.calls = 0
+                self.requests = []
+
+            def with_structured_output(self, schema, **_kwargs):
+                async def run(messages):
+                    self.calls += 1
+                    self.requests.append(copy.deepcopy(messages))
+                    if self.calls == 1:
+                        payload = {
+                            "action": "FINISH",
+                            "reason": "Scheduler still prefers the old contract.",
+                            "remaining_steps": [],
+                        }
+                    else:
+                        payload = {
+                            "action": "CONTINUE",
+                            "reason": "Execute the user-approved downgrade.",
+                            "remaining_steps": [{
+                                "step_id": 2,
+                                "objective": outcome,
+                                "success_criteria": [outcome, disclosure],
+                                "worker_kind": "WEB",
+                            }],
+                        }
+                    return {
+                        "parsed": schema.model_validate(payload),
+                        "raw": AIMessage(content=json.dumps(payload, ensure_ascii=False)),
+                        "parsing_error": None,
+                    }
+
+                return RunnableLambda(run)
+
+        proposal = {
+            "proposal_kind": "WEB",
+            "reason": "Popularity ranking was unavailable.",
+            "preserved_results": ["Showtime and rating were verified."],
+            "downgrade_recommended": True,
+            "downgrade_reason": "No reliable popularity ranking was found.",
+            "proposed_degraded_outcome": outcome,
+            "user_visible_disclosure": disclosure,
+            "user_confirmation_request": "是否允许按较弱条件推荐？",
+            "affected_criterion_ids": ["C1"],
+            "unavailable_or_uncertain_facts": ["Popularity rank."],
+            "attempted_approaches": ["Public ranking sources."],
+            "strongest_supported_claim": "One available rated movie.",
+            "human_decision": {
+                "status": "APPROVED",
+                "source": "USER",
+                "message": "用户已明确允许本次具体降级方案。",
+            },
+        }
+        report = StepReport(
+            step_id=1,
+            status="PARTIAL",
+            summary="Popularity was not proven.",
+            stop_reason="Reviewer requested Replan.",
+            request_replan=True,
+            replan_reason="Use the approved downgrade.",
+            recovery_proposal=proposal,
+        )
+        model = ApprovedModel()
+        context = PlanningContextPack(current_time="now", user_request="查最火爱情片")
+
+        result = await run_hard_replanner(
+            model,
+            context=context,
+            plan_objective="推荐电影",
+            plan_success_criteria=["证明最火"],
+            completed_step_reports=[report],
+            replan_context="User approved downgrade.",
+            remaining_steps=[],
+            remaining_budget={"model": 3},
+            next_step_id=2,
+            max_remaining_steps=1,
+            replan_source="step_reporter",
+            origin_worker_kind="WEB",
+            origin_step_id=1,
+        )
+
+        self.assertEqual(model.calls, 2)
+        self.assertEqual(result.output.action, "CONTINUE")
+        self.assertEqual(result.output.remaining_steps[0].objective, outcome)
+        self.assertIn(disclosure, result.output.remaining_steps[0].success_criteria)
+        self.assertIn("必须选择CONTINUE", json.dumps(model.requests[0], ensure_ascii=False))
+
     async def test_schema_once_and_every_request_extends_previous_history(self):
         model = ScriptedModel()
         context = PlanningContextPack(current_time="now", user_request="查影院并做海报")

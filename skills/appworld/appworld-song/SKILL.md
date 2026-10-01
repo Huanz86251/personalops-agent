@@ -5,6 +5,7 @@ metadata:
   roles: "general"
   topics: "appworld spotify music song playlist duration"
   required-tools: "appworld_discover appworld_execute"
+  required-toolsets: "APPWORLD"
 ---
 
 # AppWorld Song：时长与循环

@@ -4,5 +4,4 @@ importance 表示长期使用价值：low、medium、high、urgent；urgent 仅�
 
 日期必须是带时区的 ISO 8601；无法可靠确定就用 null。profile 的 name 只用于用户明确陈述自己的姓名；“以后叫我小黄”这类希望助手如何称呼用户的要求使用 preferred_name，不使用 name、other 或 preference。人物关系中的 relation 是该人物相对于用户的角色；other 必须填写 other_relation。task 的 request 包含普通请求或委托，order 只用于明确命令；promise 是某人明确承诺，reminder 是提醒，update 是任务状态或期限变化，cancel 是取消。action 保留简短常用动作，event 不得照抄自然语言动词创造新类型。
 
-只输出 JSON：
-{{schema}}
+按本轮动态注册的 records 结构输出；只允许上一轮已经选中的 record_type。

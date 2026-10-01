@@ -25,13 +25,17 @@ from workers.code_review_models import (
     CodeCheckResult,
     CodeChangedFile,
     CodeContinuationSubmission,
+    CodeReviewFinding,
     CodeReviewLoopState,
     CodeReviewReport,
+    CodeWorkerRepairResponse,
     CodeWorkerSubmission,
     SchedulerCodeDecision,
     finish_code_review,
     receive_code_continuation_submission,
+    receive_code_worker_response,
     record_code_publication,
+    request_code_repair,
 )
 from workers.code_runtime import CodeStepRuntime
 from workers.code_runtime_checkpoint import CodeRuntimeCheckpointStore
@@ -128,6 +132,18 @@ class FakeSandboxManager:
         self.cleaned = True
 
 
+class FailedControlPlaneManager(FakeSandboxManager):
+    def handoff(self, pair, role):
+        self.events.append(f"handoff:{role}")
+        if role == "REVIEWER":
+            raise RuntimeError("docker socket unavailable")
+        return replace(pair, active_role=role)
+
+    def freeze(self, pair):
+        self.events.append("freeze_failed")
+        raise RuntimeError("docker socket unavailable")
+
+
 class FakeWorkerGraph:
     async def ainvoke(self, state, config=None):
         candidate = CodeCandidateRef.model_validate(state["code_candidate"])
@@ -148,7 +164,6 @@ class FakeWorkerGraph:
             "messages": [AIMessage(content="Candidate submitted.")],
             "executor_model_calls_used": 1,
             "executor_tool_calls_used": 2,
-            "show_all_toolsets_calls_used": 0,
             "code_candidate": candidate.model_dump(mode="json"),
             "code_review_loop": loop.model_dump(mode="json"),
             "code_worker_submission": {
@@ -213,7 +228,6 @@ class FakeReviewerGraph:
             "messages": [AIMessage(content=report.summary)],
             "executor_model_calls_used": 2,
             "executor_tool_calls_used": 3,
-            "show_all_toolsets_calls_used": 0,
             "code_review_loop": loop.model_dump(mode="json"),
             "code_review_report": report.model_dump(mode="json"),
             "code_artifact_manifest": manifest.model_dump(mode="json"),
@@ -287,7 +301,6 @@ class ContinueWorkerGraph(FakeWorkerGraph):
             "messages": [AIMessage(content="Continued candidate submitted.")],
             "executor_model_calls_used": 1,
             "executor_tool_calls_used": 1,
-            "show_all_toolsets_calls_used": 0,
             "code_candidate": candidate.model_dump(mode="json"),
             "code_review_loop": loop.model_dump(mode="json"),
             "code_worker_submission": submission_record,
@@ -308,9 +321,88 @@ class FailOnceReviewerGraph(FakeReviewerGraph):
             "messages": [AIMessage(content=report.summary)],
             "executor_model_calls_used": 1,
             "executor_tool_calls_used": 1,
-            "show_all_toolsets_calls_used": 0,
             "code_review_loop": loop.model_dump(mode="json"),
             "code_review_report": report.model_dump(mode="json"),
+        }
+
+
+class RepairThenPassReviewerGraph(FakeReviewerGraph):
+    """First request a repair without a final report, then approve the revision."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def ainvoke(self, state, config=None):
+        self.calls += 1
+        if self.calls > 1:
+            return await super().ainvoke(state, config=config)
+        loop = CodeReviewLoopState.model_validate(state["code_review_loop"])
+        loop = request_code_repair(
+            loop,
+            summary="Use the requested delivery shape.",
+            required_changes=("Update the candidate once.",),
+            preserve_behaviors=("Keep the verified behavior.",),
+            findings=(
+                CodeReviewFinding(
+                    finding_id="F1",
+                    category="DELIVERY_MANIFEST",
+                    summary="The candidate needs one bounded repair.",
+                    affected_requirement_ids=("feature",),
+                    related_paths=("app.py",),
+                ),
+            ),
+        )
+        return {
+            "messages": [AIMessage(content="Repair requested.")],
+            "executor_model_calls_used": 1,
+            "executor_tool_calls_used": 1,
+            "code_review_loop": loop.model_dump(mode="json"),
+            # Deliberately no code_review_report: WAITING_FOR_WORKER is a
+            # handoff boundary, not a terminal review decision.
+        }
+
+
+class RepairAwareWorkerGraph(FakeWorkerGraph):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def ainvoke(self, state, config=None):
+        self.calls += 1
+        loop = CodeReviewLoopState.model_validate(state["code_review_loop"])
+        if loop.status != "WAITING_FOR_WORKER":
+            return await super().ainvoke(state, config=config)
+        candidate = loop.candidate.model_copy(
+            update={"candidate_revision": loop.candidate.candidate_revision + 1}
+        )
+        response = CodeWorkerRepairResponse(
+            round_no=loop.repair_round,
+            action="REVISION_READY",
+            candidate=candidate,
+            summary="Applied the bounded repair.",
+            changed_files=(
+                CodeChangedFile(
+                    path="app.py",
+                    change_summary="Applied the requested repair.",
+                ),
+            ),
+        )
+        loop = receive_code_worker_response(loop, response)
+        submission = CodeWorkerSubmission(
+            candidate=candidate,
+            summary="Implemented and repaired the feature.",
+            requirement_status={"feature": "MET"},
+            changed_files=response.changed_files,
+            proposed_artifact_paths=("app.py",),
+        )
+        record = dict(state["code_worker_submission"])
+        record["submission"] = submission.model_dump(mode="json")
+        return {
+            "messages": [AIMessage(content="Repair submitted.")],
+            "executor_model_calls_used": 1,
+            "executor_tool_calls_used": 1,
+            "code_candidate": candidate.model_dump(mode="json"),
+            "code_review_loop": loop.model_dump(mode="json"),
+            "code_worker_submission": record,
         }
 
 
@@ -325,8 +417,39 @@ class CodeRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "code_task": contract().model_dump(mode="json"),
             "executor_model_run_limit": 10,
             "executor_tool_run_limit": 10,
-            "show_all_toolsets_run_limit": 0,
         }
+
+    async def test_control_plane_failure_still_commits_recovery_checkpoint(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            (workspace / "app.py").write_text("print('base')\n", encoding="utf-8")
+            manager = FailedControlPlaneManager()
+            runtime = CodeStepRuntime(
+                object(),
+                sandbox_manager=manager,
+                source_root=workspace,
+                target_root=workspace,
+                archive_root=root / "archives",
+                run_storage_root=root / "runs",
+                worker_factory=lambda *args, **kwargs: FakeWorkerGraph(),
+                reviewer_factory=lambda *args, **kwargs: FakeReviewerGraph(),
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "docker socket unavailable"):
+                await runtime.ainvoke(
+                    self.runtime_input(),
+                    config={"configurable": {"thread_id": "code-control-failure"}},
+                )
+
+            checkpoint = CodeRuntimeCheckpointStore().load(
+                next((root / "archives").iterdir())
+            )
+            self.assertEqual(checkpoint.phase, "RECOVERY_REQUIRED")
+            self.assertIn("sandbox freeze was unavailable", checkpoint.reason)
+            self.assertIsNotNone(checkpoint.recovery_state)
+            self.assertFalse(manager.cleaned)
 
     async def test_worker_export_reviewer_publish_and_archive(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -370,7 +493,6 @@ class CodeRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     "code_task": contract().model_dump(mode="json"),
                     "executor_model_run_limit": 10,
                     "executor_tool_run_limit": 10,
-                    "show_all_toolsets_run_limit": 0,
                 },
                 config={"configurable": {"thread_id": "code-thread"}},
             )
@@ -458,6 +580,41 @@ class CodeRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue((archive_root / "final_record.json").is_file())
             self.assertTrue((archive_root / "runtime_checkpoint.json").is_file())
             self.assertTrue((archive_root / "retention_cleanup.json").is_file())
+
+    async def test_repair_handoff_does_not_require_a_final_review_report(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            (workspace / "app.py").write_text("print('base')\n", encoding="utf-8")
+            manager = FakeSandboxManager()
+            worker = RepairAwareWorkerGraph()
+            reviewer = RepairThenPassReviewerGraph()
+            runtime = CodeStepRuntime(
+                object(),
+                sandbox_manager=manager,
+                source_root=workspace,
+                target_root=workspace,
+                archive_root=root / "archives",
+                run_storage_root=root / "runs",
+                worker_factory=lambda *args, **kwargs: worker,
+                reviewer_factory=lambda *args, **kwargs: reviewer,
+            )
+
+            result = await runtime.ainvoke(
+                self.runtime_input(),
+                config={"configurable": {"thread_id": "code-repair-handoff"}},
+            )
+
+            self.assertEqual(result["code_review_loop"]["status"], "APPLIED")
+            self.assertEqual(
+                result["code_review_loop"]["candidate"]["candidate_revision"],
+                2,
+            )
+            self.assertEqual(worker.calls, 2)
+            self.assertEqual(reviewer.calls, 2)
+            self.assertIn("handoff:WORKER", manager.events)
+            self.assertTrue(manager.cleaned)
 
     async def test_insert_pauses_code_between_worker_and_reviewer(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -675,7 +832,6 @@ class CodeRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     "code_task": contract().model_dump(mode="json"),
                     "executor_model_run_limit": 10,
                     "executor_tool_run_limit": 10,
-                    "show_all_toolsets_run_limit": 0,
                 }
 
             first = await runtime.ainvoke(

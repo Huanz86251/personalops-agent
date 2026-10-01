@@ -5,6 +5,7 @@ metadata:
   roles: "code"
   topics: "implementation web-ui"
   required-tools: "read_file execute"
+  required-toolsets: "SOFTWARE_DEVELOPMENT"
 ---
 
 # 页面与交互实现

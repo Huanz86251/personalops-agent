@@ -1,7 +1,15 @@
 import unittest
+from datetime import datetime, timezone
 from langchain_core.messages import AIMessage, ToolMessage, HumanMessage
 from reporting.context import _tool_audit, materialize_worker_review_trace, build_step_review_packet
 from planning_models import PlanStep
+from workers.submission import (
+    ResolvedToolEvidence,
+    WorkerCriterionClaim,
+    WorkerSubmission,
+    WorkerSubmissionRecord,
+    resolve_all_tool_evidence,
+)
 
 class AuditTests(unittest.TestCase):
     def test_records_are_not_selected_by_worker(self):
@@ -64,3 +72,80 @@ class AuditTests(unittest.TestCase):
         rows,_=_tool_audit(trace)
         self.assertIsNone(rows[0]["fetch_status"])
         self.assertIsNone(rows[0]["error_type"])
+
+    def test_successful_retry_is_visible_even_when_worker_cites_failed_call(self):
+        messages = [
+            AIMessage(content="", tool_calls=[
+                {"id": "failed-map", "name": "maps_text_search", "args": {"keywords": "景点"}},
+            ]),
+            ToolMessage(
+                content="Execution failed: Unknown source_refs: S1",
+                tool_call_id="failed-map",
+                status="error",
+            ),
+            AIMessage(content="", tool_calls=[
+                {"id": "successful-map", "name": "maps_text_search", "args": {"keywords": "景点"}},
+            ]),
+            ToolMessage(
+                content='{"pois":[{"name":"故宫博物院"}]}',
+                tool_call_id="successful-map",
+            ),
+        ]
+        all_evidence = resolve_all_tool_evidence(messages)
+        self.assertEqual(
+            [item.tool_call_id for item in all_evidence],
+            ["failed-map", "successful-map"],
+        )
+
+        cited_failure = ResolvedToolEvidence(
+            tool_call_id="failed-map",
+            tool_name="maps_text_search",
+            arguments={"keywords": "景点"},
+            result="Execution failed: Unknown source_refs: S1",
+            result_chars=41,
+        )
+        record = WorkerSubmissionRecord(
+            submitted_at=datetime.now(timezone.utc),
+            worker_id="general-1",
+            event_id="event-1",
+            step_id="1",
+            total_tool_calls=2,
+            submission=WorkerSubmission(
+                summary="地图查询和文件交付已完成。",
+                final_conclusion="完成。",
+                criterion_claims=[WorkerCriterionClaim(
+                    criterion="查询景点",
+                    evidence_tool_call_ids=["failed-map"],
+                    conclusion="已查询。",
+                )],
+            ),
+            resolved_evidence=[cited_failure],
+        )
+        trace = materialize_worker_review_trace({
+            "attempt": 1,
+            "worker_submission": record.model_dump(mode="json"),
+            "review_evidence": [
+                item.model_dump(mode="json") for item in all_evidence
+            ],
+            "messages": messages,
+        })
+        packet = build_step_review_packet(
+            user_request="查询景点",
+            plan_objective="查询景点并交付",
+            current_step=PlanStep(
+                step_id=1,
+                worker_kind="GENERAL",
+                objective="查询景点",
+                success_criteria=["查询景点"],
+            ),
+            current_attempt=trace,
+            stop_reason="done",
+        )
+        self.assertEqual(
+            [item.tool_call_id for item in packet.attempts[0].resolved_evidence],
+            ["failed-map", "successful-map"],
+        )
+        self.assertIn(
+            "故宫博物院",
+            packet.attempts[0].resolved_evidence[1].result,
+        )

@@ -16,6 +16,7 @@ from workers.submission import (
     ResolvedToolEvidence,
     WorkerSubmissionRecord,
 )
+from workers.web_report import WebStepReportRecord
 from worker_termination import WorkerCancellationRecord
 
 
@@ -54,6 +55,20 @@ def _bounded_evidence(
         )
         for item in evidence
     ]
+
+
+def _review_evidence(trace: Mapping[str, Any]) -> list[ResolvedToolEvidence]:
+    """Return Harness-collected evidence independently of Worker citations."""
+
+    resolved: list[ResolvedToolEvidence] = []
+    for raw_item in trace.get("review_evidence", []) or []:
+        try:
+            resolved.append(ResolvedToolEvidence.model_validate(raw_item))
+        except Exception:
+            # A malformed optional audit row must not invalidate the Worker's
+            # structured submission. The tool audit still records the call.
+            continue
+    return resolved
 
 
 def _bounded_text(value: Any, max_chars: int) -> str:
@@ -138,7 +153,6 @@ def materialize_worker_review_trace(
                 "tool_call_count",
                 "tool_result_count",
                 "leadership_model_call_count",
-                "show_all_toolsets_call_count",
                 "finalization_model_call_count",
                 "finalization_tool_call_count",
             )
@@ -148,6 +162,16 @@ def materialize_worker_review_trace(
     if isinstance(applied_limits, Mapping):
         durable["applied_limits"] = dict(applied_limits)
 
+    raw_web_report = trace.get("web_step_report")
+    try:
+        web_report = (
+            WebStepReportRecord.model_validate(raw_web_report)
+            if raw_web_report
+            else None
+        )
+    except Exception:
+        web_report = None
+
     raw_submission = trace.get("worker_submission")
     if raw_submission:
         try:
@@ -155,6 +179,18 @@ def materialize_worker_review_trace(
         except Exception:
             submission = None
         if submission is not None:
+            if web_report is not None:
+                indexed_evidence = {
+                    item.tool_call_id: item
+                    for item in submission.resolved_evidence
+                }
+                indexed_evidence.update({
+                    item.tool_call_id: item
+                    for item in web_report.resolved_evidence
+                })
+                submission = submission.model_copy(
+                    update={"resolved_evidence": list(indexed_evidence.values())}
+                )
             durable["worker_submission"] = submission.model_copy(
                 update={
                     "resolved_evidence": _bounded_evidence(
@@ -162,6 +198,24 @@ def materialize_worker_review_trace(
                     )
                 }
             ).model_dump(mode="json")
+    review_evidence = _review_evidence(trace)
+    if review_evidence:
+        durable["review_evidence"] = [
+            item.model_dump(mode="json")
+            for item in _bounded_evidence(review_evidence)
+        ]
+    if web_report is not None:
+        durable["web_step_report"] = web_report.model_copy(
+            update={
+                "resolved_evidence": _bounded_evidence(
+                    web_report.resolved_evidence
+                )
+            }
+        ).model_dump(mode="json")
+    if trace.get("web_step_report_error"):
+        durable["web_step_report_error"] = _bounded_text(
+            trace["web_step_report_error"], 2000
+        )
     raw_cancellation = trace.get("worker_cancellation_record")
     if raw_cancellation:
         try:
@@ -255,6 +309,12 @@ def _build_attempt(
 
     if record is not None:
         submission = record.submission
+        merged_evidence = {
+            item.tool_call_id: item
+            for item in record.resolved_evidence
+        }
+        for item in _review_evidence(trace):
+            merged_evidence.setdefault(item.tool_call_id, item)
         artifact_owner = str(record.worker_id or assignment_key).strip()
         resolved_artifacts = [
             artifact.model_copy(
@@ -277,9 +337,10 @@ def _build_attempt(
             stop_reason=stop_reason,
             summary=submission.summary,
             final_conclusion=submission.final_conclusion,
+            answer_text=submission.answer_text,
             criterion_claims=submission.criterion_claims,
             resolved_evidence=_bounded_evidence(
-                record.resolved_evidence
+                list(merged_evidence.values())
             ),
             resolved_artifacts=resolved_artifacts,
             unresolved_items=submission.unresolved_items,
@@ -334,6 +395,7 @@ def build_step_review_packet(
     previous_step_report: StepReport | None = None,
     stop_reason: str,
     remaining_budget: Mapping[str, Any] | None = None,
+    user_interactions: Sequence[Mapping[str, Any]] = (),
 ) -> StepReviewPacket:
     """Build the materialized review view consumed by the Reporter."""
 
@@ -364,6 +426,7 @@ def build_step_review_packet(
             execution_guidance=current_step.execution_guidance,
             success_criteria=list(current_step.success_criteria),
             artifact_outputs=list(current_step.artifact_outputs),
+            user_interactions=[dict(item) for item in user_interactions],
         ),
         attempts=attempts,
         previous_step_report=(

@@ -9,7 +9,7 @@ from langchain_core.utils.function_calling import convert_to_openai_tool
 
 from handoff_knowledge import HandoffKnowledge, collect_handoff_knowledge
 from workers.general_completion import report_general_result
-from workers.submission import submit_for_review
+from workers.submission import complete_web_step
 from workers.code_submission import submit_code_for_review, submit_code_review
 from planning_models import StepReport
 
@@ -21,7 +21,7 @@ def item(**updates):
                 next_action="Read the actual note before modifying it.", **updates)
 
 
-@pytest.mark.parametrize("tool", [report_general_result, submit_for_review, submit_code_for_review, submit_code_review])
+@pytest.mark.parametrize("tool", [report_general_result, complete_web_step, submit_code_for_review, submit_code_review])
 def test_all_submission_schemas_explain_fresh_agent(tool):
     schema = json.dumps(convert_to_openai_tool(tool))
     for text in ("handoff_apis", "documentation", "parameters", "call_example", "next_action"):

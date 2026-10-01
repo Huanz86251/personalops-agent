@@ -26,6 +26,28 @@ class RelevanceTests(RagTests):
         finally:
             kb.close()
 
+    def test_below_threshold_is_explicit_in_trace_output(self):
+        source = self.base / 'manual.md'
+        source.write_text('# Guide\n\nUseful deployment instructions.', encoding='utf-8')
+        kb = self.open()
+        try:
+            kb.ingest(source)
+            with patch('knowledge_rag.service.set_span_output') as record:
+                hits = kb.search(
+                    'deployment',
+                    scorer=lambda q, docs: [NS(index=i, score=.39) for i in range(len(docs))],
+                )
+            payloads = [call.args[1] for call in record.call_args_list]
+            self.assertEqual(hits, [])
+            self.assertTrue(any(
+                payload.get('status') == 'no_match_above_threshold'
+                and payload.get('threshold') == .4
+                and payload.get('accepted_count') == 0
+                for payload in payloads
+            ))
+        finally:
+            kb.close()
+
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -72,6 +94,15 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload['content_tokens'], 3)
         self.assertEqual(payload['serialized_context_tokens'], len(text))
         self.assertGreater(payload['serialized_context_tokens'], payload['content_tokens'])
+
+    async def test_automatic_no_match_has_explicit_status(self):
+        self.hub.rag = AsyncMock(return_value=[])
+        with patch('knowledge_rag.runtime.set_span_output') as record:
+            with retrieval_scope(self.hub, 'owner', 'no-match-run'):
+                text = await automatic_rag('missing topic', 'General', 'no-match-step')
+        self.assertEqual(text, '')
+        self.assertEqual(record.call_args.args[1]['status'], 'no_match')
+        self.assertEqual(record.call_args.args[1]['selected_count'], 0)
 
     async def test_failure_is_empty_no_context(self):
         self.hub.rag.side_effect = RuntimeError('scorer unavailable')

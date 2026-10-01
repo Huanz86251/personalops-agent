@@ -15,16 +15,34 @@ from workers.code_state import CodeRuntimeContextMiddleware
 class RepairAwareWorker:
     def __init__(self):
         self.calls = []
+        self.checkpoints = {}
 
     async def ainvoke(self, input_state, config=None):
         thread_id = (config or {}).get("configurable", {}).get("thread_id")
+        # Emulate the sticky control state left in a real Worker checkpoint
+        # after complete_web_step. A new invocation must explicitly clear it.
+        resumed_state = {**self.checkpoints.get(thread_id, {}), **input_state}
         self.calls.append({
             "thread_id": thread_id,
-            "repair": input_state.get("final_worker_repair_request"),
-            "model_limit": input_state.get("executor_model_run_limit"),
-            "tool_limit": input_state.get("executor_tool_run_limit"),
+            "repair": resumed_state.get("final_worker_repair_request"),
+            "model_limit": resumed_state.get("executor_model_run_limit"),
+            "tool_limit": resumed_state.get("executor_tool_run_limit"),
+            "review_requested": resumed_state.get("worker_review_requested"),
+            "submission": resumed_state.get("worker_submission"),
+            "finalize_requested": resumed_state.get("worker_finalize_requested"),
+            "finalize_reason": resumed_state.get("worker_finalize_reason"),
+            "terminal_action": resumed_state.get("worker_terminal_action"),
         })
-        repaired = bool(input_state.get("final_worker_repair_request"))
+        if resumed_state.get("worker_review_requested"):
+            raise AssertionError("Repair Worker ended before model execution")
+        repaired = bool(resumed_state.get("final_worker_repair_request"))
+        self.checkpoints[thread_id] = {
+            "worker_review_requested": True,
+            "worker_submission": {"submitted": True},
+            "worker_finalize_requested": True,
+            "worker_finalize_reason": "BUDGET",
+            "worker_terminal_action": "SUBMIT",
+        }
         return {
             "messages": [
                 *input_state.get("messages", []),
@@ -32,7 +50,6 @@ class RepairAwareWorker:
             ],
             "executor_model_calls_used": 1,
             "executor_tool_calls_used": 1,
-            "show_all_toolsets_calls_used": 0,
             "general_result": {
                 "status": "COMPLETED",
                 "summary": "已补齐最终缺口。" if repaired else "首次执行完成。",
@@ -200,6 +217,11 @@ class FinalWorkerRepairLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(worker.calls[1]["repair"]["failed_criterion_ids"], ["C1"])
         self.assertEqual(worker.calls[1]["model_limit"], settings().max_step_executor_rounds)
         self.assertEqual(worker.calls[1]["tool_limit"], settings().max_step_tool_calls)
+        self.assertFalse(worker.calls[1]["review_requested"])
+        self.assertIsNone(worker.calls[1]["submission"])
+        self.assertFalse(worker.calls[1]["finalize_requested"])
+        self.assertIsNone(worker.calls[1]["finalize_reason"])
+        self.assertIsNone(worker.calls[1]["terminal_action"])
         self.assertEqual(result["final_worker_repair_round"], 1)
         self.assertEqual(
             result["current_step_trace"]["final_reviewer_request"]["observed_problem"],

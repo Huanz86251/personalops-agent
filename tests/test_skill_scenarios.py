@@ -136,7 +136,9 @@ class ScenarioReporterTests(unittest.IsolatedAsyncioTestCase):
         model = ScenarioReporterModel(selected=names)
         result = await run_step_reporter(model, current_step=sample_step(), review_packet=failed_packet(),
             max_model_rounds=5, model_output_max_tokens=4096, skill_catalog=catalog, skill_mode="dynamic")
-        self.assertEqual(result.report.status, "BLOCKED")
+        # Top-level Step status is Harness-derived from criterion judgments.
+        # A sole NOT_MET criterion deterministically yields FAILED.
+        self.assertEqual(result.report.status, "FAILED")
         self.assertEqual(len(model.selection_requests), 1)
         self.assertNotIn("HTTP 403", str(model.selection_requests))
         self.assertNotIn("PRIVATE_WORKER_TRAJECTORY", str(model.selection_requests))

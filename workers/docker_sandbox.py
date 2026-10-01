@@ -6,6 +6,7 @@ from runtime_tracing import operation
 import json
 import os
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -126,6 +127,52 @@ class DockerCLI:
             if os.name == "nt"
             else {}
         )
+        # Every Docker command on Windows is a short ``wsl.exe`` process.  If
+        # no other process keeps the distro alive, WSL may stop it (and its
+        # Docker daemon) between Worker and Reviewer control-plane commands.
+        # Keep one owned, silent process alive for the lifetime of this CLI.
+        self._runtime_lease: subprocess.Popen[bytes] | None = None
+        self._runtime_lease_lock = threading.Lock()
+
+    def _ensure_runtime_lease(self) -> None:
+        if os.name != "nt":
+            return
+        with self._runtime_lease_lock:
+            if (
+                self._runtime_lease is not None
+                and self._runtime_lease.poll() is None
+            ):
+                return
+            self._runtime_lease = subprocess.Popen(
+                [
+                    "wsl",
+                    "-d",
+                    self.wsl_distribution,
+                    "--exec",
+                    "sh",
+                    "-lc",
+                    "exec sleep infinity",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                **self._creation,
+            )
+
+    def close(self) -> None:
+        """Release only the WSL keepalive process owned by this adapter."""
+
+        with self._runtime_lease_lock:
+            process = self._runtime_lease
+            self._runtime_lease = None
+        if process is None or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
 
     def run(
         self,
@@ -193,6 +240,7 @@ class DockerCLI:
         return translated
 
     def ensure_daemon(self) -> None:
+        self._ensure_runtime_lease()
         if self.run(["version", "--format", "{{.Server.Version}}"], timeout=30).returncode == 0:
             return
 
@@ -398,6 +446,11 @@ class CodeSandboxManager:
     ) -> None:
         self.policy = policy or CodeSandboxPolicy()
         self.cli = cli or DockerCLI(self.policy.wsl_distribution)
+
+    def close(self) -> None:
+        close = getattr(self.cli, "close", None)
+        if callable(close):
+            close()
 
     @operation('Sandbox / Check Availability', fields=())
     def ensure_ready(self) -> None:
@@ -636,6 +689,9 @@ class CodeSandboxManager:
     def handoff(self, pair: CodeSandboxPair, role: CodeSandboxRole) -> CodeSandboxPair:
         if pair.active_role == role:
             return pair
+        # Control-plane operations are idempotent and may safely re-check the
+        # daemon.  Business ``docker exec`` calls are deliberately not retried.
+        self.cli.ensure_daemon()
         if pair.active_role == "WORKER":
             self.cli.require_success(
                 ["stop", "--time", "5", pair.worker_container],
@@ -661,6 +717,7 @@ class CodeSandboxManager:
     @operation('Sandbox / Freeze', fields=('pair',))
     def freeze(self, pair: CodeSandboxPair) -> CodeSandboxPair:
         if pair.active_role is not None:
+            self.cli.ensure_daemon()
             target = (
                 pair.worker_container
                 if pair.active_role == "WORKER"
@@ -708,6 +765,7 @@ class CodeSandboxManager:
     def freeze_all(self, pair: CodeSandboxPair) -> CodeSandboxPair:
         """Stop both owned roles without trusting a stale active-role flag."""
 
+        self.cli.ensure_daemon()
         for container in (pair.worker_container, pair.reviewer_container):
             record = self._inspect_owned_resource("container", container)
             if record is None:
@@ -891,6 +949,7 @@ class CodeSandboxManager:
         destination: Path,
         operation: str,
     ) -> Path:
+        self.cli.ensure_daemon()
         target = destination.resolve()
         if target.exists():
             if not target.is_dir() or any(target.iterdir()):
@@ -910,6 +969,7 @@ class CodeSandboxManager:
         return target
 
     def isolation_report(self, pair: CodeSandboxPair) -> dict:
+        self.cli.ensure_daemon()
         result = self.cli.require_success(
             ["inspect", pair.worker_container, pair.reviewer_container],
             operation="CODE sandbox isolation inspection",
@@ -937,6 +997,7 @@ class CodeSandboxManager:
 
     @operation('Sandbox / Cleanup', fields=('pair',))
     def cleanup(self, pair: CodeSandboxPair) -> None:
+        self.cli.ensure_daemon()
         errors = []
         for args in (["rm", "-f", pair.worker_container], ["rm", "-f", pair.reviewer_container],
                      ["volume", "rm", "-f", pair.candidate_volume], ["volume", "rm", "-f", pair.review_volume]):

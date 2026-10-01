@@ -46,6 +46,7 @@ from eventing import (
 )
 from feishu_attachments import AttachmentIngressError, FeishuAttachmentStore
 from feishu_exports import ExportPolicy, ExportService, export_event_scope
+from progress_events import OperationInactivityTimeoutError, run_with_progress_keepalive
 from scripts import local_ocr_worker
 from tools import local_native as local
 
@@ -164,6 +165,12 @@ def adapter_namespace(store, runtime, channel, pump):
         "_send_control_panel": AsyncMock(),
         "FEISHU_EXPORTS": ExportService(store.root / "exports", ExportPolicy(), channel),
         "export_event_scope": export_event_scope,
+        "run_with_progress_keepalive": run_with_progress_keepalive,
+        "OperationInactivityTimeoutError": OperationInactivityTimeoutError,
+        "settings": SimpleNamespace(worker_runtime=SimpleNamespace(
+            worker_inactivity_timeout_seconds=600,
+            code_inactivity_timeout_seconds=900,
+        )),
         "FEISHU_EVENT_CONTEXTS": {},
         "FEISHU_INTERACTIONS": {},
         "conversation_runtime": runtime,
@@ -178,6 +185,18 @@ def adapter_namespace(store, runtime, channel, pump):
         "_handle_command": AsyncMock(return_value=True),
         "_enqueue_feishu_cancel": AsyncMock(),
         "_handle_clean_action": AsyncMock(),
+        "STEP_USER_QUESTIONS": SimpleNamespace(
+            has_pending=lambda _chat: False,
+            consume_user_reply=lambda _chat, _text: SimpleNamespace(handled=False),
+        ),
+        "HOST_FILE_ACCESS": SimpleNamespace(
+            has_pending=lambda _chat: False,
+            consume_user_reply=lambda _chat, _text: SimpleNamespace(handled=False),
+        ),
+        "RECOVERY_APPROVALS": SimpleNamespace(
+            has_pending=lambda _chat: False,
+            consume_user_reply=lambda _chat, _text: SimpleNamespace(handled=False),
+        ),
     }
     exec(compile(ast.fix_missing_locations(module), str(source), "exec"), namespace)  # noqa: S102 - only local checked-in function definitions
     return namespace
@@ -244,6 +263,21 @@ class FeishuIngressTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             (await self.events.require_run(event.event_id)).status, RunStatus.QUEUED
         )
+
+    async def test_fresh_queue_event_uses_existing_reply_context_when_run_starts(self):
+        await self.ns["handle_feishu_message"](
+            incoming("ordinary-queue", "我download文件下面有一个简历能发给我吗")
+        )
+        event = self.pump.notify.call_args.args[0]
+        self.assertIn(event.event_id, self.ns["FEISHU_EVENT_CONTEXTS"])
+
+        result = await self.ns["_run_feishu_event"](event, None, False)
+
+        self.assertEqual(result, "answer")
+        self.runtime.ask.assert_awaited_once()
+        kwargs = self.runtime.ask.await_args.kwargs
+        self.assertEqual(kwargs["reply_target_id"], "chat")
+        self.assertEqual(kwargs["event_id"], event.event_id)
 
     async def test_same_name_different_files_and_explicit_reference_survive_restart(
         self,

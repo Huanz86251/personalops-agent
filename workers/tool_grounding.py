@@ -19,8 +19,9 @@ from langchain_core.utils.function_calling import convert_to_openai_tool
 
 SOURCE_FIELD = "source_refs"
 MODEL_REF = "MODEL"
+WEB_RESULT_REF_PATTERN = re.compile(r"^W[A-Z]+[1-9][0-9]*$")
 CONTROL_TOOLS = {
-    "report_general_result", "submit_for_review", "publish_worker_progress",
+    "report_general_result", "complete_web_step", "publish_worker_progress",
     "submit_code_for_review", "respond_to_code_review",
     "submit_continued_code_for_review", "request_code_worker_repair",
     "publish_reviewed_candidate", "submit_code_review",
@@ -46,16 +47,19 @@ class ToolGroundingPolicy:
 # tools are listed so a newly added mutation does not become exempt by accident.
 EXEMPT_TOOLS = CONTROL_TOOLS | {
     # Framework/control and terminal-style tools.
-    "show_all_toolsets", "execute", "shell",
+    "execute", "shell",
     # Pure local computation or zero-context inspection.
     "get_current_time", "symbolic_math", "python_syntax_check", "python_static_check",
-    "ls", "glob", "grep", "list_directory", "find_files", "grep_files",
+    "ls", "glob", "grep",
     # Harness-owned catalogs: the call itself creates the evidence.
-    "search_knowledge", "read_knowledge", "read_execution_history", "read_review_material",
+    "search_knowledge", "read_knowledge", "read_execution_history", "read_review_materials",
 }
 OPTIONAL_TOOLS = {
     # Read/search/navigation calls may begin from MODEL or a visible source.
     "read_file", "web_search", "find_github_mirror", "fetch_webpage",
+    "host_list_files", "host_search_files",
+    "list_cinemas", "list_city_movies", "get_cinema_showtimes",
+    "get_movie_showtimes", "search_1688_products",
     "attachment_to_text", "ocr_image", "spreadsheet_read",
     "browser_navigate", "browser_snapshot", "browser_find", "browser_tabs",
     "browser_navigate_back", "browser_wait_for", "browser_close",
@@ -64,11 +68,12 @@ OPTIONAL_TOOLS = {
 }
 REQUIRED_TOOLS = {
     # Mutations, external actions, captures and AppWorld execution.
-    "write_file", "replace_in_file", "edit_file", "delete", "convert_document",
+    "write_file", "edit_file", "delete", "convert_document",
     "spreadsheet_write", "spreadsheet_format", "spreadsheet_chart",
     "schedule_create", "schedule_create_feishu_reminder", "schedule_create_agent_task",
     "schedule_pause", "schedule_resume", "schedule_delete", "windows_notify",
     "capture_desktop_screenshot", "send_local_file_to_feishu",
+    "host_import_file",
     "browser_click", "browser_type", "browser_fill_form", "browser_select_option",
     "email_download_attachment", "email_create_draft",
     APPWORLD_DISCOVER, *APPWORLD_EXECUTION,
@@ -119,6 +124,16 @@ def source_catalog(messages, evidence_refs) -> dict[str, dict]:
         MODEL_REF: {"kind": "model_knowledge", "description": "通用推理或计算；不能单独证明环境API或业务参数"},
         "P1": {"kind": "policy", "description": "当前System与已选择Skill中的规则或示例"},
     }
+    # Parallel Web Search rows are first-class visible evidence.  Their IDs
+    # (WA1/WB3/...) are created by the Harness and may not have a ToolMessage of
+    # their own, so register the canonical values directly.
+    for raw_id, public_ref in dict(evidence_refs or {}).items():
+        public_ref = str(public_ref or "").strip()
+        if WEB_RESULT_REF_PATTERN.fullmatch(public_ref):
+            catalog[public_ref] = {
+                "kind": "web_search_result",
+                "canonical_id": str(raw_id),
+            }
     counts: dict[str, int] = {}
     for message in messages:
         kind = _kind(message)
@@ -169,11 +184,11 @@ def schema_with_sources(tool, available_refs):
             # validate_and_strip_tool_call checks membership at runtime.
             "type": "array", "items": {
                 "type": "string",
-                "pattern": r"^(?:MODEL|P1|[URSHCE][1-9][0-9]*)$",
+                "pattern": r"^(?:MODEL|P1|[URSHCE][1-9][0-9]*|W[A-Z]+[1-9][0-9]*)$",
             },
             "minItems": 1, "maxItems": 4, "uniqueItems": True,
             "description": (
-                "复制当前消息中实际可见的短来源号（如U1、R1、E2）。"
+                "复制当前消息中实际可见的短来源号（如U1、R1、E2、WA1、WB3）。"
                 "可用MODEL表示通用知识；"
                 "它不能单独证明环境中的具体接口、字段、路径或业务参数。"
             ),
@@ -697,15 +712,33 @@ def validate_and_strip_tool_call(request, evidence_refs):
         # model schemas still require the field, while an omitted low-risk
         # declaration is recorded as ungrounded model knowledge.
         refs = [MODEL_REF]
-    if not isinstance(refs, list) or not refs or any(not isinstance(ref, str) for ref in refs):
+    if isinstance(refs, str):
+        refs = [refs]
+    elif not isinstance(refs, list):
+        refs = []
+    # Formatting mistakes in this audit-only field must not force another paid
+    # model round.  Normalize singleton strings/whitespace/duplicates, discard
+    # non-string values, and keep the first four.
+    refs = list(dict.fromkeys(
+        ref.strip() for ref in refs if isinstance(ref, str) and ref.strip()
+    ))[:4]
+    if not refs and policy.mode is GroundingMode.REQUIRED:
         raise ValueError("source_refs is required; copy 1-4 visible source references or use MODEL.")
-    if len(refs) > 4 or len(set(refs)) != len(refs):
-        raise ValueError("source_refs must contain 1-4 unique references.")
+    if not refs:
+        refs = [MODEL_REF]
     catalog = source_catalog([*request.state.get("worker_archived_messages", []),
                               *request.state.get("messages", [])], evidence_refs)
     unknown = [ref for ref in refs if ref not in catalog]
-    if unknown:
-        raise ValueError("Unknown source_refs: " + ", ".join(unknown))
+    # Unknown IDs do not prove anything and are deterministically discarded.
+    # Mutating tools still fail closed if no valid source remains; optional
+    # read/search tools fall back to the explicit MODEL marker.
+    refs = [ref for ref in refs if ref in catalog]
+    if not refs:
+        if policy.mode is GroundingMode.OPTIONAL:
+            refs = [MODEL_REF]
+        else:
+            raise ValueError("No valid source_refs remain after discarding: " + ", ".join(unknown))
+    args[SOURCE_FIELD] = refs
     if name in APPWORLD_EXECUTION:
         prior = _tool_result_index(request.state, evidence_refs)
         grounded_by_result = any(

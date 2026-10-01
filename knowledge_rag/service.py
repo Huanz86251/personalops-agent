@@ -18,7 +18,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient, models
 
-from observability import trace_span, set_span_output
+from observability import trace_span, set_span_attributes, set_span_output
 
 PROJECT = Path(__file__).resolve().parents[1]
 SUPPORTED = {".txt", ".md", ".json", ".csv", ".html", ".pdf", ".docx", ".xlsx", ".pptx", ".jsonl"}
@@ -206,6 +206,22 @@ class KnowledgeBase:
                     break
             docs = [Document(page_content=p.payload["page_content"], metadata=p.payload["metadata"]) for p in points]
             if not docs:
+                set_span_attributes(
+                    span,
+                    **{
+                        "rag.status": "empty_index",
+                        "rag.candidate_count": 0,
+                        "rag.selected_count": 0,
+                    },
+                )
+                set_span_output(span, {
+                    "status": "empty_index",
+                    "query": query,
+                    "candidate_count": 0,
+                    "selected_count": 0,
+                    "results": [],
+                    "memory_slots_used": 0,
+                })
                 return []
             # An explicitly named, indexed API is the only automatic leaf read.
             # Natural-language matches are promoted to a sibling catalog below.
@@ -236,8 +252,19 @@ class KnowledgeBase:
                         '_source_id': source_id, '_version': self.manifest[source_id]['hash'],
                         '_collection': self.collection,
                     })
-                set_span_output(span, {'query': query, 'mode': 'exact_api_name', 'results': results,
-                                       'memory_slots_used': 0})
+                set_span_attributes(
+                    span,
+                    **{
+                        "rag.status": "exact_match",
+                        "rag.candidate_count": len(exact),
+                        "rag.selected_count": len(results),
+                        "rag.top_score": 1.0,
+                    },
+                )
+                set_span_output(span, {'status': 'exact_match', 'query': query,
+                                       'mode': 'exact_api_name', 'candidate_count': len(exact),
+                                       'selected_count': len(results), 'top_score': 1.0,
+                                       'results': results, 'memory_slots_used': 0})
                 return results
             k = self.config["candidate_limit"]
             bm25 = MatchingBM25Retriever.from_documents(docs, preprocess_func=terms, k=k)
@@ -257,24 +284,38 @@ class KnowledgeBase:
             score_by_text = {}
             audit_candidates = ordered[:]
             candidate_scores = {}
+            threshold = float(self.config.get("relevance_threshold", 0.4))
             if scorer is not None and ordered:
-                with trace_span("RAG / Rerank and Filter", kind="retriever", input_value={"query": query, "threshold": self.config.get("relevance_threshold", 0.4), "candidates": [d.page_content for d in ordered]}) as gate_span:
+                with trace_span("RAG / Rerank and Filter", kind="retriever", input_value={"query": query, "threshold": threshold, "candidates": [d.page_content for d in ordered]}) as gate_span:
                     scored = scorer(query, [d.page_content for d in ordered])
                     scores = {item.index: float(item.score) for item in scored}
                     candidate_scores = scores
                     score_by_text = {d.page_content: scores.get(i) for i, d in enumerate(ordered)}
-                    accepted = [(i, d) for i, d in enumerate(ordered) if scores.get(i, -1) >= self.config.get("relevance_threshold", 0.4)]
+                    accepted = [(i, d) for i, d in enumerate(ordered) if scores.get(i, -1) >= threshold]
                     accepted.sort(key=lambda item: -scores[item[0]])
-                    set_span_output(gate_span, {"scores": scores, "accepted_indices": [i for i, _ in accepted],
+                    top_score = max(scores.values()) if scores else None
+                    gate_status = "matches_above_threshold" if accepted else "no_match_above_threshold"
+                    set_span_attributes(gate_span, **{
+                        "rag.status": gate_status,
+                        "rag.threshold": threshold,
+                        "rag.candidate_count": len(ordered),
+                        "rag.accepted_count": len(accepted),
+                        "rag.top_score": top_score,
+                    })
+                    set_span_output(gate_span, {"status": gate_status, "threshold": threshold,
+                        "candidate_count": len(ordered), "accepted_count": len(accepted),
+                        "rejected_count": len(ordered) - len(accepted), "top_score": top_score,
+                        "scores": scores, "accepted_indices": [i for i, _ in accepted],
                         "ranking_changed": [i for i,_ in accepted] != sorted(i for i,_ in accepted),
                         "scored_expanded_context": False,
                         "score_meaning":"Cross Encoder relevance; not memory confidence or correctness probability",
                         "candidates":[{'candidate_index':i,'chunk_id':d.metadata.get('chunk_id'),
                             'source':d.metadata.get('source'),'path':d.metadata.get('full_path'),
                             'text':d.page_content,'cross_encoder_score':scores.get(i),
-                            'threshold_passed':scores.get(i,-1)>=self.config.get('relevance_threshold',.4)}
+                            'threshold_passed':scores.get(i,-1)>=threshold}
                             for i,d in enumerate(ordered)]})
                 ordered = [d for _, d in accepted]
+            accepted_count = len(ordered)
             result_limit, selection_policy = self._dynamic_result_limit(ordered, score_by_text)
             results, seen, used = [], set(), 0
             for hit in ordered:
@@ -378,7 +419,27 @@ class KnowledgeBase:
                 decisions.append({'chunk_id':ident,'candidate_index':i,'source':d.metadata.get('source'),
                     'cross_encoder_score':candidate_scores.get(i),'rank_after_filter':ranked_ids.get(ident),
                     'promoted_parent_id': promoted, 'selected_rank':selected_ids.get(selection_key),'decision':reason})
-            set_span_output(span, {"query": query, "context_tokens": used, "results": results,
+            top_score = max(candidate_scores.values()) if candidate_scores else None
+            status = (
+                "selected"
+                if results
+                else "no_match_above_threshold"
+                if scorer is not None and audit_candidates and accepted_count == 0
+                else "no_results_after_expansion"
+            )
+            set_span_attributes(span, **{
+                "rag.status": status,
+                "rag.threshold": threshold if scorer is not None else None,
+                "rag.candidate_count": len(audit_candidates),
+                "rag.accepted_count": accepted_count,
+                "rag.selected_count": len(results),
+                "rag.top_score": top_score,
+            })
+            set_span_output(span, {"status": status, "query": query,
+                "threshold": threshold if scorer is not None else None,
+                "candidate_count": len(audit_candidates), "accepted_count": accepted_count,
+                "selected_count": len(results), "top_score": top_score,
+                "context_tokens": used, "results": results,
                 "selection_policy": selection_policy,
                 "selection_decisions":decisions,"memory_slots_used":0})
             return results

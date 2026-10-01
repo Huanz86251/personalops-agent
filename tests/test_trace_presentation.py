@@ -10,7 +10,12 @@ from tests.test_model_roles import defaults
 from agent import build_role_model
 from model_roles import load_role_models
 from trace_callbacks import RuntimeTraceCallback, CALLBACK
-from trace_presentation import attach_audit_callbacks, run_name
+from trace_presentation import (
+    attach_audit_callbacks,
+    conversation_trace_name,
+    run_name,
+    trace_title,
+)
 from observability import trace_span
 from evals.appworld.adapter import UsageMeter
 
@@ -97,3 +102,20 @@ class PresentationTests(base.TraceTests):
         self.assertEqual(leaf.attributes["timing.first_token_status"], "observed")
         self.assertLessEqual(leaf.attributes["timing.first_token_ms"], leaf.attributes["timing.duration_ms"])
         self.assertNotEqual(run_name("Chain Audit"), run_name("Chain Audit"))
+
+    def test_root_trace_title_uses_only_three_terminal_icons_and_40_chars(self):
+        query = "请帮我查询今晚莱西可以看的爱情电影，同时说明剧情、评分、影院和放映时间"
+        self.assertLessEqual(len(trace_title(query)), 40)
+        self.assertEqual(conversation_trace_name(query, status="COMPLETED")[0], "✅")
+        self.assertEqual(conversation_trace_name(query, status="PARTIAL")[0], "⚠")
+        self.assertEqual(conversation_trace_name(query, status="FAILED")[0], "❌")
+        self.assertTrue(conversation_trace_name(query, resumed=True).startswith("续跑 · "))
+
+    def test_root_trace_title_redacts_credentials_paths_and_ids(self):
+        title = trace_title(
+            r"请读 C:\Users\Alice\Downloads\resume.pdf token=secret-value "
+            "ou_6c75c5a199c4573daf40ab7e77073b84"
+        )
+        self.assertNotIn("Alice", title)
+        self.assertNotIn("secret-value", title)
+        self.assertNotIn("ou_6c75", title)

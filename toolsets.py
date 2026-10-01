@@ -1,6 +1,13 @@
 from __future__ import annotations
 
 from prompt_loader import load_prompt
+from amap_mcp_runtime import (
+    AMAP_ACTION_LINK_TOOL_NAMES,
+    AMAP_LOCATION_CONTEXT_TOOL_NAMES,
+    AMAP_POI_TOOL_NAMES,
+    AMAP_ROUTE_TOOL_NAMES,
+    AMAP_TOOL_NAMES,
+)
 
 from dataclasses import (
     dataclass,
@@ -15,18 +22,6 @@ from typing import (
 # 它表示本轮不需要任何业务工具，
 # 本身不是一个真实Toolset。
 NO_TOOL_ROUTE = "NO_TOOL"
-
-# Deep Agents使用短工具名，旧主运行时使用同能力的历史名称。
-# Registry在解析真实工具池时接受这些确定性别名；模型和Cross-Encoder
-# 始终只看到实际存在的工具对象，不会得到虚构别名。
-TOOL_NAME_ALIASES: dict[str, tuple[str, ...]] = {
-    "list_directory": ("ls",),
-    "find_files": ("glob",),
-    "grep_files": ("grep",),
-    "replace_in_file": ("edit_file",),
-    "shell": ("execute",),
-}
-
 
 @dataclass(frozen=True)
 class ToolsetSpec:
@@ -52,6 +47,10 @@ class ToolsetSpec:
     # 不能再把其他业务组同时暴露给执行模型；角色公共工具仍由
     # Middleware 在组外追加。
     exclusive: bool = False
+
+    # False 表示该能力只能在 Worker 执行前的首次路由中选中，
+    # 不得被执行中的 request_additional_capabilities 当作回退路径。
+    allow_runtime_expansion: bool = True
 
 @dataclass(frozen=True)
 class ToolsetResolution:
@@ -338,24 +337,12 @@ class ToolsetRegistry:
             )
         )
 
-        def resolved_name(tool_name: str) -> str | None:
-            if tool_name in tools_by_name:
-                return tool_name
-            return next(
-                (
-                    alias
-                    for alias in TOOL_NAME_ALIASES.get(tool_name, ())
-                    if alias in tools_by_name
-                ),
-                None,
-            )
-
         required_resolutions = {
-            name: resolved_name(name)
+            name: name if name in tools_by_name else None
             for name in spec.required_tool_names
         }
         optional_resolutions = {
-            name: resolved_name(name)
+            name: name if name in tools_by_name else None
             for name in spec.optional_tool_names
         }
 
@@ -548,23 +535,64 @@ DEFAULT_TOOLSET_REGISTRY = (
     ToolsetRegistry(
         specs=[
             ToolsetSpec(
+                name="HOST_FILE_INTERACTION",
+                description=(
+                    "按用户要求浏览或搜索电脑上的既有文件，并在独立审批后将精确文件"
+                    "只读导入当前Worker隔离工作区；不等同于向外发送文件。"
+                ),
+                routing_profile=load_prompt("routing/toolsets/host_file_interaction"),
+                routing_threshold=0.35,
+                instructions=load_prompt("tools/host_file_interaction"),
+                required_tool_names=(
+                    "host_list_files", "host_search_files", "host_import_file",
+                ),
+            ),
+            ToolsetSpec(
                 name="FEISHU_FILE_EXPORT",
-                description="授权用户通过 General 申请将允许目录内的本地文件或目录发回当前飞书会话；上传前必须由用户单独确认，未配置时不可用。",
+                description="授权用户通过任一执行Worker将本机文件、下载候选、已审核handoff或工作区成品发回当前飞书会话；每次外发由独立Judge核对原始请求，宿主执行身份、完整性和大小校验（受飞书平台30 MB上限约束）。",
                 routing_profile=load_prompt("routing/toolsets/feishu_file_export"),
                 # “在飞书提醒我”也包含“飞书”，但不是文件回传。
                 # Secondary候选还有0.05共享容差；实际文件回传样例约0.56，
                 # 提醒样例约0.45，因此用0.52阻断后者并保留前者。
                 routing_threshold=0.52,
-                instructions="使用 send_local_file_to_feishu 提交文件或目录的绝对路径。PENDING 只能报告等待用户确认；不得通过 Shell、浏览器或其他工具绕过授权。",
+                instructions="使用 send_local_file_to_feishu 提交本机绝对路径、/downloads候选、/handoff文件或当前工作区路径和具体发送理由；Harness对每次外发独立审批，存疑时暂停等待用户允许或拒绝。只有工具返回 SENT 和 message_id 才算交付。USER_DENIED不可重试或绕过。工具报大小超限时停止，向用户说明未上传并询问是否允许拆分。",
                 required_tool_names=("send_local_file_to_feishu",),
             ),
             ToolsetSpec(
-                name="LOCAL_DOCUMENTS",
-                description="读取PDF/PPTX等文档并自动OCR、独立中英文图片OCR、格式转换及Excel操作；无需MCP服务。",
-                routing_profile=load_prompt("routing/toolsets/local_documents"),
+                name="DOCUMENT_READING",
+                description=(
+                    "读取和提取本地PDF、Word、PPTX、任务附件与扫描图片中的文字；"
+                    "支持分页、OCR和带页码的材料核对，但不修改表格或转换文件格式。"
+                ),
+                routing_profile=load_prompt("routing/toolsets/document_reading"),
                 routing_threshold=0.35,
-                instructions=load_prompt("tools/local_documents"),
-                required_tool_names=("attachment_to_text", "ocr_image", "convert_document", "spreadsheet_read", "spreadsheet_write", "spreadsheet_format", "spreadsheet_chart"),
+                instructions=load_prompt("tools/document_reading"),
+                required_tool_names=("attachment_to_text", "ocr_image"),
+            ),
+            ToolsetSpec(
+                name="DOCUMENT_CONVERSION",
+                description=(
+                    "把本地文档在PDF、DOCX、PPTX等受支持格式之间转换并生成新文件；"
+                    "用于明确的格式转换或导出，不负责阅读总结、电子表格编辑或发送文件。"
+                ),
+                routing_profile=load_prompt("routing/toolsets/document_conversion"),
+                routing_threshold=0.35,
+                instructions=load_prompt("tools/document_conversion"),
+                required_tool_names=("convert_document",),
+            ),
+            ToolsetSpec(
+                name="SPREADSHEET_WORK",
+                description=(
+                    "读取和修改Excel电子表格的单元格、公式、样式与图表；"
+                    "适用于XLSX表格分析和结构化编辑，不用于普通文本、PDF阅读或网页表格搜索。"
+                ),
+                routing_profile=load_prompt("routing/toolsets/spreadsheet_work"),
+                routing_threshold=0.35,
+                instructions=load_prompt("tools/spreadsheet_work"),
+                required_tool_names=(
+                    "spreadsheet_read", "spreadsheet_write",
+                    "spreadsheet_format", "spreadsheet_chart",
+                ),
             ),
             ToolsetSpec(
                 name="LOCAL_ANALYSIS",
@@ -586,38 +614,50 @@ DEFAULT_TOOLSET_REGISTRY = (
                 required_tool_names=("capture_desktop_screenshot", "ocr_image"),
             ),
             ToolsetSpec(
-                name="SCHEDULED_AUTOMATION",
+                name="SCHEDULE_CREATION",
                 description=(
-                    "创建、查询、暂停、恢复或取消持久化日程；可在到期时"
-                    "弹出Windows通知、向当前飞书会话推送文本，或把一次性任务"
-                    "作为新Event排入Agent队列；不负责外部日历和邮件。"
+                    "创建一次、每日或每周的持久提醒，或立即发送Windows通知；"
+                    "支持到期Windows通知、当前飞书会话文本和一次性Agent队列任务，"
+                    "但不创建外部日历会议，也不定时发送邮件。"
                 ),
-                routing_profile=load_prompt("routing/toolsets/scheduled_automation"),
+                routing_profile=load_prompt("routing/toolsets/schedule_creation"),
                 # Secondary candidates receive a small shared tolerance in
                 # ToolsetRouter. Keep this group at 0.45 so unrelated
                 # multi-tool tasks scoring around 0.36 cannot slip in, while
                 # representative reminder intents remain above 0.56.
                 routing_threshold=0.45,
-                instructions=load_prompt("tools/scheduled_automation"),
+                instructions=load_prompt("tools/schedule_creation"),
                 required_tool_names=(
                     "get_current_time",
                     "schedule_create",
                     "schedule_create_feishu_reminder",
                     "schedule_create_agent_task",
+                    "windows_notify",
+                ),
+            ),
+            ToolsetSpec(
+                name="SCHEDULE_MANAGEMENT",
+                description=(
+                    "查询已有持久提醒及运行记录，并按真实schedule_id暂停、恢复或取消；"
+                    "用于管理已经存在的提醒，不负责创建日历会议、发送邮件或执行任意后台脚本。"
+                ),
+                routing_profile=load_prompt("routing/toolsets/schedule_management"),
+                routing_threshold=0.45,
+                instructions=load_prompt("tools/schedule_management"),
+                required_tool_names=(
                     "schedule_list",
                     "schedule_pause",
                     "schedule_resume",
                     "schedule_delete",
                     "schedule_runs",
-                    "windows_notify",
                 ),
             ),
             ToolsetSpec(
                 name="EMAIL_READING",
                 description=(
                     "通过本地只读IMAP连接查看QQ、Foxmail或其他兼容邮箱的"
-                    "连接状态、近期邮件、正文摘要和附件，并可将指定附件保存到"
-                    "本机隔离目录；不能发送、删除、移动或标记邮件。"
+                    "连接状态、近期邮件、正文摘要和附件，并可将用户指定附件保存到"
+                    "本机隔离目录；不能写草稿、发送、删除、移动或标记邮件。"
                 ),
                 routing_profile=load_prompt("routing/toolsets/email_reading"),
                 routing_threshold=0.40,
@@ -629,7 +669,100 @@ DEFAULT_TOOLSET_REGISTRY = (
                     "email_read_message",
                     "email_list_attachments",
                     "email_download_attachment",
+                ),
+            ),
+            ToolsetSpec(
+                name="EMAIL_DRAFTING",
+                description=(
+                    "在用户明确要求后，把已确认的收件人、主题和纯文本正文保存到"
+                    "邮箱Drafts草稿箱；只保存草稿，绝不发送邮件，也不读取收件箱或下载附件。"
+                ),
+                routing_profile=load_prompt("routing/toolsets/email_drafting"),
+                routing_threshold=0.40,
+                instructions=load_prompt("tools/email_drafting"),
+                required_tool_names=(
                     "email_create_draft",
+                ),
+            ),
+            ToolsetSpec(
+                name="ECOMMERCE_1688",
+                description=(
+                    "在1688寻找商品和货源，查询带商品链接、起订量和阶梯价格的"
+                    "B2B报价；适合选品和批发价格参考，不代表淘宝零售价。"
+                ),
+                routing_profile=load_prompt("routing/toolsets/ecommerce_1688"),
+                routing_threshold=0.35,
+                instructions=load_prompt("tools/ecommerce_1688"),
+                required_tool_names=("search_1688_products",),
+                exclusive=False,
+            ),
+            ToolsetSpec(
+                name="AMAP_POI",
+                description=(
+                    "高德地点与兴趣点搜索：按城市、区县、地址、关键词或坐标查找餐馆、"
+                    "健身房、医院、商场、景点等实体，查询周边地点及POI详情。"
+                    "用于本地服务候选和地点核验，不证明评分、口碑或实时营业状态。"
+                ),
+                routing_profile=load_prompt("routing/toolsets/amap_poi"),
+                routing_threshold=0.35,
+                instructions=load_prompt("tools/amap_poi"),
+                required_tool_names=AMAP_POI_TOOL_NAMES,
+                exclusive=False,
+            ),
+            ToolsetSpec(
+                name="AMAP_ROUTE",
+                description=(
+                    "高德路线与距离：把用户给出的起点和终点解析为地点，查询驾车、公交、"
+                    "步行或骑行路线、里程与预计耗时；不用于餐馆口碑、天气或真实叫车下单。"
+                ),
+                routing_profile=load_prompt("routing/toolsets/amap_route"),
+                routing_threshold=0.35,
+                instructions=load_prompt("tools/amap_route"),
+                required_tool_names=AMAP_ROUTE_TOOL_NAMES,
+                exclusive=False,
+            ),
+            ToolsetSpec(
+                name="AMAP_LOCATION_CONTEXT",
+                description=(
+                    "高德地点上下文：地址与坐标互转、粗略IP定位以及指定城市的天气查询；"
+                    "用于地理编码、逆地理编码、地区识别和天气，不搜索本地商户或规划路线。"
+                ),
+                routing_profile=load_prompt("routing/toolsets/amap_location_context"),
+                routing_threshold=0.35,
+                instructions=load_prompt("tools/amap_location_context"),
+                required_tool_names=AMAP_LOCATION_CONTEXT_TOOL_NAMES,
+                exclusive=False,
+            ),
+            ToolsetSpec(
+                name="AMAP_ACTION_LINKS",
+                description=(
+                    "生成可交给高德地图客户端的个人地图、导航或打车链接；"
+                    "只在用户明确要求生成地图/导航/打车入口时选择，生成链接不代表已经导航、叫车或下单。"
+                ),
+                routing_profile=load_prompt("routing/toolsets/amap_action_links"),
+                routing_threshold=0.45,
+                instructions=load_prompt("tools/amap_action_links"),
+                required_tool_names=AMAP_ACTION_LINK_TOOL_NAMES,
+                exclusive=False,
+            ),
+            ToolsetSpec(
+                name="MOVIE",
+                description=(
+                    "电影专用：查询城市影院、指定日期的影片、"
+                    "各影院场次与逐场票价。"
+                ),
+                routing_profile=load_prompt("routing/toolsets/movie"),
+                routing_threshold=0.35,
+                instructions=load_prompt("tools/movie"),
+                required_tool_names=(
+                    "get_current_time",
+                    "list_cinemas",
+                    "list_city_movies",
+                    "get_cinema_showtimes",
+                    "get_movie_showtimes",
+                ),
+                optional_tool_names=(
+                    "web_search",
                 ),
             ),
             ToolsetSpec(
@@ -654,11 +787,6 @@ DEFAULT_TOOLSET_REGISTRY = (
 
                 optional_tool_names=(
                     "fetch_webpage",
-                    "browser_navigate",
-                    "browser_snapshot",
-                    "browser_find",
-                    "browser_tabs",
-                    "browser_close",
                 ),
             ),
 
@@ -666,8 +794,9 @@ DEFAULT_TOOLSET_REGISTRY = (
                 name="BROWSER_AUTOMATION",
 
                 description=(
-                    "执行真实浏览器导航、点击、输入、"
-                    "表单填写和多页面交互。"
+                    "高成本真实浏览器控制：仅当用户或当前Step明确要求"
+                    "登录、点击、输入、选择、提交或多页面交互时使用；"
+                    "不用于普通搜索、资料查询、推荐、静态阅读或搜索失败后的回退。"
                 ),
 
                 routing_profile=load_prompt("routing/toolsets/browser_automation"),
@@ -693,6 +822,7 @@ DEFAULT_TOOLSET_REGISTRY = (
                     "browser_tabs",
                     "browser_navigate_back",
                 ),
+                allow_runtime_expansion=False,
             ),
 
             ToolsetSpec(
@@ -712,9 +842,9 @@ DEFAULT_TOOLSET_REGISTRY = (
                 ),
 
                 required_tool_names=(
-                    "list_directory",
-                    "find_files",
-                    "grep_files",
+                    "ls",
+                    "glob",
+                    "grep",
                     "read_file",
                 ),
             ),
@@ -736,14 +866,14 @@ DEFAULT_TOOLSET_REGISTRY = (
 
                 required_tool_names=(
                     "read_file",
-                    "grep_files",
-                    "replace_in_file",
+                    "grep",
+                    "edit_file",
                     "write_file",
-                    "find_files",
+                    "glob",
                 ),
 
                 optional_tool_names=(
-                    "list_directory",
+                    "ls",
                 ),
             ),
 
@@ -764,14 +894,14 @@ DEFAULT_TOOLSET_REGISTRY = (
 
                 required_tool_names=(
                     "read_file",
-                    "grep_files",
-                    "shell",
+                    "grep",
+                    "execute",
                 ),
 
                 optional_tool_names=(
-                    "find_files",
-                    "list_directory",
-                    "replace_in_file",
+                    "glob",
+                    "ls",
+                    "edit_file",
                     "write_file",
                     "find_github_mirror",
                 ),

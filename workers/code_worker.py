@@ -37,6 +37,11 @@ from workers.progress import (
     publish_worker_progress,
 )
 from workers.tool_access import WorkerToolAllowlistMiddleware
+from tools.capability_expansion import (
+    REQUEST_ADDITIONAL_CAPABILITIES_NAME,
+    request_additional_capabilities,
+)
+from step_user_question import ASK_USER_NAME, create_ask_user_tool
 
 
 CODE_WORKER_NAME = "code_worker"
@@ -70,12 +75,16 @@ def create_code_worker(
 ) -> CompiledStateGraph:
     """Build a checkpointable single-writer implementation Agent."""
 
-    business_tools = with_knowledge_tool(select_general_worker_tools(tools))
+    business_tools = with_knowledge_tool(
+        select_general_worker_tools(tools, allow_file_export=True)
+    )
     reserved = {
         PUBLISH_WORKER_PROGRESS_NAME,
         SUBMIT_CODE_FOR_REVIEW_NAME,
         RESPOND_TO_CODE_REVIEW_NAME,
         SUBMIT_CONTINUED_CODE_FOR_REVIEW_NAME,
+        REQUEST_ADDITIONAL_CAPABILITIES_NAME,
+        ASK_USER_NAME,
     }
     if any(_tool_name(item) in reserved for item in business_tools):
         raise ValueError(
@@ -110,10 +119,13 @@ def create_code_worker(
         finalization_tools=(SUBMIT_CODE_FOR_REVIEW_NAME, RESPOND_TO_CODE_REVIEW_NAME, SUBMIT_CONTINUED_CODE_FOR_REVIEW_NAME),
     )
 
+    ask_user = create_ask_user_tool("CODE_WORKER")
     graph = create_deep_agent(
         model=model,
         tools=[
             *business_tools,
+            ask_user,
+            request_additional_capabilities,
             publish_worker_progress,
             submit_code_for_review,
             respond_to_code_review,

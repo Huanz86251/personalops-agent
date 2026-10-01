@@ -5,6 +5,7 @@ metadata:
   roles: "general"
   topics: "email documents"
   required-tools: "email_connection_status email_list_recent email_read_message"
+  required-toolsets: "EMAIL_READING"
   exclusive: "true"
 ---
 

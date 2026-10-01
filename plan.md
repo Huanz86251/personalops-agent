@@ -3,18 +3,11 @@ LangChain 的动态 Prompt Middleware 设计提示词
 顺序	工具	文件	实现方式
 1	get_current_time	time_tools.py	自己写
 2	calculate	calculator_tools.py	自己写，不能直接 eval
-3	list_directory	file_tools.py	自己写
-4	read_file	file_tools.py	自己写
-5	write_file	file_tools.py	自己写
-6	replace_in_file	file_tools.py	自己写
-7	search_files	file_tools.py	自己写
-8	run_shell	shell_tools.py	自己写
-9	run_python	python_tools.py	自己写
-10	web_search	web_tools.py	Tavily 官方集成
-11	web_fetch	web_tools.py	自己封装 httpx
-12	get_weather	weather_tools.py	调天气 API
-13	get_system_info	system_tools.py	自己写
-14	list_available_tools	registry.py	自己写
+3	任务文件系统	Deep Agents backend	按 Worker 隔离
+4	run_shell	shell_tools.py	历史设计，当前生产入口未接入
+5	web_search	web_tools.py	Web Worker
+6	web_fetch	web_tools.py	Web Worker
+7	list_available_tools	registry.py	按工具组动态路由
 
 
 自动记忆抽取

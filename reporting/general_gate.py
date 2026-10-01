@@ -13,6 +13,4 @@ def general_review_reasons(step, trace, packet, stop_reason=''):
         or (trace.get('worker_finalize_requested') and not schema_repair_only)
         or '预算' in str(stop_reason) or 'budget' in str(stop_reason).lower()):
         reasons.append('interrupted_or_budget_exhausted')
-    if result.get('files') or step.artifact_outputs or any(a.resolved_artifacts for a in packet.attempts):
-        reasons.append('artifact_review')
     return reasons

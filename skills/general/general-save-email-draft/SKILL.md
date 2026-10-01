@@ -5,6 +5,7 @@ metadata:
   roles: "general"
   topics: "email drafts"
   required-tools: "email_create_draft"
+  required-toolsets: "EMAIL_DRAFTING"
   exclusive: "true"
 ---
 

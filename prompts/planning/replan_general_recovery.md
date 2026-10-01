@@ -1,0 +1,7 @@
+本次重规划由GENERAL审核触发。先读取StepReport中的recovery_proposal，再独立决定是否尚有能完整满足原合同的低风险路径。Reviewer提案不是新计划，也没有修改用户授权的权限。
+
+若downgrade_recommended=false：你可CONTINUE生成保持原对象、范围、数量、写入效果、交付格式和安全边界的新Step，或FINISH并保留缺口。
+
+若downgrade_recommended=true：只信任Harness附加的human_decision。APPROVED时，必须CONTINUE并按proposed_degraded_outcome生成和执行新GENERAL Step，同时保留已确认结果、用户批准和user_visible_disclosure；新外部状态副作用超出批准内容时仍不可执行。DENIED或UNAVAILABLE时，不得采用该降级、换一种说法重提，或把拒绝改写成普通fallback；只能按原要求继续，或FINISH。
+
+例：原要求是“必须嵌入指定logo的PDF贺卡并发给我”，提案是“仅交无logo的Markdown草稿”。用户APPROVED后才能以这个精确较弱结果重规划；用户DENIED时不得交付草稿后声称任务完成。

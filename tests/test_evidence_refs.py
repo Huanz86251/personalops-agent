@@ -3,15 +3,40 @@ from types import SimpleNamespace
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage, HumanMessage
 from langchain_core.utils.function_calling import convert_to_openai_tool
-from workers.evidence_refs import registry, message_view, canonical_arguments, schema_view, EvidenceReferenceMiddleware
+from workers.evidence_refs import (
+    registry,
+    message_view,
+    canonical_arguments,
+    schema_view,
+    EvidenceReferenceMiddleware,
+    eligible_evidence,
+    web_result_evidence,
+    model_display_registry,
+)
 from workers.general_completion import report_general_result
-from workers.submission import submit_for_review, resolve_tool_evidence
+from workers.submission import complete_web_step, resolve_tool_evidence
 from workers.code_submission import submit_code_for_review, respond_to_code_review, submit_continued_code_for_review, submit_code_review
 
 RAW='call_1234567890abcdefghijklmnopqrstuvwxyz'
 def history():
     return [AIMessage(content='',tool_calls=[{'id':RAW,'name':'probe','args':{}}]),
             ToolMessage(content='actual result',name='probe',tool_call_id=RAW)]
+
+
+def web_history():
+    return [
+        AIMessage(content='', tool_calls=[{
+            'id': 'search-call', 'name': 'web_search', 'args': {'query': 'cinema'},
+        }]),
+        ToolMessage(
+            content=json.dumps({'groups': [{'results': [{
+                'source_ref': 'WA1', 'title': 'Cinema',
+                'href': 'https://example.com/cinema', 'body': 'Observed listing',
+            }]}]}),
+            name='web_search',
+            tool_call_id='search-call',
+        ),
+    ]
 
 def test_stable_archive_mapping_and_separate_agent_scope():
     old=history(); refs=registry({'messages':old})
@@ -36,7 +61,54 @@ def test_views_hide_ids_without_mutating_canonical_messages():
     assert restored['files'][0]['evidence_tool_call_id']==RAW
     assert resolve_tool_evidence(originals,restored['claims'][0]['evidence_tool_call_ids'])[0].result=='actual result'
 
-@pytest.mark.parametrize('tool',[report_general_result,submit_for_review,submit_code_for_review,respond_to_code_review,submit_continued_code_for_review,submit_code_review])
+
+def test_web_result_reference_is_registered_and_eligible_as_one_result():
+    messages = web_history()
+    indexed = web_result_evidence(messages)
+    assert indexed['WA1']['parent_tool_call_id'] == 'search-call'
+    assert indexed['WA1']['result']['title'] == 'Cinema'
+    eligible = eligible_evidence({'messages': messages})
+    assert 'WA1' in eligible
+    assert 'search-call' not in eligible
+    restored = canonical_arguments(
+        {'claims': [{'evidence_refs': ['WA1']}]},
+        {'WA1': 'WA1'},
+        eligible={'WA1'},
+    )
+    assert restored['claims'][0]['evidence_tool_call_ids'] == ['WA1']
+
+
+def test_successful_web_search_parent_is_not_shown_as_evidence_reference():
+    messages = web_history()
+    state = {'messages': messages}
+    refs = registry(state)
+    assert refs['search-call'] == 'E1'
+    displayed = model_display_registry(state, refs)
+    assert displayed['search-call'] == 'SEARCH_BATCH_1'
+    viewed = [message_view(message, displayed) for message in messages]
+    assert viewed[0].tool_calls[0]['id'] == 'SEARCH_BATCH_1'
+    assert viewed[1].tool_call_id == 'SEARCH_BATCH_1'
+    assert 'WA1' in viewed[1].content
+    assert 'E1' not in json.dumps([message.model_dump() for message in viewed])
+
+
+def test_failed_web_search_parent_keeps_failure_evidence_reference():
+    messages = [
+        AIMessage(content='', tool_calls=[{
+            'id': 'failed-search', 'name': 'web_search', 'args': {'query': 'missing'},
+        }]),
+        ToolMessage(
+            content=json.dumps({'error': 'backend unavailable'}),
+            name='web_search',
+            tool_call_id='failed-search',
+        ),
+    ]
+    state = {'messages': messages}
+    refs = registry(state)
+    assert model_display_registry(state, refs)['failed-search'] == 'E1'
+    assert 'failed-search' in eligible_evidence(state)
+
+@pytest.mark.parametrize('tool',[report_general_result,complete_web_step,submit_code_for_review,respond_to_code_review,submit_continued_code_for_review,submit_code_review])
 def test_all_submission_schemas_hide_long_id_contract(tool):
     before=convert_to_openai_tool(tool)
     viewed=convert_to_openai_tool(schema_view(tool))
@@ -79,7 +151,7 @@ def test_web_real_graph_short_refs():
             if not any(isinstance(m,ToolMessage) for m in messages):
                 msg=AIMessage(content='',tool_calls=[{'name':'web_search','id':RAW,'args':{'query':'check'}}])
             else:
-                msg=AIMessage(content='',tool_calls=[{'name':'submit_for_review','id':'submission','args':{'submission':{'summary':'checked','final_conclusion':'observed','criterion_claims':[{'criterion':'check','conclusion':'observed','evidence_refs':['E1']}]}}}])
+                msg=AIMessage(content='',tool_calls=[{'name':'complete_web_step','id':'submission','args':{'submission':{'summary':'checked','final_conclusion':'observed','criterion_claims':[{'criterion':'check','conclusion':'observed','status':'MET','evidence_refs':['E1']}]}}}])
             return ChatResult(generations=[ChatGeneration(message=msg)])
     result=create_web_worker(WebModel(),tools=[web_search]).invoke({'messages':[HumanMessage(content='check')],'worker_id':'web'})
     record=result['worker_submission']

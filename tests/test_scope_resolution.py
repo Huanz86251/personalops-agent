@@ -2,6 +2,7 @@ import unittest
 import os
 from unittest.mock import AsyncMock, patch
 
+from langchain_core.messages import AIMessage
 from planning_models import PlanningContextPack, ScopeContract, SupervisorDecision
 from hard_planning import _validate_supervisor_scope_contract
 from scheduler_runtime import SchedulerConversation
@@ -62,6 +63,13 @@ class SequencedStructuredModel(FakeStructuredModel):
         return response
 
 
+class FakeScopeDecisionModel(FakeStructuredModel):
+    def bind_tools(self, tools, **kwargs):
+        self.bound_tools = tools
+        self.bind_options = kwargs
+        return self
+
+
 class LengthFinishReasonError(ValueError):
     pass
 
@@ -104,6 +112,34 @@ class ScopeResolutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("bookmark_id", model.messages[0]["content"])
         self.assertIn("真实世界当前时间", model.messages[1]["content"])
         self.assertIn("now", model.messages[1]["content"])
+
+    async def test_positive_local_route_can_be_overruled_by_continue_decision(self):
+        model = FakeScopeDecisionModel(AIMessage(
+            content="",
+            tool_calls=[{
+                "name": "ScopeResolutionContinue",
+                "args": {},
+                "id": "scope-continue",
+                "type": "tool_call",
+            }],
+        ))
+        route = {
+            "label": "REQUIRES_SCOPE_CONTRACT", "label_id": 1,
+            "probability_requires_scope": 0.61, "threshold": 0.1,
+            "router_status": "ok",
+        }
+        with patch("scope_resolution.classify_scope_request", AsyncMock(return_value=route)):
+            updated, calls = await prepare_scope_context(
+                context("查一下北京故宫明天的开放时间和官方预约入口"), model,
+            )
+        self.assertEqual(calls, 1)
+        self.assertIsNone(updated.scope_contract)
+        self.assertEqual(updated.scope_router["resolver_status"], "continued")
+        self.assertEqual(updated.scope_router["resolver_decision"], "CONTINUE")
+        self.assertEqual(model.bind_options["tool_choice"], "any")
+        session = SchedulerConversation({}, updated)
+        session.initialize()
+        self.assertNotIn("已校验范围合同", [item["kind"] for item in session.records])
 
     def test_contract_preserves_cross_entity_required_context_and_read_only_effect(self):
         contract = ScopeContract.model_validate({
@@ -455,7 +491,8 @@ class ScopeResolutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("字段校验失败", repair)
         self.assertIn("sets: missing", repair)
         self.assertIn("operation: missing", repair)
-        self.assertIn("只返修 ScopeContract", repair)
+        self.assertIn("ScopeResolutionContinue", repair)
+        self.assertIn("ScopeContract", repair)
 
     async def test_truncation_requests_shorter_reasoning_and_complete_json(self):
         truncated = {

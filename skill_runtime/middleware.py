@@ -5,6 +5,7 @@ from __future__ import annotations
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.runnables import RunnableConfig
 
+from progress_events import ProgressEvent, safe_emit_progress
 from skill_runtime import prepare_skills, prepare_skills_sync, skill_prompt
 from workers.progress import WorkerProgressState
 
@@ -76,7 +77,29 @@ class RoleSkillsMiddleware(AgentMiddleware[WorkerProgressState]):
         return self._update(state, prepare_skills_sync(self.model, config=config, **self._options(state)))
 
     async def abefore_agent(self, state, runtime, config: RunnableConfig):
-        return self._update(state, await prepare_skills(self.model, config=config, **self._options(state)))
+        snapshot = await prepare_skills(self.model, config=config, **self._options(state))
+        progress_callback = (config.get("configurable") or {}).get("progress_callback")
+        if snapshot.selected and callable(progress_callback):
+            raw_step_id = state.get("step_id")
+            step_id = (
+                int(raw_step_id)
+                if str(raw_step_id or "").isdigit() and int(raw_step_id) > 0
+                else None
+            )
+            await safe_emit_progress(
+                progress_callback,
+                ProgressEvent(
+                    stage="CAPABILITY_SELECTED",
+                    message=(
+                        "已为当前执行选用 Skill："
+                        + "、".join(asset.name for asset in snapshot.selected)
+                        + "。"
+                    ),
+                    step_id=step_id,
+                    capability=str(state.get("worker_id") or self.role),
+                ),
+            )
+        return self._update(state, snapshot)
 
     @staticmethod
     def _with_skills(request):

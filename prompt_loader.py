@@ -1,5 +1,4 @@
 from functools import lru_cache
-import json
 from pathlib import Path
 import re
 from path import PROJECT_ROOT
@@ -17,14 +16,6 @@ PROMPT_NAME_PART_PATTERN = re.compile(
 )
 PROMPT_INCLUDE_PATTERN = re.compile(r"<!-- include: ([A-Za-z0-9_/-]+) -->")
 RUNTIME_CONTEXT_MARKER = "<!-- runtime-context -->"
-
-
-def render_structured_prompt(prompt_name: str, output_schema) -> str:
-    """Use the same model for the visible output format and response validation."""
-    return render_prompt(
-        prompt_name,
-        schema=json.dumps(output_schema.model_json_schema(), ensure_ascii=False, separators=(",", ":")),
-    )
 
 
 def _read_composed_prompt(prompt_name: str, stack: tuple[str, ...] = ()) -> str:

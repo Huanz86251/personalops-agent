@@ -32,6 +32,84 @@ class Scripted:
 
 
 class RepairTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def redundant_single_plan(*, assignments=1, legacy_entity="file"):
+        worker_assignments = [
+            {
+                "assignment_key": f"delivery_{index}",
+                "objective": f"Deliver the selected file, branch {index}",
+            }
+            for index in range(1, assignments + 1)
+        ]
+        return {
+            "action": "PLAN",
+            "plan_objective": "Locate and deliver the requested resume",
+            "plan_success_criteria": ["The selected file is delivered"],
+            "steps": [
+                {
+                    "step_id": 1,
+                    "objective": "Locate and deliver the requested resume",
+                    "success_criteria": ["The selected file is delivered"],
+                    "worker_kind": "GENERAL",
+                    "execution_mode": "SINGLE",
+                    "worker_assignments": worker_assignments,
+                    "target_selection": {
+                        "target_entity": "file",
+                        "result_entity": legacy_entity,
+                        "effect_mode": "READ_ONLY",
+                        "sets": [
+                            {
+                                "set_id": "A",
+                                "definition": "Resume files in Downloads",
+                                "condition_owner": "file",
+                            }
+                        ],
+                        "operation": "DIRECT",
+                        "operands": ["A"],
+                    },
+                }
+            ],
+        }
+
+    async def test_supervisor_deterministic_shape_repair_avoids_model_retry(self):
+        model = Scripted([{"parsed": self.redundant_single_plan()}])
+        fallback = SupervisorDecision.model_validate(
+            {
+                "plan_objective": "Fallback",
+                "plan_success_criteria": ["Stop"],
+                "steps": [
+                    {
+                        "step_id": 1,
+                        "objective": "Stop",
+                        "success_criteria": ["Stop"],
+                    }
+                ],
+            }
+        )
+        result = await _invoke_structured(
+            model,
+            prompt="fixed",
+            output_schema=SupervisorDecision,
+            trace_name="test",
+            fallback_factory=lambda _error: fallback,
+        )
+        self.assertEqual(len(model.requests), 1)
+        self.assertEqual(result.validation_retry_count, 0)
+        self.assertFalse(result.used_fallback)
+        step = result.output.steps[0]
+        self.assertEqual(step.worker_assignments, [])
+        self.assertEqual(step.target_selection.sets[0].result_entity, "file")
+
+    def test_supervisor_shape_repair_does_not_guess_ambiguous_semantics(self):
+        with self.assertRaises(ValidationError):
+            SupervisorDecision.model_validate(
+                self.redundant_single_plan(assignments=2)
+            )
+        with self.assertRaises(ValidationError):
+            SupervisorDecision.model_validate(
+                self.redundant_single_plan(legacy_entity="document")
+            )
+
     async def test_original_prefix_and_caller_history_unchanged(self):
         raw = '{"count":"wrong"}'
         model = Scripted([{"raw": AIMessage(content=raw), "parsing_error": ValueError("plan" * 3000 + "bad count")},

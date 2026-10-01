@@ -19,6 +19,15 @@ def report_payload(criterion_status="MET", status="COMPLETED"):
 
 
 class ReportDecisionTests(unittest.TestCase):
+    def test_city_movie_tool_description_prevents_per_cinema_fanout(self):
+        from tools.cinema_showtimes import list_city_movies_tool
+
+        description = list_city_movies_tool.description
+        self.assertIn("城市级问题只调用本工具一次", description)
+        self.assertIn("不要先调用", description)
+        self.assertIn("get_cinema_showtimes", description)
+        self.assertIn("指定某一部影片", description)
+
     def test_completed_rejects_each_unfinished_criterion(self):
         for status in ("UNKNOWN", "PARTIAL", "NOT_MET"):
             with self.subTest(status=status):
@@ -29,7 +38,7 @@ class ReportDecisionTests(unittest.TestCase):
         payload["errors"] = ["Earlier fetch returned an empty shell; alternate source supplied evidence."]
         self.assertTrue(_report_matches_step(StepReport(**payload), sample_step()))
 
-    def test_scheduler_receives_each_report_field_without_worker_history(self):
+    def test_scheduler_receives_review_projection_without_worker_context(self):
         payload = report_payload("UNKNOWN", "PARTIAL")
         payload.update(completed_work=["Read an alternate reference quote."],
                        errors=["Target page was a shell."], unresolved_items=["Target seller live price."],
@@ -41,8 +50,21 @@ class ReportDecisionTests(unittest.TestCase):
         record_graph_facts(session, {"completed_step_reports": [report.model_dump(mode="json")]})
         session.compact()
         delivered = json.loads(session.wire()[0]["content"])["StepReport"]
-        self.assertEqual(delivered, report.model_dump(mode="json"))
-        self.assertEqual(set(delivered), set(StepReport.model_fields))
+        self.assertEqual(delivered["summary"], report.summary)
+        self.assertEqual(delivered["criterion_results"], [
+            item.model_dump(mode="json") for item in report.criterion_results
+        ])
+        self.assertEqual(delivered["replan_reason"], report.replan_reason)
+        self.assertNotIn("answer_text", delivered)
+        self.assertNotIn("handoff_knowledge", delivered)
+        self.assertNotIn("handoff_apis", delivered)
+        self.assertNotIn("handoff_api_receipts", delivered)
+        self.assertNotIn("evidence", delivered)
+        self.assertTrue({
+            "step_id", "summary", "stop_reason", "status",
+            "criterion_results", "request_replan", "replan_reason",
+            "recovery_proposal",
+        }.issubset(delivered))
         self.assertNotIn("messages", delivered)
 
     def test_targeted_tool_evidence_survives_bounded_packet(self):

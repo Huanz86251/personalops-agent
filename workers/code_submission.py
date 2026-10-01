@@ -32,6 +32,7 @@ from workers.code_attempt_models import (
 )
 from workers.code_publisher import PUBLISH_REVIEWED_CANDIDATE_NAME
 from workers.submission import ResolvedToolEvidence, resolve_tool_evidence
+from workers.control_protocol import defer_terminal_call_if_mixed
 
 
 SUBMIT_CODE_FOR_REVIEW_NAME = "submit_code_for_review"
@@ -49,6 +50,7 @@ CODE_CONTROL_TOOL_NAMES = frozenset(
         SUBMIT_CODE_REVIEW_NAME,
         PUBLISH_REVIEWED_CANDIDATE_NAME,
         "publish_worker_progress",
+        "request_additional_capabilities",
     }
 )
 
@@ -198,6 +200,10 @@ def submit_code_for_review(
 ) -> Command:
     """Store the initial candidate manifest and stop the Code Worker turn."""
 
+    deferred = defer_terminal_call_if_mixed(runtime, SUBMIT_CODE_FOR_REVIEW_NAME)
+    if deferred is not None:
+        return deferred
+
     if submission.plan_challenge is not None and int(
         runtime.state.get("worker_plan_challenges_remaining", 0) or 0
     ) <= 0:
@@ -256,6 +262,10 @@ def respond_to_code_review(
     runtime: ToolRuntime,
 ) -> Command:
     """Respond to one Reviewer repair request using the same Worker context."""
+
+    deferred = defer_terminal_call_if_mixed(runtime, RESPOND_TO_CODE_REVIEW_NAME)
+    if deferred is not None:
+        return deferred
 
     try:
         loop = _read_loop(runtime.state)
@@ -338,6 +348,12 @@ def submit_continued_code_for_review(
     runtime: ToolRuntime,
 ) -> Command:
     """Send continuation output to Reviewer, never directly to Scheduler."""
+
+    deferred = defer_terminal_call_if_mixed(
+        runtime, SUBMIT_CONTINUED_CODE_FOR_REVIEW_NAME
+    )
+    if deferred is not None:
+        return deferred
 
     try:
         loop = _read_loop(runtime.state)
@@ -423,6 +439,12 @@ def request_code_worker_repair(
 ) -> Command:
     """Store one bounded Reviewer-to-Worker repair instruction."""
 
+    deferred = defer_terminal_call_if_mixed(
+        runtime, REQUEST_CODE_WORKER_REPAIR_NAME
+    )
+    if deferred is not None:
+        return deferred
+
     try:
         loop = _read_loop(runtime.state)
         expected = {r.requirement_id for r in CodeTaskContract.model_validate(runtime.state.get("code_task")).requirements}
@@ -487,6 +509,10 @@ def submit_code_review(
     runtime: ToolRuntime,
 ) -> Command:
     """Store the final CODE review and close the Reviewer turn."""
+
+    deferred = defer_terminal_call_if_mixed(runtime, SUBMIT_CODE_REVIEW_NAME)
+    if deferred is not None:
+        return deferred
 
     try:
         loop = _read_loop(runtime.state)

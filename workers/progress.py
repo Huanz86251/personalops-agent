@@ -54,12 +54,32 @@ from config import (
     WORKER_PROGRESS_HARD_MAX_TOOL_CALLS,
     WORKER_PROGRESS_MIN_TOOL_CALLS,
 )
-from workers.submission import SUBMIT_FOR_REVIEW_NAME
+from workers.submission import COMPLETE_WEB_STEP_NAME
 
 
 PUBLISH_WORKER_PROGRESS_NAME = (
     "publish_worker_progress"
 )
+
+
+def merge_web_search_cache(
+    left: dict[str, dict[str, Any]] | None,
+    right: dict[str, dict[str, Any]] | None,
+) -> dict[str, dict[str, Any]]:
+    """Merge parallel search lanes and keep the newest bounded cache entries."""
+
+    merged = dict(left or {})
+    merged.update(right or {})
+    return dict(list(merged.items())[-24:])
+
+
+def keep_largest_web_search_lane(
+    left: int | None,
+    right: int | None,
+) -> int:
+    """Keep globally monotonic Web result lanes across cache-only pages."""
+
+    return max(int(left or 0), int(right or 0))
 
 
 WorkerCompletionClaim = Literal[
@@ -89,24 +109,25 @@ class WorkerProgressPayload(
             "What has been accomplished since the previous report."
         ),
     )
-    findings: list[str] = Field(
+    findings: list[Annotated[str, Field(min_length=1, max_length=1200)]] = Field(
         default_factory=list,
         max_length=8,
         description=(
             "Important evidence, decisions, or completed changes."
         ),
     )
-    difficulties: list[str] = Field(
+    difficulties: list[Annotated[str, Field(min_length=1, max_length=1200)]] = Field(
         default_factory=list,
         max_length=8,
         description=(
             "Current blockers, repeated failures, or uncertainty."
         ),
     )
-    evidence_refs: list[str] = Field(
+    evidence_refs: list[Annotated[str, Field(min_length=1, max_length=160)]] = Field(
         default_factory=list,
+        max_length=24,
         description=(
-            "Relevant references to sources, files, test output, or other saved artifacts."
+            "最多24个相关来源、文件、测试输出或已保存产物编号，每个最多160字符。"
         ),
     )
     next_action: str = Field(
@@ -148,12 +169,15 @@ class WorkerProgressPayload(
         "findings",
         "difficulties",
         "evidence_refs",
+        mode="before",
     )
     @classmethod
     def _normalize_string_lists(
         cls,
-        values: list[str],
+        values,
     ) -> list[str]:
+        from schema_normalization import coerce_text_sequence
+        values = coerce_text_sequence(values)
         normalized_values: list[str] = []
         seen: set[str] = set()
 
@@ -200,6 +224,16 @@ class WorkerProgressState(
     """Unified Conversation, execution-budget, and Worker progress state."""
 
     conversation_id: NotRequired[str]
+    # web_search首轮只向模型展示少量结果；同一次上游响应的其余结果
+    # 留在checkpoint中，后续翻页只读本地缓存，不再次请求搜索服务。
+    web_search_cache: NotRequired[
+        Annotated[dict[str, dict[str, Any]], merge_web_search_cache]
+    ]
+    web_search_lane_cursor: NotRequired[
+        Annotated[int, keep_largest_web_search_lane]
+    ]
+    # 同一Planning Step/slot跨Worker attempt复用能力路由；不同并行slot隔离。
+    toolset_route_cache_key: NotRequired[str]
     worker_evidence_refs: NotRequired[dict[str, str]]
     worker_criterion_refs: NotRequired[dict[str, str]]
     worker_target_selection: NotRequired[dict[str, Any] | None]
@@ -210,6 +244,13 @@ class WorkerProgressState(
     toolset_route_query: NotRequired[str]
     # Scheduler决定当前Step是否开放业务工具。缺失时Harness按ENABLED处理。
     step_tool_access: NotRequired[str | bool]
+    # Scheduler only declares whether this Step may need the host boundary.
+    # Exact paths and operations are proposed by the Worker and adjudicated by
+    # the Harness; this flag never grants access by itself.
+    requires_host_file_access: NotRequired[bool]
+    host_original_user_request: NotRequired[str]
+    host_current_step: NotRequired[str]
+    host_worker_kind: NotRequired[str]
     # 仅当第一轮本地路由低于绝对阈值时使用；由Harness从用户原话生成头尾窗口。
     toolset_route_fallback_query: NotRequired[str]
     # 仅供低置信工具组模型选择使用；不自动拼入普通Worker上下文。
@@ -243,10 +284,11 @@ class WorkerProgressState(
 
     executor_model_run_limit: NotRequired[int]
     executor_tool_run_limit: NotRequired[int]
-    show_all_toolsets_run_limit: NotRequired[int]
     executor_model_calls_used: NotRequired[int]
     executor_tool_calls_used: NotRequired[int]
-    show_all_toolsets_calls_used: NotRequired[int]
+    # Worker可提交一次有证据的能力缺口。第二条记录表示重复申请，
+    # 由现有finalization链强制PARTIAL/FAILED收尾。
+    capability_expansion_requests: NotRequired[list[dict[str, Any]]]
 
     worker_id: NotRequired[str]
     event_id: NotRequired[str]
@@ -278,6 +320,8 @@ class WorkerProgressState(
     ]
     worker_review_requested: NotRequired[bool]
     worker_submission: NotRequired[dict[str, Any]]
+    web_step_report: NotRequired[dict[str, Any]]
+    web_step_report_error: NotRequired[str]
     general_result: NotRequired[dict[str, Any]]
     worker_finalize_requested: NotRequired[bool]
     worker_finalize_reason: NotRequired[str]
@@ -326,6 +370,69 @@ def count_tool_calls_since_progress(
     return max(
         total - last_report,
         0,
+    )
+
+
+def _keep_one_progress_call(response: ModelResponse) -> ModelResponse:
+    """A forced progress turn must publish exactly one checkpoint.
+
+    Some providers return several calls to the *same* forced tool in one
+    response. Those calls run against the same graph state, so each would
+    claim the same progress sequence before any reducer update is committed.
+    Keep the first call at the model boundary instead of weakening the
+    event store's conflict check or silently overwriting a report.
+    """
+
+    messages = list(response.result)
+    all_calls = [call for message in messages
+                 for call in (getattr(message, "tool_calls", ()) or ())]
+    from step_user_question import ASK_USER_NAME
+    ask_calls = [call for call in all_calls if call.get("name") == ASK_USER_NAME]
+    progress_calls = [call for call in all_calls
+                      if call.get("name") == PUBLISH_WORKER_PROGRESS_NAME]
+    if (not progress_calls and not ask_calls) or len(all_calls) == 1:
+        return response
+
+    # The model boundary retains the first valid progress report. In
+    # particular, unrelated tool calls must not race the checkpoint interrupt.
+    retained = ask_calls[0] if ask_calls else progress_calls[0]
+    kept = False
+    for index, message in enumerate(messages):
+        calls = list(getattr(message, "tool_calls", ()) or ())
+        if not calls:
+            continue
+        keep_here = not kept and retained in calls
+        kept = kept or keep_here
+        additional_kwargs = dict(getattr(message, "additional_kwargs", {}) or {})
+        raw_calls = additional_kwargs.get("tool_calls")
+        if isinstance(raw_calls, list):
+            additional_kwargs["tool_calls"] = [
+                call for call in raw_calls
+                if keep_here and isinstance(call, dict)
+                and call.get("id") == retained.get("id")
+            ]
+        messages[index] = message.model_copy(update={
+            "tool_calls": [retained] if keep_here else [],
+            "additional_kwargs": additional_kwargs,
+        })
+    from observability import trace_span, set_span_output
+    with trace_span("Worker Progress / Isolate Checkpoint", input_value={
+        "returned_tool_calls": len(all_calls),
+        "progress_tool_calls": len(progress_calls),
+        "ask_user_tool_calls": len(ask_calls),
+    }) as span:
+        set_span_output(span, {
+            "kept_tool_call_id": retained.get("id"),
+            "discarded_tool_call_ids": [call.get("id") for call in all_calls
+                                        if call is not retained],
+            "reason": (
+                "A Human Loop request takes precedence; otherwise keep one progress "
+                "checkpoint. Other calls were not executed."
+            ),
+        })
+    return ModelResponse(
+        result=messages,
+        structured_response=response.structured_response,
     )
 
 
@@ -481,7 +588,11 @@ class WorkerProgressMiddleware(
             WORKER_FINALIZATION_DEFAULT_MODEL_ROUNDS
         ),
         schema_repair_max_rounds: int = 3,
-        finalization_tools: tuple[str, ...] = (SUBMIT_FOR_REVIEW_NAME,),
+        finalization_tools: tuple[str, ...] = (COMPLETE_WEB_STEP_NAME,),
+        finalization_tool_overrides: dict[str, tuple[str, ...]] | None = None,
+        progress_checkpoint_resolver: (
+            Callable[[WorkerProgressState], bool] | None
+        ) = None,
     ) -> None:
         if not (
             WORKER_PROGRESS_MIN_TOOL_CALLS
@@ -506,6 +617,22 @@ class WorkerProgressMiddleware(
         if not finalization_tools or len(set(finalization_tools)) != len(finalization_tools):
             raise ValueError("Finalization tools must be a non-empty unique tuple")
         self.finalization_tools = finalization_tools
+        self.finalization_tool_overrides = {
+            str(reason): tuple(names)
+            for reason, names in (finalization_tool_overrides or {}).items()
+        }
+        self.progress_checkpoint_resolver = progress_checkpoint_resolver
+        if any(
+            not names or len(set(names)) != len(names)
+            for names in self.finalization_tool_overrides.values()
+        ):
+            raise ValueError(
+                "Finalization tool overrides must contain non-empty unique tuples"
+            )
+
+    def _active_finalization_tools(self, state) -> tuple[str, ...]:
+        reason = str(state.get("worker_finalize_reason") or "")
+        return self.finalization_tool_overrides.get(reason, self.finalization_tools)
 
     @hook_config(can_jump_to=["end"])
     def before_model(
@@ -559,7 +686,14 @@ class WorkerProgressMiddleware(
                 return {"jump_to": "end"}
         from workers.runtime_events import context_event
         if state.get("worker_finalize_requested"):
-            reminder = render_prompt("workers/finalize_submission", reason=state.get("worker_finalize_reason") or "结束", finalization_tools=" / ".join(self.finalization_tools))
+            reason = str(state.get("worker_finalize_reason") or "结束")
+            reminder = render_prompt(
+                "workers/finalize_submission",
+                reason=reason,
+                finalization_tools=" / ".join(
+                    self._active_finalization_tools(state)
+                ),
+            )
         elif self._progress_is_due(state):
             reminder = render_prompt("workers/progress_checkpoint", tool_calls_since_progress=count_tool_calls_since_progress(state))
         else:
@@ -597,6 +731,7 @@ class WorkerProgressMiddleware(
         )
 
         if state.get("worker_finalize_requested"):
+            active_finalization_tools = self._active_finalization_tools(state)
             updates: dict[str, Any] = {
                 "worker_finalization_model_calls_used": (
                     _read_non_negative_int(
@@ -614,7 +749,7 @@ class WorkerProgressMiddleware(
                         1
                         for tool_call in tool_calls
                         if self._tool_name(tool_call)
-                        in self.finalization_tools
+                        in active_finalization_tools
                     )
                 ),
             }
@@ -659,6 +794,13 @@ class WorkerProgressMiddleware(
         self,
         state: WorkerProgressState,
     ) -> bool:
+        if self.progress_checkpoint_resolver is not None:
+            try:
+                if not bool(self.progress_checkpoint_resolver(state)):
+                    return False
+            except Exception:
+                # Web选择器的附加判断不能阻断主任务；任何异常都按不强制检查。
+                return False
         return (
             count_tool_calls_since_progress(
                 state
@@ -702,23 +844,30 @@ class WorkerProgressMiddleware(
         if request.state.get("worker_finalize_requested") and not (
             request.state.get("worker_review_requested")
         ):
+            active_names = self._active_finalization_tools(request.state)
+            from step_user_question import ASK_USER_NAME
             submit_tools = [
                 current_tool
                 for current_tool in request.tools
-                if self._tool_name(current_tool) in self.finalization_tools
+                if self._tool_name(current_tool) in {*active_names, ASK_USER_NAME}
             ]
-            if len(submit_tools) != len(self.finalization_tools):
+            visible_names = {self._tool_name(tool) for tool in submit_tools}
+            if not set(active_names).issubset(visible_names):
                 raise RuntimeError(
                     "Worker finalization requires its registered terminal tools: "
-                    + ", ".join(self.finalization_tools)
+                    + ", ".join(active_names)
                 )
-            return request.override(tools=submit_tools, tool_choice=self.finalization_tools[0] if len(submit_tools) == 1 else "required")
+            return request.override(
+                tools=submit_tools,
+                tool_choice="required",
+            )
 
         if not self._progress_is_due(
             request.state
         ):
             return request
 
+        from step_user_question import ASK_USER_NAME
         progress_tools = [
             current_tool
             for current_tool
@@ -727,17 +876,18 @@ class WorkerProgressMiddleware(
                 self._tool_name(
                     current_tool
                 )
-                == PUBLISH_WORKER_PROGRESS_NAME
+                in {PUBLISH_WORKER_PROGRESS_NAME, ASK_USER_NAME}
             )
         ]
 
-        if len(progress_tools) != 1:
+        visible_names = {self._tool_name(tool) for tool in progress_tools}
+        if PUBLISH_WORKER_PROGRESS_NAME not in visible_names:
             raise RuntimeError(
                 "Worker runtime requires exactly one "
                 "publish_worker_progress tool."
             )
 
-        return request.override(tools=progress_tools, tool_choice=PUBLISH_WORKER_PROGRESS_NAME)
+        return request.override(tools=progress_tools, tool_choice="required")
 
     def wrap_model_call(
         self,
@@ -749,11 +899,11 @@ class WorkerProgressMiddleware(
     ) -> ModelResponse:
         """Temporarily force the progress tool on a synchronous model call."""
 
-        return handler(
-            self._require_progress_request(
-                request
-            )
-        )
+        response = handler(self._require_progress_request(request))
+        return (_keep_one_progress_call(response)
+                if self._progress_is_due(request.state)
+                and not request.state.get("worker_finalize_requested")
+                else response)
 
     def _require_progress_request(self, request: ModelRequest) -> ModelRequest:
         """Backward-compatible alias for the unified control selector."""
@@ -767,11 +917,11 @@ class WorkerProgressMiddleware(
     ) -> ModelResponse:
         """Force a due progress report or terminal submission."""
 
-        return await handler(
-            self._require_control_request(
-                request
-            )
-        )
+        response = await handler(self._require_control_request(request))
+        return (_keep_one_progress_call(response)
+                if self._progress_is_due(request.state)
+                and not request.state.get("worker_finalize_requested")
+                else response)
 
 
 __all__ = [

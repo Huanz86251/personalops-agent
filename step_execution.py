@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import copy
+import re
+from urllib.parse import urlsplit
 from collections.abc import (
     Mapping,
 )
@@ -25,6 +27,7 @@ from planning_models import (
     PlanStep,
     StepCriterionResult,
     StepReport,
+    StepSourceLink,
 )
 from reporting.models import (
     StepReviewPacket,
@@ -33,6 +36,7 @@ from reporting.criteria import ReferencedStepReport, normalize_report
 from schema_utils import is_schema_repairable_error, schema_repair_feedback
 
 from prompt_loader import (
+    load_prompt,
     render_prompt,
 )
 
@@ -64,6 +68,10 @@ STEP_REPORT_MIN_TRACE_TOKENS = 512
 
 # Reporter最终fallback保留多少原始轨迹。
 STEP_REPORT_FALLBACK_TRACE_TOKENS = 800
+# Direct, Harness-produced head/tail preview.  This is deliberately small
+# enough to keep all evidence rows visible while still exposing the actual
+# tool result rather than a Worker-authored summary.
+STEP_REPORT_EVIDENCE_PREVIEW_CHARS = 700
 
 @dataclass(
     frozen=True,
@@ -77,6 +85,175 @@ class StepReportRunResult:
 
     used_fallback: bool
     skill_snapshot: dict | None = None
+
+
+def _bounded_evidence_preview(value: str) -> str:
+    """Keep every registered result visible without duplicating full bodies."""
+
+    text = str(value or "")
+    if len(text) <= STEP_REPORT_EVIDENCE_PREVIEW_CHARS:
+        return text
+    marker = "\n...[preview middle omitted; read the registered reference for full text]...\n"
+    remaining = STEP_REPORT_EVIDENCE_PREVIEW_CHARS - len(marker)
+    head = remaining // 2
+    return text[:head] + marker + text[-(remaining - head):]
+
+
+def _reporter_evidence_manifest(
+    review_packet: StepReviewPacket,
+    evidence_refs: Mapping[str, str],
+) -> list[dict[str, Any]]:
+    """Expose one bounded row for every resolved business-tool result."""
+
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for attempt in review_packet.attempts:
+        for item in attempt.resolved_evidence:
+            public_reference = evidence_refs.get(item.tool_call_id)
+            if not public_reference or public_reference in seen:
+                continue
+            seen.add(public_reference)
+            rows.append({
+                "reference": public_reference,
+                "attempt": attempt.attempt,
+                "assignment_key": attempt.assignment_key,
+                "tool_name": item.tool_name,
+                "result_chars": item.result_chars,
+                "preview": _bounded_evidence_preview(item.result),
+                "preview_source": "HARNESS_DIRECT_TOOL_RESULT",
+                "preview_truncated": item.result_chars > STEP_REPORT_EVIDENCE_PREVIEW_CHARS,
+                "full_text_available_via_read_review_materials": (
+                    item.result_chars > STEP_REPORT_EVIDENCE_PREVIEW_CHARS
+                ),
+            })
+    return rows
+
+
+def _reporter_source_links(
+    review_packet: StepReviewPacket,
+    evidence_refs: Mapping[str, str],
+    used_refs: set[str],
+) -> list[dict[str, str]]:
+    """Bind cited concrete Web rows to safe public links without model rewriting."""
+
+    evidence = [
+        item
+        for attempt in review_packet.attempts
+        for item in attempt.resolved_evidence
+    ]
+    return resolved_evidence_source_links(evidence, evidence_refs, used_refs)
+
+
+def resolved_evidence_source_links(
+    resolved_evidence: list[Any],
+    evidence_refs: Mapping[str, str],
+    used_refs: set[str],
+) -> list[dict[str, str]]:
+    """Build one canonical source-link list from already resolved evidence.
+
+    Fetched pages are ordered ahead of search-result rows.  The final renderer
+    deduplicates equal URLs after applying the accepted-evidence filter, so a
+    fetched page wins when both references were adopted while either reference
+    can still render on its own.  No model copies or rewrites URLs.
+    """
+
+    links: list[dict[str, str]] = []
+    seen_references: set[str] = set()
+    ordered_evidence = sorted(
+        enumerate(resolved_evidence),
+        key=lambda pair: (
+            0 if pair[1].tool_name == "fetch_webpage" else 1,
+            pair[0],
+        ),
+    )
+    for _, item in ordered_evidence:
+        public_reference = evidence_refs.get(item.tool_call_id)
+        cited_reference = (
+            item.tool_call_id
+            if item.tool_call_id in used_refs
+            else public_reference
+        )
+        if (
+            not public_reference
+            or cited_reference not in used_refs
+            or cited_reference in seen_references
+        ):
+            continue
+        payload: Any = None
+        try:
+            payload = json.loads(item.result)
+        except (TypeError, json.JSONDecodeError):
+            pass
+        href = ""
+        title = ""
+        if item.tool_name == "web_search" and isinstance(payload, dict):
+            href = str(payload.get("href") or "").strip()
+            title = str(payload.get("title") or cited_reference).strip()
+        elif item.tool_name == "fetch_webpage" and isinstance(payload, dict):
+            href = str(
+                payload.get("final_url") or payload.get("source_url") or ""
+            ).strip()
+            content = str(payload.get("content") or "")
+            heading = re.search(r"(?m)^#{1,3}\s+(.+?)\s*$", content)
+            title = heading.group(1).strip() if heading else ""
+            if not title and href:
+                title = urlsplit(href).hostname or cited_reference
+        elif item.tool_name in {
+            "browser_navigate",
+            "browser_snapshot",
+            "browser_find",
+            "browser_click",
+        }:
+            arguments = item.arguments if isinstance(item.arguments, dict) else {}
+            url_match = re.search(
+                r"(?:Page URL|页面\s*URL)\s*[:：]\s*(https?://[^\s<>\"']+)",
+                item.result,
+                flags=re.IGNORECASE,
+            )
+            href = (
+                url_match.group(1).rstrip("),.;，。；）]")
+                if url_match
+                else str(arguments.get("url") or "").strip()
+            )
+            if isinstance(payload, dict):
+                title = str(payload.get("title") or "").strip()
+            if not title:
+                match = re.search(
+                    r"(?:Page title|页面标题)\s*[:：]\s*([^\r\n]+)",
+                    item.result,
+                    flags=re.IGNORECASE,
+                )
+                title = match.group(1).strip() if match else cited_reference
+        else:
+            continue
+        if not href.startswith(("http://", "https://")):
+            continue
+        links.append({
+            "evidence_ref": cited_reference,
+            "title": title[:240] or cited_reference,
+            "href": href,
+        })
+        seen_references.add(cited_reference)
+        if len(links) >= 20:
+            return links
+    return links
+
+
+def build_report_source_links(
+    review_packet: StepReviewPacket,
+    used_refs: set[str],
+) -> list[StepSourceLink]:
+    """Resolve links for a report that already uses canonical evidence IDs."""
+
+    identities = {
+        item.tool_call_id: item.tool_call_id
+        for attempt in review_packet.attempts
+        for item in attempt.resolved_evidence
+    }
+    return [
+        StepSourceLink.model_validate(item)
+        for item in _reporter_source_links(review_packet, identities, used_refs)
+    ]
 
 
 def _make_json_safe(
@@ -941,6 +1118,59 @@ def _compact_step_execution_trace(
         messages,
         list,
     ):
+        # Parallel Steps have no single ``current_attempt.messages`` stream.
+        # Keep one compact identity/result row per Worker before considering a
+        # raw tail fallback; otherwise a tight token budget can silently retain
+        # only the last slot and make the Reporter forget the other branches.
+        attempts = compacted_trace.get("attempts")
+        if isinstance(attempts, list):
+            compact_attempts: list[dict[str, Any]] = []
+            for attempt in attempts:
+                if not isinstance(attempt, Mapping):
+                    continue
+                compact_attempts.append(
+                    {
+                        key: _make_json_safe(attempt.get(key))
+                        for key in (
+                            "assignment_key",
+                            "assignment_objective",
+                            "attempt",
+                            "worker_id",
+                            "finish_reason",
+                            "stop_reason",
+                            "summary",
+                            "final_conclusion",
+                            "answer_text",
+                            "criterion_claims",
+                            "resolved_evidence",
+                            "resolved_artifacts",
+                            "unresolved_items",
+                        )
+                        if attempt.get(key) not in (None, "", [], {})
+                    }
+                )
+
+            parallel_trace = {
+                "trace_compression": compacted_trace["trace_compression"],
+                "attempts": compact_attempts,
+            }
+            parallel_text = _to_prompt_text(parallel_trace, "")
+            parallel_tokens = _estimate_tokens(parallel_text)
+            if compact_attempts and parallel_tokens <= max_tokens:
+                parallel_trace["trace_compression"][
+                    "compacted_estimated_tokens"
+                ] = parallel_tokens
+                parallel_trace["trace_compression"]["strategy"] = (
+                    "并行Step保留每个Worker的身份、任务和结果摘要；"
+                    "删除重复执行元数据。"
+                )
+                return (
+                    parallel_trace,
+                    True,
+                    original_tokens,
+                    parallel_tokens,
+                )
+
         compacted_text = _to_prompt_text(
             compacted_trace,
             "没有可用执行轨迹。",
@@ -1357,19 +1587,14 @@ def _build_report_fallback(
 
         confirmed_results=[],
 
-        evidence=[
-            (
-                "Reporter失败前保留的压缩执行轨迹：\n"
-                f"{trace_tail}"
-            )
-        ],
+        # evidence is an ID-only field.  A deterministic fallback must not
+        # disguise raw trace text as a registered evidence reference.
+        evidence=[],
 
-        errors=[
-            (
-                "StepReport结构化输出失败："
-                f"{error[:2000]}"
-            )
-        ],
+        errors=[(
+            "StepReport结构化输出失败："
+            f"{error}\n压缩执行轨迹：{trace_tail}"
+        )[:2000]],
 
         unresolved_items=list(
             current_step.success_criteria
@@ -1452,6 +1677,10 @@ async def run_step_reporter(
     skill_mode=None,
     skill_fixed_ids=(),
     saved_skill_snapshot=None,
+    step_attempt: int = 1,
+    repair_round: int = 0,
+    review_trigger: str = "worker_attempt_complete",
+    review_evidence_mode: str = "strict",
 ) -> StepReportRunResult:
     """Review one bounded packet in a fresh context with registered material reads.
 
@@ -1467,11 +1696,33 @@ async def run_step_reporter(
     8. 最终失败时返回Python兜底报告。
     """
 
+    if review_evidence_mode not in {"strict", "balanced"}:
+        raise ValueError("review_evidence_mode must be strict or balanced")
+
     step_execution_trace = review_packet.model_dump(
         mode="json",
     )
-    from workers.evidence_refs import registry as evidence_registry, display as evidence_display, eligible_evidence
-    reporter_evidence_refs = evidence_registry({'review_packet': step_execution_trace})
+    from workers.evidence_refs import (
+        registry as evidence_registry,
+        display as evidence_display,
+        eligible_evidence,
+        is_web_result_ref,
+    )
+    raw_reporter_refs = evidence_registry({'review_packet': step_execution_trace})
+    web_result_ids = {
+        item.tool_call_id
+        for attempt in review_packet.attempts
+        for item in attempt.resolved_evidence
+        if is_web_result_ref(item.tool_call_id)
+    }
+    reporter_evidence_refs = {}
+    next_evidence_index = 1
+    for raw_reference in raw_reporter_refs:
+        if raw_reference in web_result_ids:
+            reporter_evidence_refs[raw_reference] = raw_reference
+        else:
+            reporter_evidence_refs[raw_reference] = f"E{next_evidence_index}"
+            next_evidence_index += 1
     completed_evidence_ids = eligible_evidence({'review_packet': step_execution_trace})
     for attempt in review_packet.attempts:
         for artifact in attempt.resolved_artifacts:
@@ -1527,14 +1778,6 @@ async def run_step_reporter(
 
     allowed_model_rounds = max_model_rounds
 
-    schema_text = json.dumps(
-        ReferencedStepReport.model_json_schema(),
-
-        ensure_ascii=False,
-
-        indent=2,
-    )
-
     trace_placeholder = (
         "[STEP_REVIEW_PACKET_PLACEHOLDER]"
     )
@@ -1550,6 +1793,12 @@ async def run_step_reporter(
     )
     preparation_calls = snapshot.model_calls if saved_skill_snapshot is None else 0
     allowed_model_rounds = min(allowed_model_rounds, max_model_rounds - preparation_calls)
+    # The truth/acceptance report keeps the full repair budget. A recovery
+    # proposal is advisory and may use one *remaining* round only after a valid
+    # report requests Replan; it must never steal the round needed to repair an
+    # invalid criterion/evidence form.
+    recovery_proposal_enabled = current_step.worker_kind in {"GENERAL", "WEB"}
+    report_model_rounds = allowed_model_rounds
     selected_methods = skill_prompt(snapshot)
 
     prompt_with_placeholder = render_prompt(
@@ -1560,12 +1809,14 @@ async def run_step_reporter(
         ),
     )
 
+    from structured_output_policy import textual_schema_fallback
+    schema_guidance = textual_schema_fallback(
+        simple_model,
+        ReferencedStepReport,
+        heading="只输出符合以下 Schema 的 JSON：",
+    )
     structured_output_suffix = (
-        "\n\n"
-        + render_prompt(
-            "reporters/step_report_output",
-            schema=schema_text,
-        )
+        ("\n\n" + schema_guidance) if schema_guidance else ""
     )
 
     # 演示项目的简单启发式预算：
@@ -1640,17 +1891,13 @@ async def run_step_reporter(
         ),
     )
 
-    structured_model = (
-        simple_model
-        .with_structured_output(
-            ReferencedStepReport,
+    from structured_output_policy import with_provider_structured_output
 
-            # 与Hard结构化节点保持一致。
-            # Thinking模式下不依赖强制Tool Choice。
-            method="json_mode",
-
-            include_raw=True,
-        )
+    structured_model = with_provider_structured_output(
+        simple_model,
+        ReferencedStepReport,
+        include_raw=True,
+        fallback_method="json_mode",
     )
 
     messages: list[
@@ -1674,6 +1921,12 @@ async def run_step_reporter(
                 {"role": "user", "content": packet_context}]
     # The contract is never compressed with evidence; validation uses these exact criteria.
     messages.append({"role": "user", "content": "原始验收契约（逐条原样审核，不得自行拆分或替换）：" + review_packet.task_contract.model_dump_json()})
+    messages.append({
+        "role": "user",
+        "content": load_prompt(
+            f"reporters/evidence_mode_{review_evidence_mode}"
+        ),
+    })
     if review_packet.task_contract.current_time_context:
         messages.append({
             "role": "user",
@@ -1684,18 +1937,61 @@ async def run_step_reporter(
             "role": "user",
             "content": review_packet.task_contract.completion_api_contract,
         })
+    evidence_manifest = _reporter_evidence_manifest(
+        review_packet,
+        valid_reporter_refs,
+    )
+    if evidence_manifest:
+        messages.append({
+            "role": "user",
+            "content": (
+                "HARNESS工具证据索引（每条已登记结果都保留一个有界预览；"
+                "预览被截断时，按reference调用read_review_materials批量读取全文）："
+                + json.dumps(evidence_manifest, ensure_ascii=False)
+            ),
+        })
     # Publication identities must survive packet compaction; approval uses these exact refs.
     artifact_manifest = [{"review_ref": reporter_evidence_refs.get(a.review_ref, a.review_ref), "description": a.description[:300],
                           "size_bytes": a.size_bytes, "sha256": a.sha256}
                          for attempt in review_packet.attempts for a in attempt.resolved_artifacts]
     if artifact_manifest:
         messages.append({"role": "user", "content": "候选文件索引（存在不等于内容已验证）：" + json.dumps(artifact_manifest, ensure_ascii=False)})
-    from reporting.materials import ReviewWithReads, build_reader
-    _, material_refs = build_reader(review_packet)
+    from reporting.materials import ReviewWithReads, build_material_reader
+    material_source_aliases = {}
+    for raw_reference, public_reference in reporter_evidence_refs.items():
+        material_source_aliases[public_reference] = (
+            raw_reference
+            if public_reference.startswith("A")
+            else "evidence:" + raw_reference
+        )
+    _, material_refs = build_material_reader(review_packet, material_source_aliases)
     material_refs = evidence_display(material_refs, reporter_evidence_refs)
-    if material_refs and hasattr(simple_model, "bind_tools") and allowed_model_rounds > 1:
-        structured_model = ReviewWithReads(simple_model, structured_model, review_packet, allowed_model_rounds)
-        messages.append({"role": "user", "content": "可按需调用read_review_material读取登记材料，或直接提交StepReport。最后一轮只提交报告。材料引用：" + json.dumps(material_refs, ensure_ascii=False)})
+    material_report_aliases = {
+        item["reference"]: str(item["source"]).removeprefix("evidence:")
+        for item in material_refs
+    }
+    from step_user_question import ask_user_available
+    if (
+        hasattr(simple_model, "bind_tools")
+        and allowed_model_rounds > 1
+        and (material_refs or ask_user_available())
+    ):
+        structured_model = ReviewWithReads(
+            simple_model,
+            structured_model,
+            review_packet,
+            allowed_model_rounds,
+            material_source_aliases,
+        )
+        messages.append({
+            "role": "user",
+            "content": (
+                "需要核对材料时，只能调用read_review_materials批量读取；"
+                "翻页或只复核一项时也传入单元素requests。也可直接提交StepReport。"
+                "最后一轮只提交报告。材料引用："
+                + json.dumps(material_refs, ensure_ascii=False)
+            ),
+        })
     material_read_pending = False
     model_rounds_used = preparation_calls
 
@@ -1706,7 +2002,9 @@ async def run_step_reporter(
     with trace_span(
         (
             "step_report."
-            f"step_{current_step.step_id}"
+            f"step_{current_step.step_id}."
+            f"attempt_{max(int(step_attempt), 1)}."
+            f"repair_{max(int(repair_round), 0)}"
         ),
 
         kind="chain",
@@ -1737,6 +2035,9 @@ async def run_step_reporter(
             ),
 
             "review_contract_preserved": True,
+            "step_attempt": max(int(step_attempt), 1),
+            "repair_round": max(int(repair_round), 0),
+            "review_trigger": review_trigger,
             "review_final_submission_reserve": min(2, allowed_model_rounds),
             "reporter_total_budget_tokens": (
                 total_budget_tokens
@@ -1791,9 +2092,18 @@ async def run_step_reporter(
             ),
         },
     ) as span:
+        set_span_attributes(
+            span,
+            **{
+                "step_report.step_id": current_step.step_id,
+                "step_report.step_attempt": max(int(step_attempt), 1),
+                "step_report.repair_round": max(int(repair_round), 0),
+                "step_report.review_trigger": review_trigger,
+            },
+        )
 
         for attempt_index in range(
-            allowed_model_rounds
+            report_model_rounds
         ):
             if attempt_index > 0 and not material_read_pending:
                 messages.append(
@@ -1856,7 +2166,7 @@ async def run_step_reporter(
 
                 continue
 
-            if response.get("material_read"):
+            if response.get("material_read") or response.get("human_answer"):
                 material_read_pending = True
                 continue
 
@@ -1873,7 +2183,13 @@ async def run_step_reporter(
 
             try:
                 report = (
-                    normalize_report(response.get("parsed"), current_step.success_criteria, valid_reporter_refs)
+                    normalize_report(
+                        response.get("parsed"),
+                        current_step.success_criteria,
+                        valid_reporter_refs,
+                        aliases=material_report_aliases,
+                        mode=review_evidence_mode,
+                    )
                 )
 
             except Exception as error:
@@ -1894,6 +2210,42 @@ async def run_step_reporter(
 
                 continue
 
+            used_evidence_refs = {
+                str(reference).strip()
+                for criterion in report.criterion_results
+                for reference in criterion.evidence
+                if str(reference).strip()
+            }
+            report = report.model_copy(update={
+                "source_links": _reporter_source_links(
+                    review_packet,
+                    reporter_evidence_refs,
+                    used_evidence_refs,
+                )
+            })
+
+            recovery_error = None
+            if (
+                report.request_replan
+                and recovery_proposal_enabled
+                and model_rounds_used < allowed_model_rounds
+            ):
+                from review_recovery import build_recovery_proposal
+
+                proposal, proposal_rounds, recovery_error = await build_recovery_proposal(
+                    simple_model,
+                    worker_kind=current_step.worker_kind,
+                    user_request=review_packet.task_contract.user_request,
+                    current_step=current_step,
+                    review_output=report,
+                    trigger_source="step_reporter",
+                )
+                model_rounds_used += proposal_rounds
+                if proposal is not None:
+                    report = report.model_copy(
+                        update={"recovery_proposal": proposal}
+                    )
+
             set_span_attributes(
                 span,
 
@@ -1913,6 +2265,10 @@ async def run_step_reporter(
                     ),
 
                     "step_report.used_fallback": False,
+                    "step_report.recovery_proposal_generated": (
+                        report.recovery_proposal is not None
+                    ),
+                    "step_report.recovery_proposal_error": recovery_error or "",
                 },
             )
 

@@ -44,9 +44,12 @@ class RoleConfigurationTests(unittest.TestCase):
         env={'DASHSCOPE_API_KEY':'test','DASHSCOPE_BASE_URL':'https://qwen.invalid/v1',
              'OPENAI_API_KEY':'test','DEEPSEEK_API_KEY':'test'}
         with patch.dict(os.environ,env,clear=True):
-            self.assertEqual(load_role_models(settings)['skill_selector'].max_tokens,1536)
-            self.assertTrue(load_role_models(settings)['skill_selector'].thinking_enabled)
-            with patch.dict(os.environ,{'GENERAL_LLM_MAX_TOKENS':'1024'}):
+            roles = load_role_models(settings)
+            self.assertEqual(roles['skill_selector'].max_tokens,512)
+            self.assertFalse(roles['skill_selector'].thinking_enabled)
+            self.assertEqual(roles['capability_selector'].max_tokens,768)
+            self.assertFalse(roles['capability_selector'].thinking_enabled)
+            with patch.dict(os.environ,{'GENERAL_LLM_MAX_TOKENS':'500'}):
                 with self.assertRaisesRegex(ValueError,'leave room'):
                     load_role_models(settings)
             for invalid in (-1, True, '1024'):
@@ -73,18 +76,24 @@ class RoleConfigurationTests(unittest.TestCase):
         for role, config in settings.role_models.items():
             expected = role in strong
             self.assertEqual(config.model, "qwen3.8-flash" if expected else "qwen3.7-flash", role)
-            self.assertTrue(config.thinking_enabled, role)
-            self.assertEqual(config.reasoning_effort, "medium" if role == "scope_resolver" else "low" if expected else None, role)
-            self.assertEqual(config.max_tokens, 4096 if role == "scope_resolver" else 16000 if role == "extraction" else 1536 if role == "skill_selector" else 5000, role)
+            control = role in {"skill_selector", "host_file_judge", "capability_selector"}
+            numeric_budget = role == "final_reviewer" or (not expected and not control)
+            self.assertEqual(config.thinking_enabled, not control, role)
+            self.assertEqual(
+                config.reasoning_effort,
+                "low" if expected and role != "final_reviewer" else None,
+                role,
+            )
+            self.assertEqual(config.max_tokens, 4096 if role == "scope_resolver" else 16000 if role == "extraction" else 768 if role == "capability_selector" else 512 if role in {"host_file_judge", "skill_selector"} else 5000, role)
             model = build_role_model(settings, role)
             model.root_client._client.close()
             with httpx.Client(transport=httpx.MockTransport(handler)) as client:
                 model.root_client._client = client
                 model.invoke("offline configuration check")
             payload = requests[-1]
-            self.assertTrue(payload["enable_thinking"], role)
-            self.assertEqual(payload.get("reasoning_effort"), "medium" if role == "scope_resolver" else "low" if expected else None, role)
-            self.assertEqual(payload.get("thinking_budget"), None if expected else 1024)
+            self.assertEqual(payload["enable_thinking"], not control, role)
+            self.assertEqual(payload.get("reasoning_effort"), "low" if expected and role != "final_reviewer" else None, role)
+            self.assertEqual(payload.get("thinking_budget"), 500 if numeric_budget else None, role)
         self.assertEqual(len(requests), len(settings.role_models))
 
     def test_qwen_override_changes_only_one_role(self):
@@ -98,7 +107,7 @@ class RoleConfigurationTests(unittest.TestCase):
         self.assertEqual(roles["web"].max_tokens, 9000)
         self.assertEqual(roles["web"].api_key, "test-qwen")
         self.assertEqual(roles["general"].model, "deepseek-v4-flash")
-        self.assertEqual(roles["web_reporter"].model, "deepseek-v4-flash")
+        self.assertNotIn("web_reporter", roles)
         self.assertEqual(roles["code_reviewer"].model, "deepseek-v4-pro")
         self.assertEqual(roles["extraction"].max_tokens, 16000)
         self.assertNotIn("test-qwen", repr(roles["web"]))

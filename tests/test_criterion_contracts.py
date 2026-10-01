@@ -3,11 +3,13 @@ from copy import deepcopy
 from types import SimpleNamespace
 import pytest
 from langchain_core.messages import HumanMessage, ToolMessage
-from reporting.criteria import (criterion_registry, normalize_report, restore_claims,
-                                worker_registry, ReferencedStepReport)
+from reporting.criteria import (complete_missing_worker_claims, criterion_registry,
+                                normalize_report, restore_claims, worker_registry,
+                                ReferencedStepReport)
 from workers.evidence_refs import schema_view, canonical_arguments, registry
 from workers.general_completion import report_general_result
-from workers.submission import submit_for_review
+from workers.submission import complete_web_step
+from workers.submission import WorkerCriterionClaim
 from workers.code_submission import validate_review_requirements
 from planning_models import CodeRequirement, CodeTaskContract
 
@@ -40,13 +42,43 @@ def test_reject_invalid_report_identity(defect):
     with pytest.raises(ValueError): normalize_report(raw, ["First", "Second"], {"call": "E1"})
 
 
+def test_balanced_mode_downgrades_bad_references_without_model_repair():
+    raw = payload()
+    raw["status"] = "COMPLETED"
+    raw["criterion_results"][0].update(status="MET", evidence=["E999"])
+    report = normalize_report(
+        raw,
+        ["First", "Second"],
+        {"call": "E1"},
+        mode="balanced",
+    )
+    second = next(item for item in report.criterion_results if item.criterion_id == "C2")
+    assert second.status == "UNKNOWN"
+    assert report.status == "PARTIAL"
+    assert "Second" in report.unresolved_items
+    assert any("dropped unknown" in error for error in report.errors)
+
+
+def test_balanced_mode_synthesizes_missing_criterion_as_unknown():
+    raw = payload()
+    raw["criterion_results"] = [raw["criterion_results"][1]]
+    report = normalize_report(
+        raw,
+        ["First", "Second"],
+        {"call": "E1"},
+        mode="balanced",
+    )
+    assert [item.criterion_id for item in report.criterion_results] == ["C1", "C2"]
+    assert report.criterion_results[1].status == "UNKNOWN"
+
+
 def test_identical_text_requires_distinct_ids():
     assert len(criterion_registry(["same", "same"])) == 2
     report = normalize_report(payload(), ["same", "same"], {"call": "E1"})
     assert len(report.criterion_results) == 2
 
 
-@pytest.mark.parametrize("tool", [report_general_result, submit_for_review])
+@pytest.mark.parametrize("tool", [report_general_result, complete_web_step])
 def test_general_web_submission_schema_uses_criterion_ids(tool):
     schema = schema_view(tool, criteria_enabled=True).args_schema
     claims = schema.get("$defs", {}).get("WorkerCriterionClaim", {})
@@ -65,6 +97,21 @@ def test_claim_ids_and_evidence_restore_before_tool_execution():
     claim = restored["submission"]["criterion_claims"][0]
     assert claim["criterion"] == "Check actual result"
     assert claim["evidence_tool_call_ids"] == ["real"]
+
+
+def test_missing_worker_claims_are_filled_as_unknown_without_model_repair():
+    state = {"worker_criterion_refs": {"C1": "Find candidates", "C2": "Disclose unknowns"}}
+    claims = [WorkerCriterionClaim(
+        criterion_id="C1",
+        criterion="Find candidates",
+        evidence_tool_call_ids=["real-call"],
+        conclusion="Found five candidates",
+    )]
+    completed = complete_missing_worker_claims(state, claims)
+    assert [claim.criterion_id for claim in completed] == ["C1", "C2"]
+    assert completed[0] is claims[0]
+    assert completed[1].evidence_tool_call_ids == []
+    assert "UNKNOWN" in completed[1].conclusion
 
 
 def test_worker_contract_survives_compaction_and_ignores_tool_text():
@@ -137,3 +184,45 @@ def test_reviewer_repairs_bad_id_without_rerunning_worker(kind):
     assert model.calls == 2
     assert result.report.status == "PARTIAL"
     assert result.report.criterion_results[1].status == "UNKNOWN"
+
+
+@pytest.mark.parametrize("kind", ["GENERAL", "WEB"])
+def test_balanced_reviewer_normalizes_bad_evidence_without_second_model_call(kind):
+    import asyncio
+    from planning_models import PlanStep
+    from reporting import build_step_review_packet
+    from step_execution import run_step_reporter
+    step = PlanStep(
+        step_id=1,
+        worker_kind=kind,
+        objective="Check",
+        success_criteria=["First", "Second"],
+    )
+    packet = build_step_review_packet(
+        user_request="Check",
+        plan_objective="Check",
+        current_step=step,
+        current_attempt={},
+        stop_reason="Execution stopped",
+    )
+    class Model:
+        calls = 0
+        def with_structured_output(self, schema, **kwargs): return self
+        async def ainvoke(self, messages):
+            self.calls += 1
+            raw = payload()
+            raw["status"] = "COMPLETED"
+            raw["criterion_results"][0].update(status="MET", evidence=["E404"])
+            return {"parsed": raw}
+    model = Model()
+    result = asyncio.run(run_step_reporter(
+        model,
+        current_step=step,
+        review_packet=packet,
+        max_model_rounds=2,
+        model_output_max_tokens=1024,
+        review_evidence_mode="balanced",
+    ))
+    assert model.calls == 1
+    assert result.report.status == "PARTIAL"
+    assert result.report.criterion_results[0].status == "UNKNOWN"

@@ -52,6 +52,7 @@ def execute(command: str) -> str:
 
 class ProbeModel(BaseChatModel):
     selected: list[str] = Field(default_factory=lambda: ["general-read-documents"])
+    execution_route: str = "PLAN"
     selection_requests: list = Field(default_factory=list)
     execution_requests: list = Field(default_factory=list)
 
@@ -66,7 +67,21 @@ class ProbeModel(BaseChatModel):
         def respond(messages):
             if schema is SkillChoice:
                 self.selection_requests.append(copy.deepcopy(messages))
-                return {"parsed": {"skill_ids": self.selected, "reason": "SELECTOR_ONLY_MARKER"}, "parsing_error": None}
+                return {"parsed": {"skill_ids": self.selected, "reason": "SELECTOR_ONLY_MARKER",
+                                   "execution_route": self.execution_route}, "parsing_error": None}
+            if schema.__name__ == "SupervisorDecision":
+                self.execution_requests.append(copy.deepcopy(messages))
+                return {"parsed": schema.model_validate({
+                    "action": "PLAN",
+                    "plan_objective": "Execute the requested task.",
+                    "plan_success_criteria": ["The requested result is delivered."],
+                    "steps": [{
+                        "step_id": 1,
+                        "objective": "Execute the requested task.",
+                        "success_criteria": ["The requested result is delivered."],
+                        "worker_kind": "GENERAL",
+                    }],
+                }), "parsing_error": None}
             self.execution_requests.append(copy.deepcopy(messages))
             return {"parsed": schema.model_validate({"action": "FINAL", "final_answer": "ready"}), "parsing_error": None}
         return RunnableLambda(respond)
@@ -131,6 +146,18 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(result.selected, ())
         self.assertEqual(result.selection_method, "selection_error")
         self.assertEqual(len(model.selection_requests), 1)
+
+    def test_successful_empty_scheduler_selection_normalizes_to_direct(self):
+        scheduler = prepare_skills_sync(
+            ProbeModel(selected=[], execution_route="PLAN"),
+            role="scheduler", task="stable knowledge question", mode="dynamic",
+        )
+        worker = prepare_skills_sync(
+            ProbeModel(selected=[], execution_route="PLAN"),
+            role="general", task="worker task", mode="dynamic",
+        )
+        self.assertEqual(scheduler.execution_route, "DIRECT")
+        self.assertEqual(worker.execution_route, "PLAN")
 
     def test_off_fixed_and_budget_skip_make_no_model_call(self):
         model = ProbeModel()
@@ -224,7 +251,7 @@ class RolePreparationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(injected, model.execution_requests[-1][0].content)
 
     async def test_scheduler_checkpoint_resumes_after_selection_without_reselection(self):
-        model = ProbeModel(selected=["plan-task-dependencies"])
+        model = ProbeModel(selected=[], execution_route="DIRECT")
         with TemporaryDirectory() as directory:
             store = AsyncEventStore(Path(directory) / "events.sqlite")
             graph = build_planning_graph(
@@ -245,14 +272,15 @@ class RolePreparationTests(unittest.IsolatedAsyncioTestCase):
                 finished = await graph.ainvoke(None, config=config)
             self.assertEqual(len(model.selection_requests), 1)
             self.assertEqual(finished["model_rounds_used"], 2)
-            self.assertEqual(finished["final_answer"], "ready")
+            self.assertEqual(finished["final_answer"], "executed")
+            self.assertEqual(finished["overall_stop_reason"], "direct_answer")
 
     async def test_worker_prepares_once_and_keeps_execution_prefix_on_resume(self):
         model = ProbeModel()
         worker = create_general_worker(model, tools=[attachment_to_text],
             middleware=[DynamicExecutionBudgetMiddleware()], checkpointer=InMemorySaver())
         common = {"skill_mode": "dynamic", "executor_model_run_limit": 5, "executor_tool_run_limit": 4,
-                  "memory_context": "initial memory", "show_all_toolsets_run_limit": 0}
+                  "memory_context": "initial memory"}
         first = await ask_worker(worker, "Read the supplied PDF.", thread_id="skills-worker", state_update=common, return_details=True)
         self.assertEqual(first["execution_summary"]["model_call_count"], 2)
         self.assertEqual(len(model.selection_requests), 1)
@@ -286,7 +314,7 @@ class RolePreparationTests(unittest.IsolatedAsyncioTestCase):
         model = ProbeModel()
         worker = create_general_worker(model, tools=[attachment_to_text], middleware=[DynamicExecutionBudgetMiddleware()])
         result = await worker.ainvoke({"messages": [{"role":"user", "content":"read PDF"}],
-            "skill_mode":"dynamic", "executor_model_run_limit":1, "executor_tool_run_limit":1, "show_all_toolsets_run_limit":0})
+            "skill_mode":"dynamic", "executor_model_run_limit":1, "executor_tool_run_limit":1})
         self.assertEqual(model.selection_requests, [])
         self.assertEqual(result["executor_model_calls_used"], 1)
         self.assertEqual(result["role_skill_snapshot"]["selection_method"], "budget_skip")

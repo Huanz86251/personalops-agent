@@ -2,8 +2,8 @@ from types import SimpleNamespace
 import unittest
 
 from retrieval_models import RerankResult
-from toolset_router import ToolsetRouter
-from toolsets import NO_TOOL_ROUTE, ToolsetRegistry, ToolsetSpec
+from toolset_router import ToolsetRouter, WebModelToolsetSelection
+from toolsets import DEFAULT_TOOLSET_REGISTRY, NO_TOOL_ROUTE, ToolsetRegistry, ToolsetSpec
 
 
 def _tool(name):
@@ -45,6 +45,56 @@ class FakeReranker:
         return sorted(results, key=lambda item: item.score, reverse=True)[:top_k]
 
 
+class FakeToolsetSelectionModel:
+    def with_structured_output(self, *args, **kwargs):
+        return self
+
+    async def ainvoke(self, messages):
+        return {
+            "parsed": {
+                "reason": "PDF生成需要读文件并执行验证命令。",
+                "selected_toolsets": ["SOFTWARE_DEVELOPMENT"],
+            },
+            "parsing_error": None,
+        }
+
+
+class CompositeToolsetSelectionModel:
+    def with_structured_output(self, *args, **kwargs):
+        return self
+
+    async def ainvoke(self, messages):
+        return {
+            "parsed": {
+                "reason": "先查询官方来源，再把结论写入本地文件。",
+                "selected_toolsets": ["WEB_RESEARCH", "FILE_EDITING"],
+            },
+            "parsing_error": None,
+        }
+
+
+class WebCheckpointSelectionModel:
+    def __init__(self, checkpoint_value=True):
+        self.checkpoint_value = checkpoint_value
+        self.schemas = []
+        self.messages = []
+
+    def with_structured_output(self, schema, **kwargs):
+        self.schemas.append(schema)
+        return self
+
+    async def ainvoke(self, messages):
+        self.messages.append(messages)
+        return {
+            "parsed": {
+                "reason": "当前Step需要沿论文引用继续核验。",
+                "selected_toolsets": ["WEB_RESEARCH"],
+                "require_progress_checkpoint": self.checkpoint_value,
+            },
+            "parsing_error": None,
+        }
+
+
 class ToolsetCrossEncoderRouterTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.registry = ToolsetRegistry(
@@ -81,6 +131,56 @@ class ToolsetCrossEncoderRouterTests(unittest.IsolatedAsyncioTestCase):
             decision.selected_toolset_names,
             ("FILE_EDITING",),
         )
+
+    async def test_hybrid_selector_can_resolve_composite_web_and_file_task(self):
+        # hybrid_candidates does not include NO_TOOL, so registry order is
+        # WEB_RESEARCH, BROWSER_AUTOMATION, FILE_EDITING.
+        reranker = FakeReranker([0.92, 0.08, 0.87])
+        router = ToolsetRouter(reranker, registry=self.registry)
+
+        decision = await router.route_hybrid_with_model(
+            CompositeToolsetSelectionModel(),
+            primary_task="查询官方说明，然后把结论写进本地 Markdown",
+            user_request_window="查询官方说明，然后把结论写进本地 Markdown",
+            available_tools=self.tools,
+        )
+
+        self.assertIsNotNone(decision)
+        self.assertEqual(
+            decision.selected_toolset_names,
+            ("WEB_RESEARCH", "FILE_EDITING"),
+        )
+        self.assertEqual(decision.tool_names, ("web_search", "write_file"))
+
+    async def test_web_selector_reuses_same_call_for_progress_checkpoint_decision(self):
+        reranker = FakeReranker([0.92, 0.08, 0.20])
+        router = ToolsetRouter(reranker, registry=self.registry)
+        model = WebCheckpointSelectionModel(True)
+
+        decision = await router.route_hybrid_with_model(
+            model,
+            primary_task="筛选论文后沿引用核对相互矛盾的实验结论",
+            user_request_window="研究近五年的方法演进",
+            available_tools=self.tools,
+            select_progress_checkpoint=True,
+        )
+
+        self.assertIsNotNone(decision)
+        self.assertTrue(decision.require_progress_checkpoint)
+        self.assertIs(model.schemas[0], WebModelToolsetSelection)
+        self.assertIn(
+            "查北京故宫明天是否开放",
+            model.messages[0][0]["content"],
+        )
+
+    def test_invalid_web_checkpoint_value_defaults_false_without_losing_toolsets(self):
+        parsed = WebModelToolsetSelection.model_validate({
+            "selected_toolsets": ["WEB_RESEARCH"],
+            "require_progress_checkpoint": {"unexpected": "shape"},
+        })
+
+        self.assertEqual(parsed.selected_toolsets, ["WEB_RESEARCH"])
+        self.assertFalse(parsed.require_progress_checkpoint)
 
     async def test_exclusive_primary_group_suppresses_other_business_groups(self):
         registry = ToolsetRegistry(
@@ -190,8 +290,28 @@ class ToolsetCrossEncoderRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await router.route("查新闻", self.tools))
 
 
-class ToolsetRegistryAliasTests(unittest.TestCase):
-    def test_deep_agent_tool_aliases_resolve_without_duplicate_tools(self):
+class ToolsetRegistryCurrentNameTests(unittest.TestCase):
+    def test_research_and_movie_groups_do_not_leak_browser_tools(self):
+        research = DEFAULT_TOOLSET_REGISTRY.get("WEB_RESEARCH")
+        movie = DEFAULT_TOOLSET_REGISTRY.get("MOVIE")
+        browser = DEFAULT_TOOLSET_REGISTRY.get("BROWSER_AUTOMATION")
+
+        self.assertIsNotNone(research)
+        self.assertIsNotNone(movie)
+        self.assertIsNotNone(browser)
+        self.assertEqual(research.optional_tool_names, ("fetch_webpage",))
+        self.assertEqual(movie.optional_tool_names, ("web_search",))
+        self.assertFalse(browser.allow_runtime_expansion)
+        self.assertFalse(any(
+            name.startswith("browser_")
+            for name in (*research.required_tool_names, *research.optional_tool_names)
+        ))
+        self.assertFalse(any(
+            name.startswith("browser_")
+            for name in (*movie.required_tool_names, *movie.optional_tool_names)
+        ))
+
+    def test_current_deep_agent_tool_names_resolve_without_compatibility_aliases(self):
         registry = ToolsetRegistry(
             [
                 ToolsetSpec(
@@ -200,8 +320,8 @@ class ToolsetRegistryAliasTests(unittest.TestCase):
                     routing_profile="## 选择它\nfiles\n## 典型命令\nread files",
                     routing_threshold=0.35,
                     instructions="inspect files",
-                    required_tool_names=("list_directory", "find_files", "grep_files"),
-                    optional_tool_names=("replace_in_file",),
+                    required_tool_names=("ls", "glob", "grep"),
+                    optional_tool_names=("edit_file",),
                 )
             ]
         )
@@ -213,6 +333,54 @@ class ToolsetRegistryAliasTests(unittest.TestCase):
 
         self.assertEqual(resolution.missing_required_tool_names, ())
         self.assertEqual(resolution.tool_names, ("ls", "glob", "grep", "edit_file"))
+
+    def test_missing_tool_names_are_not_silently_aliased(self):
+        registry = ToolsetRegistry(
+            [
+                ToolsetSpec(
+                    name="LEGACY_FILES",
+                    description="legacy file tools",
+                    routing_profile="## 选择它\nlegacy files\n## 典型命令\nread files",
+                    routing_threshold=0.35,
+                    instructions="inspect files",
+                    required_tool_names=("missing_test_tool",),
+                )
+            ]
+        )
+        resolution = registry.resolve("LEGACY_FILES", [_tool("ls")])
+        self.assertEqual(resolution.missing_required_tool_names, ("missing_test_tool",))
+        self.assertEqual(registry.build_router_metadata([_tool("ls")]), [])
+
+    def test_pdf_code_step_exposes_current_file_and_execution_toolsets(self):
+        tools = [
+            _tool(name)
+            for name in (
+                "ls", "read_file", "write_file", "edit_file", "delete",
+                "glob", "grep", "execute", "task",
+            )
+        ]
+        names = {
+            item["name"]
+            for item in DEFAULT_TOOLSET_REGISTRY.build_router_metadata(tools)
+        }
+        self.assertEqual(
+            names,
+            {"FILE_INSPECTION", "FILE_EDITING", "SOFTWARE_DEVELOPMENT"},
+        )
+        decision = ToolsetRouter(
+            FakeReranker(), registry=DEFAULT_TOOLSET_REGISTRY
+        ).resolve_selected_toolsets(
+            ["SOFTWARE_DEVELOPMENT"],
+            tools,
+            routing_task="读取交接菜谱，生成并验证 PDF。",
+            allow_no_tool=False,
+        )
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.selected_toolset_names, ("SOFTWARE_DEVELOPMENT",))
+        self.assertEqual(
+            decision.tool_names,
+            ("read_file", "grep", "execute", "glob", "ls", "edit_file", "write_file"),
+        )
 
 
 class ToolsetRoutingCardTests(unittest.TestCase):

@@ -5,7 +5,12 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+from schema_normalization import (
+    EvidenceRefText,
+    coerce_text_sequence,
+    drop_invalid_auxiliary_fields,
+)
 
 LeadershipAction = Literal[
     "CONTINUE",
@@ -29,11 +34,21 @@ LeadershipWakeReason = Literal[
 class LeadershipDecision(BaseModel):
     """The only five actions the main model may take at a safe point."""
 
-    reason: str = Field(min_length=1, max_length=1200, description="先说明观察到的进展与依据，再填写action。")
+    reason: str = Field(default="", max_length=1200, description="可选观察依据；格式错误时Harness会省略，action及条件字段仍严格校验。")
     action: LeadershipAction
-    target_worker_ids: list[str] = Field(default_factory=list, max_length=3)
+    target_worker_ids: list[EvidenceRefText] = Field(default_factory=list, max_length=3)
     guidance: str | None = Field(default=None, max_length=2000)
     replacement_assignment: str | None = Field(default=None, max_length=4000)
+
+    @field_validator("target_worker_ids", mode="before")
+    @classmethod
+    def normalize_target_worker_ids(cls, value):
+        return coerce_text_sequence(value)
+
+    @model_validator(mode="before")
+    @classmethod
+    def omit_invalid_auxiliary_fields(cls, value):
+        return drop_invalid_auxiliary_fields(cls, value, ("reason",))
 
     @model_validator(mode="after")
     def validate_action_payload(self) -> "LeadershipDecision":

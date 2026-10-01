@@ -292,6 +292,22 @@ WORKER_RUNTIME_INTEGER_OPTIONS: dict[
         600,
     ),
 
+    # These are inactivity watchdogs, not total task deadlines. Observable
+    # planning/model/tool/review activity keeps extending the run.
+    "worker_inactivity_timeout_seconds": (
+        "RUNTIME_WORKER_INACTIVITY_TIMEOUT_SECONDS",
+        10 * 60,
+        60,
+        24 * 60 * 60,
+    ),
+
+    "code_inactivity_timeout_seconds": (
+        "RUNTIME_CODE_INACTIVITY_TIMEOUT_SECONDS",
+        15 * 60,
+        60,
+        24 * 60 * 60,
+    ),
+
     "workspace_retention_minutes": (
         "RUNTIME_WORKER_WORKSPACE_RETENTION_MINUTES",
         WORKER_WORKSPACE_DEFAULT_RETENTION_MINUTES,
@@ -390,7 +406,10 @@ class WorkerRuntimeSettings:
     leadership_single_worker_reports: int
     leadership_multi_worker_reports: int
     leadership_silence_timeout_seconds: int
+    worker_inactivity_timeout_seconds: int
+    code_inactivity_timeout_seconds: int
     workspace_retention_minutes: int
+    review_evidence_mode: str
 
 
 @dataclass(
@@ -805,8 +824,17 @@ def _load_worker_runtime_settings(
         in WORKER_RUNTIME_INTEGER_OPTIONS.items()
     }
 
+    review_evidence_mode = os.getenv(
+        "RUNTIME_REVIEW_EVIDENCE_MODE",
+        "balanced",
+    ).strip().lower()
+    if review_evidence_mode not in {"strict", "balanced"}:
+        raise RuntimeError(
+            "RUNTIME_REVIEW_EVIDENCE_MODE只支持strict或balanced。"
+        )
     return WorkerRuntimeSettings(
-        **values
+        **values,
+        review_evidence_mode=review_evidence_mode,
     )
 
 

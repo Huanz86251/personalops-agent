@@ -5,6 +5,7 @@ metadata:
   roles: "code"
   topics: "implementation files artifacts"
   required-tools: "read_file execute"
+  required-toolsets: "SOFTWARE_DEVELOPMENT"
 ---
 
 # 文件生成与转换

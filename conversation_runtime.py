@@ -1,10 +1,13 @@
 from skill_runtime.preparation import skill_selector_scope
 from knowledge_rag.runtime import RetrievalHub, retrieval_scope
 import asyncio
-from trace_presentation import run_name
+from trace_presentation import conversation_trace_name, run_name
+from trace_overview import conversation_overview
 import logging
+import os
 from contextlib import nullcontext
 import json
+from pathlib import Path
 from contextvars import (
     Context,
 )
@@ -28,7 +31,10 @@ from mcp_runtime import (
     EmailMCPRuntime,
     PlaywrightMCPPool,
 )
+from amap_mcp_runtime import AmapMapsMCPRuntime
 from uuid import uuid4
+
+from dotenv import dotenv_values
 
 from langgraph.checkpoint.sqlite.aio import (
     AsyncSqliteSaver,
@@ -52,6 +58,9 @@ from delivery.models import PromotionStatus, WorkspacePromotion
 from delivery.service import WorkspacePromotionService, format_promotion_summary
 from tools.web_tools import (
     configure_web_search_parallelism,
+)
+from step_user_question import (
+    ask_user_runtime_scope,
 )
 
 from path import AGENT_DATA_ROOT, WORKSPACE_ROOT
@@ -104,6 +113,7 @@ from tools.time_tools import (
 )
 from scheduling import ScheduleService
 from tools.schedule_tools import configure_schedule_service
+from host_file_access import configure_host_file_judge
 
 from toolsets import (
     DEFAULT_TOOLSET_REGISTRY,
@@ -132,8 +142,59 @@ from workers import (
 )
 from workers.leadership_models import LeadershipDecisionResult
 from workers.wake_policy import LeadershipWakePolicy
+from workers.code_submission import (
+    REQUEST_CODE_WORKER_REPAIR_NAME,
+    RESPOND_TO_CODE_REVIEW_NAME,
+    SUBMIT_CODE_FOR_REVIEW_NAME,
+    SUBMIT_CODE_REVIEW_NAME,
+    SUBMIT_CONTINUED_CODE_FOR_REVIEW_NAME,
+)
+from workers.code_publisher import PUBLISH_REVIEWED_CANDIDATE_NAME
+from workers.general_completion import GENERAL_REPORT_NAME
+from workers.submission import COMPLETE_WEB_STEP_NAME
 logger = logging.getLogger(
     "agent"
+)
+
+
+# Toolset routing may rank and hide business capabilities, but must never hide
+# the control-plane tools that a role's runtime can require on a later model
+# round. Keep these role baselines named and import canonical terminal-tool
+# constants so production composition and regression tests cannot silently
+# drift apart.
+GENERAL_TOOLSET_BASELINE_TOOL_NAMES = (
+    "ask_user",
+    "search_knowledge",
+    "read_knowledge",
+    "read_execution_history",
+    GENERAL_REPORT_NAME,
+    "request_additional_capabilities",
+)
+
+WEB_TOOLSET_BASELINE_TOOL_NAMES = (
+    "ask_user",
+    "search_knowledge",
+    "read_knowledge",
+    "read_execution_history",
+    "download_web_artifact",
+    "publish_worker_progress",
+    COMPLETE_WEB_STEP_NAME,
+    "request_additional_capabilities",
+)
+
+CODE_TOOLSET_BASELINE_TOOL_NAMES = (
+    "ask_user",
+    "search_knowledge",
+    "read_knowledge",
+    "read_execution_history",
+    "publish_worker_progress",
+    SUBMIT_CODE_FOR_REVIEW_NAME,
+    RESPOND_TO_CODE_REVIEW_NAME,
+    SUBMIT_CONTINUED_CODE_FOR_REVIEW_NAME,
+    REQUEST_CODE_WORKER_REPAIR_NAME,
+    PUBLISH_REVIEWED_CANDIDATE_NAME,
+    SUBMIT_CODE_REVIEW_NAME,
+    "request_additional_capabilities",
 )
 
 
@@ -660,6 +721,28 @@ def _planning_run_handoff_material(result: dict[str, Any]) -> str:
                 for item in (data(raw) for raw in report.get("criterion_results") or [])
             ][:8],
         })
+    final_decision = data(result.get("final_review_decision"))
+    final_decision_projection = {
+        "action": clipped(final_decision.get("action"), 40),
+        "status": clipped(final_decision.get("status"), 60),
+        "review_reason": clipped(final_decision.get("review_reason"), 600),
+        "criterion_reviews": [
+            {
+                "criterion_id": item.get("criterion_id"),
+                "status": clipped(item.get("status"), 60),
+                "observed_result": clipped(item.get("observed_result"), 300),
+                "missing_requirement": clipped(item.get("missing_requirement"), 240),
+            }
+            for item in (
+                data(raw)
+                for raw in final_decision.get("criterion_reviews") or []
+            )
+        ][:12],
+        "unmet_success_criteria": [
+            clipped(item, 200)
+            for item in final_decision.get("unmet_success_criteria") or []
+        ][:8],
+    } if final_decision else {}
     material = {
         "plan_objective": clipped(result.get("plan_objective")),
         "final_status": clipped(result.get("final_status"), 60),
@@ -671,6 +754,10 @@ def _planning_run_handoff_material(result: dict[str, Any]) -> str:
             clipped(data(item).get("reason") or data(item).get("summary"), 200)
             for item in list(result.get("replan_history") or [])[-3:]
         ],
+        # The final decision is authoritative when it corrected an earlier
+        # Step Reporter.  Keep its bounded verdict, never its full answer or
+        # raw evidence bodies, so the next turn does not inherit stale UNKNOWNs.
+        "final_review_decision": final_decision_projection,
     }
     return _compact_context_text(
         json.dumps(material, ensure_ascii=False, default=str), max_chars=12000
@@ -694,6 +781,19 @@ class ConversationRuntime:
         self._base_tools = tuple(tools)
         self.tools = list(self._base_tools)
         self.email_mcp = EmailMCPRuntime(settings.email_mcp)
+        # A personal AMap Web-service key is isolated in a Git-ignored local
+        # file.  It takes precedence over the shared Bailian trial service.
+        amap_local = dotenv_values(
+            Path(__file__).resolve().parent / ".env.amap.local"
+        )
+        personal_amap_key = (
+            os.getenv("AMAP_MAPS_API_KEY", "")
+            or str(amap_local.get("AMAP_MAPS_API_KEY") or "")
+        ).strip()
+        self.amap_mcp = AmapMapsMCPRuntime(
+            os.getenv("DASHSCOPE_API_KEY", ""),
+            personal_api_key=personal_amap_key,
+        )
         self.playwright_mcp = (
             PlaywrightMCPPool(
                 max_sessions=(
@@ -838,6 +938,8 @@ class ConversationRuntime:
             self.tools = list(self._base_tools)
             await self.email_mcp.start()
             self.tools.extend(self.email_mcp.tools)
+            await self.amap_mcp.start()
+            self.tools.extend(self.amap_mcp.tools)
 
             checkpointer = await (
                 checkpoint_context
@@ -933,6 +1035,7 @@ class ConversationRuntime:
                 for role, config in self.settings.role_models.items()
                 if role != "extraction" or config.api_key
             }
+            configure_host_file_judge(role_models["host_file_judge"])
             model = role_models["general"]
             hard_model = role_models["scheduler"]
             summary_model = role_models["summary"]
@@ -1031,6 +1134,12 @@ class ConversationRuntime:
             )
             await memory_service.rebuild_conflict_groups()
 
+            # 动态Worker每次attempt都会重建Graph；路由缓存必须由Conversation
+            # Runtime持有，否则Reviewer返工会无谓地再次调用能力选择器。
+            general_toolset_route_cache = {}
+            web_toolset_route_cache = {}
+            code_toolset_route_cache = {}
+
             worker_graph = create_general_worker(
                 role_models["general"],
                 summary_model=role_models["general_summary"],
@@ -1045,12 +1154,9 @@ class ConversationRuntime:
                     ToolsetRouterMiddleware(
                         retrieval_models,
                         minimum_score=self.settings.toolset_routing_threshold,
-                        baseline_tool_names=(
-                            "search_knowledge",
-                            "read_knowledge",
-                            "read_execution_history",
-                            "report_general_result",
-                        ),
+                        selector_model=role_models["capability_selector"],
+                        route_cache=general_toolset_route_cache,
+                        baseline_tool_names=GENERAL_TOOLSET_BASELINE_TOOL_NAMES,
                     ),
                     DynamicExecutionBudgetMiddleware(
                         enable_worker_finalization=False,
@@ -1133,12 +1239,9 @@ class ConversationRuntime:
                     ToolsetRouterMiddleware(
                         retrieval_models,
                         minimum_score=self.settings.toolset_routing_threshold,
-                        baseline_tool_names=(
-                            "search_knowledge",
-                            "read_knowledge",
-                            "read_execution_history",
-                            "report_general_result",
-                        ),
+                        selector_model=role_models["capability_selector"],
+                        route_cache=general_toolset_route_cache,
+                        baseline_tool_names=GENERAL_TOOLSET_BASELINE_TOOL_NAMES,
                     ),
                     DynamicExecutionBudgetMiddleware(
                         enable_worker_finalization=False,
@@ -1192,14 +1295,10 @@ class ConversationRuntime:
                     ToolsetRouterMiddleware(
                         retrieval_models,
                         minimum_score=self.settings.toolset_routing_threshold,
-                        baseline_tool_names=(
-                            "search_knowledge",
-                            "read_knowledge",
-                            "read_execution_history",
-                            "download_web_artifact",
-                            "publish_worker_progress",
-                            "submit_for_review",
-                        ),
+                        selector_model=role_models["capability_selector"],
+                        route_cache=web_toolset_route_cache,
+                        baseline_tool_names=WEB_TOOLSET_BASELINE_TOOL_NAMES,
+                        select_web_progress_checkpoint=True,
                     ),
                     DynamicExecutionBudgetMiddleware(
                         enable_worker_finalization=True,
@@ -1260,18 +1359,9 @@ class ConversationRuntime:
                     ToolsetRouterMiddleware(
                         retrieval_models,
                         minimum_score=self.settings.toolset_routing_threshold,
-                        baseline_tool_names=(
-                            "search_knowledge",
-                            "read_knowledge",
-                            "read_execution_history",
-                            "publish_worker_progress",
-                            "submit_code_for_review",
-                            "respond_to_code_review",
-                            "submit_continued_code_for_review",
-                            "request_code_worker_repair",
-                            "publish_reviewed_candidate",
-                            "submit_code_review",
-                        ),
+                        selector_model=role_models["capability_selector"],
+                        route_cache=code_toolset_route_cache,
+                        baseline_tool_names=CODE_TOOLSET_BASELINE_TOOL_NAMES,
                     ),
                     DynamicExecutionBudgetMiddleware(
                         schema_repair_max_rounds=(
@@ -1447,8 +1537,9 @@ class ConversationRuntime:
             planning_graph = (
                 build_planning_graph(
                     role_models=role_models,
-                    reporter_output_limits={role: self.settings.role_models[role].max_tokens
-                                            for role in ("reporter", "web_reporter")},
+                    reporter_output_limits={
+                        "reporter": self.settings.role_models["reporter"].max_tokens
+                    },
                     simple_model=(
                         model
                     ),
@@ -1494,6 +1585,9 @@ class ConversationRuntime:
                         .runtime_concurrency
                         .web_search_max_parallelism
                     ),
+                    review_evidence_mode=(
+                        self.settings.worker_runtime.review_evidence_mode
+                    ),
 
                     # 外层Planning Graph与子Agent共用同一个
                     # SQLite checkpointer，但通过不同thread_id隔离快照。
@@ -1503,7 +1597,9 @@ class ConversationRuntime:
 
         except Exception:
             configure_schedule_service(None)
+            configure_host_file_judge(None)
             await self.schedule_service.stop()
+            await self.amap_mcp.stop()
             await self.email_mcp.stop()
             self.tools = list(self._base_tools)
             await (
@@ -2626,6 +2722,7 @@ class ConversationRuntime:
             user_text: str,
             channel: str,
             external_chat_id: int | str,
+            reply_target_id: int | str | None = None,
             progress_callback: ProgressCallback,
             event_id: str | None = None,
             target_conversation_id: str | None = None,
@@ -2702,6 +2799,8 @@ class ConversationRuntime:
             },
         }
         resume_checkpoint_available = False
+        checkpoint_state = None
+        trace_query_text = normalized_user_text
         if resume_from_checkpoint:
             checkpoint_state = await planning_graph.aget_state(planning_config)
             resume_checkpoint_available = bool(
@@ -2716,6 +2815,15 @@ class ConversationRuntime:
                     resolved_event_id,
                     planning_thread_id,
                 )
+            else:
+                checkpoint_values = getattr(checkpoint_state, "values", None) or {}
+                checkpoint_context = checkpoint_values.get("context")
+                if isinstance(checkpoint_context, dict):
+                    checkpoint_request = checkpoint_context.get("user_request")
+                else:
+                    checkpoint_request = getattr(checkpoint_context, "user_request", None)
+                if str(checkpoint_request or "").strip():
+                    trace_query_text = str(checkpoint_request).strip()
 
         thread_lock = (
             self._thread_locks
@@ -2763,8 +2871,16 @@ class ConversationRuntime:
                         channel,
                     ],
             ):
+                turn_overview_result: dict[str, Any] = {}
                 with skill_selector_scope(self.role_models.get("skill_selector")), retrieval_scope(getattr(self, "retrieval_hub", None), "owner", resolved_event_id), trace_span(
-                        run_name("Conversation"),
+                        (
+                            run_name("Conversation")
+                            if channel == "appworld"
+                            else conversation_trace_name(
+                                trace_query_text,
+                                resumed=resume_checkpoint_available,
+                            )
+                        ),
 
                         kind="chain",
 
@@ -2818,7 +2934,13 @@ class ConversationRuntime:
                                     )
                             ),
                         },
-                ) as turn_span:
+                ) as turn_span, conversation_overview(
+                        turn_span,
+                        {"instruction": normalized_user_text, "channel": channel,
+                         "title": conversation.title},
+                        turn_overview_result,
+                        enabled=channel != "appworld",
+                ):
 
                     memories: list[
                         RetrievedMemory
@@ -3027,6 +3149,8 @@ class ConversationRuntime:
 
                                     "completed_step_reports": [],
 
+                                    "step_user_interactions": [],
+
                                     "remaining_steps": [],
 
                                     "replan_history": [],
@@ -3040,27 +3164,35 @@ class ConversationRuntime:
                             # Scheduler plans outcomes; document retrieval belongs to workers.
                             planning_context.rag_context = ""
                         try:
-                            if pause_control is None:
-                                planning_result = await planning_graph.ainvoke(
-                                    planning_input,
-                                    config=planning_config,
-                                    # 用户可见结果返回前，确保本轮所有节点状态
-                                    # 已经同步写入SQLite checkpoint。
-                                    durability="sync",
-                                )
-                            else:
-                                async for planning_snapshot in planning_graph.astream(
-                                    planning_input,
-                                    config=planning_config,
-                                    stream_mode="values",
-                                    durability="sync",
-                                ):
-                                    if isinstance(planning_snapshot, dict):
-                                        planning_result = planning_snapshot
-                                    # astream只会在一个完整节点提交之后产出
-                                    # values；因此这里不会切断正在执行的模型、
-                                    # 工具或Reviewer。
-                                    await pause_control.pause_point()
+                            with ask_user_runtime_scope(
+                                event_id=resolved_event_id,
+                                chat_id=str(
+                                    reply_target_id
+                                    if reply_target_id is not None
+                                    else external_chat_id
+                                ),
+                            ):
+                                if pause_control is None:
+                                    planning_result = await planning_graph.ainvoke(
+                                        planning_input,
+                                        config=planning_config,
+                                        # 用户可见结果返回前，确保本轮所有节点状态
+                                        # 已经同步写入SQLite checkpoint。
+                                        durability="sync",
+                                    )
+                                else:
+                                    async for planning_snapshot in planning_graph.astream(
+                                        planning_input,
+                                        config=planning_config,
+                                        stream_mode="values",
+                                        durability="sync",
+                                    ):
+                                        if isinstance(planning_snapshot, dict):
+                                            planning_result = planning_snapshot
+                                        # astream只会在一个完整节点提交之后产出
+                                        # values；因此这里不会切断正在执行的模型、
+                                        # 工具或Reviewer。
+                                        await pause_control.pause_point()
                             if not planning_result and resume_checkpoint_available:
                                 # 如果进程恰好在最后一个图节点已提交、但Event
                                 # 状态尚未来得及落盘时退出，续跑不会再产生新的
@@ -3155,23 +3287,35 @@ class ConversationRuntime:
 
                     previous_run_summary = ""
                     if channel != "appworld" and planning_result:
-                        handoff_material = _planning_run_handoff_material(planning_result)
-                        previous_run_summary = await summarize_conversation_history(
-                            self.summary_model,
-                            previous_summary="",
-                            messages=[{"role": "user", "content": handoff_material}],
-                            max_chars=self.settings.planning.conversation_summary_max_chars,
-                            prompt_name="conversation/run_summary",
-                            material_label="上一轮内部规划、执行与审核记录",
-                        )
                         terminal_status = str(planning_result.get("final_status") or "UNKNOWN")
-                        previous_run_summary = _compact_context_text(
-                            f"运行终态（Harness记录）：{terminal_status}\n{previous_run_summary}",
-                            max_chars=self.settings.planning.conversation_summary_max_chars,
-                        )
+                        if planning_result.get("overall_stop_reason") == "direct_answer":
+                            # DIRECT has no plan/report/review material to summarize.
+                            # Preserve the actual final exchange deterministically and
+                            # do not add another blocking model call before delivery.
+                            previous_run_summary = _compact_context_text(
+                                "运行终态（Harness记录）："
+                                f"{terminal_status}\n"
+                                f"用户问题：{normalized_user_text}\n"
+                                f"最终回答：{reply}",
+                                max_chars=self.settings.planning.conversation_summary_max_chars,
+                            )
+                        else:
+                            handoff_material = _planning_run_handoff_material(planning_result)
+                            previous_run_summary = await summarize_conversation_history(
+                                self.summary_model,
+                                previous_summary="",
+                                messages=[{"role": "user", "content": handoff_material}],
+                                max_chars=self.settings.planning.conversation_summary_max_chars,
+                                prompt_name="conversation/run_summary",
+                                material_label="上一轮内部规划、执行与审核记录",
+                            )
+                            previous_run_summary = _compact_context_text(
+                                f"运行终态（Harness记录）：{terminal_status}\n{previous_run_summary}",
+                                max_chars=self.settings.planning.conversation_summary_max_chars,
+                            )
 
-                    # 无论Supervisor直接FINAL，
-                    # 还是General Worker在独立Step Thread中执行，
+                    # 无论上游DIRECT直接回答，
+                    # 还是Worker在独立Step Thread中执行并完成审核，
                     # 最终都把本轮用户消息和回答写回原Conversation。
                     await agent.aupdate_state(
                         self._build_config(
@@ -3224,36 +3368,46 @@ class ConversationRuntime:
                             conversation
                                     .title_generated
                     ):
-                        try:
-                            final_title = await (
-                                generate_conversation_title(
-                                    self.role_models.get("title", model),
-
-                                    normalized_user_text,
-
-                                    reply,
-                                )
-                            )
-
-                        except Exception:
-                            logger.exception(
-                                "生成Conversation标题失败"
-                            )
-
+                        if planning_result.get("overall_stop_reason") == "direct_answer":
                             final_title = (
                                 self._fallback_title(
                                     normalized_user_text
                                 )
                             )
-
                             title_generation_status = (
-                                "fallback_after_error"
+                                "deterministic_direct"
                             )
-
                         else:
-                            title_generation_status = (
-                                "generated"
-                            )
+                            try:
+                                final_title = await (
+                                    generate_conversation_title(
+                                        self.role_models.get("title", model),
+
+                                        normalized_user_text,
+
+                                        reply,
+                                    )
+                                )
+
+                            except Exception:
+                                logger.exception(
+                                    "生成Conversation标题失败"
+                                )
+
+                                final_title = (
+                                    self._fallback_title(
+                                        normalized_user_text
+                                    )
+                                )
+
+                                title_generation_status = (
+                                    "fallback_after_error"
+                                )
+
+                            else:
+                                title_generation_status = (
+                                    "generated"
+                                )
 
                         await agent.aupdate_state(
                             self._build_config(
@@ -3470,6 +3624,28 @@ class ConversationRuntime:
                             },
                         },
                     )
+
+                    turn_overview_result.update({
+                        "answer": reply,
+                        "status": planning_result.get("final_status") or planning_status,
+                        "planning": {
+                            "planned_steps": planning_result.get("planned_steps", []),
+                            "completed_step_reports": planning_result.get("completed_step_reports", []),
+                            "final_status": planning_result.get("final_status"),
+                            "overall_stop_reason": planning_result.get("overall_stop_reason"),
+                        },
+                    })
+
+                    if channel != "appworld":
+                        turn_span.update_name(
+                            conversation_trace_name(
+                                trace_query_text,
+                                status=(
+                                    planning_result.get("final_status")
+                                    or planning_status
+                                ),
+                            )
+                        )
 
                     return reply
 
@@ -3944,10 +4120,16 @@ class ConversationRuntime:
         self._memory_postprocess_locks.clear()
 
         configure_schedule_service(None)
+        configure_host_file_judge(None)
         try:
             await self.schedule_service.stop()
         except Exception:
             logger.exception("关闭本地提醒服务时发生异常")
+
+        try:
+            await self.amap_mcp.stop()
+        except Exception:
+            logger.exception("关闭高德地图MCP时发生异常")
 
         try:
             await self.email_mcp.stop()
@@ -3977,6 +4159,8 @@ class ConversationRuntime:
             self.retrieval_models
         )
 
+        code_runtime = self.code_runtime
+
         self._memory_store_context = None
         self._memory_store = None
 
@@ -4000,6 +4184,12 @@ class ConversationRuntime:
         self.code_runtime = None
 
         self._thread_locks.clear()
+
+        if code_runtime is not None:
+            try:
+                code_runtime.close()
+            except Exception:
+                logger.exception("关闭CODE Docker控制面时发生异常")
 
         if memory_context is not None:
             try:

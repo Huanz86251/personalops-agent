@@ -133,6 +133,33 @@ def test_every_role_can_stack_compatible_skills(role, selected, topics, tools):
         assert f'[{name}]' in prompt
 
 
+def test_scheduler_file_delivery_skill_stacks_and_removes_generic_contradiction():
+    selected = ['plan-personal-tasks', 'plan-file-delivery']
+    result = prepare_skills_sync(
+        ProbeModel(selected=selected), role='scheduler',
+        task='把Downloads里的简历发给我',
+        topics=['planning', 'files', 'delivery'], tools=[], mode='dynamic',
+    )
+    assert {skill.name for skill in result.selected} == set(selected)
+    prompt = skill_prompt(result)
+    assert '[plan-file-delivery]' in prompt
+    assert '真实发送回执' in prompt
+    assert '不要编造 Render Worker' in prompt
+    assert '当前不安排任何实际发送' not in prompt
+
+    personal = Path('skills/scheduler/plan-personal-tasks/SKILL.md').read_text(
+        encoding='utf-8'
+    )
+    delivery = Path('skills/scheduler/plan-file-delivery/SKILL.md').read_text(
+        encoding='utf-8'
+    )
+    assert '文件交付规划 Skill' in personal
+    assert 'GENERAL Step' in delivery
+    assert 'WEB Step' in delivery
+    assert 'CODE Step' in delivery
+    assert 'send_local_file_to_feishu' not in delivery
+
+
 def test_exclusive_general_skill_cannot_stack_with_appworld():
     tools = ['attachment_to_text', 'appworld_discover', 'appworld_execute']
     topics = ['documents', 'appworld']
@@ -166,6 +193,56 @@ def test_explicit_pairwise_conflict_is_symmetric():
         assert [skill.name for skill in result.selected] == [kept]
 
 
+def test_movie_skills_are_role_scoped_and_exclusive():
+    scheduler = prepare_skills_sync(
+        ProbeModel(selected=['plan-movie-research']), role='scheduler',
+        task='Find tonight\'s movie sessions and reviews',
+        topics=['planning', 'research', 'cinema', 'movie-reviews'], tools=[],
+        mode='dynamic',
+    )
+    assert [skill.name for skill in scheduler.selected] == ['plan-movie-research']
+    assert scheduler.selected[0].exclusive
+    assert '两条**各自可验收**的 WEB Step' in skill_prompt(scheduler)
+
+    for selected in (['web-cinema-showtimes', 'web-movie-reviews'],
+                     ['web-movie-reviews', 'web-cinema-showtimes']):
+        result = prepare_skills_sync(
+            ProbeModel(selected=selected), role='web',
+            task='Find movie showtimes and reviews',
+            topics=['research', 'cinema', 'movie-reviews'], tools=['web_search'],
+            mode='dynamic',
+        )
+        assert [skill.name for skill in result.selected] == selected[:1]
+        assert result.selection_method == 'model_conflict_filtered'
+        with pytest.raises(ValueError, match='conflict'):
+            prepare_skills_sync(
+                ProbeModel(), role='web', task='Find movie showtimes and reviews',
+                topics=['research', 'cinema', 'movie-reviews'],
+                tools=['web_search'], mode='fixed', fixed_ids=selected,
+            )
+
+    reviews = prepare_skills_sync(
+        ProbeModel(selected=['web-movie-reviews']), role='web',
+        task='Summarize reviews for a film', topics=['movie-reviews'],
+        tools=['web_search'], mode='dynamic',
+    )
+    assert 'fetch_webpage(url=' in skill_prompt(reviews)
+    assert 'browser_snapshot()' not in skill_prompt(reviews)
+    assert '不把评价页、评分' in skill_prompt(reviews)
+
+    selector = Path('prompts/routing/skill_selector.md').read_text(encoding='utf-8')
+    assert 'plan-movie-research' in selector
+    assert 'web-movie-reviews' in selector
+    assert '不能在同一 Step 叠加' in selector
+    assert '不能把上一步未解决的缺口改成本 Step 的目标' in selector
+    assert '本步明确查剧情与评分时，仍按本步选择影评 Skill' in selector
+
+    replanner = Path('prompts/planning/replanner.md').read_text(encoding='utf-8')
+    assert 'GENERAL 没有 web_search 或浏览器能力' in replanner
+    assert '应保留 WEB 能力' in replanner
+    assert '没有可行新路径时选择 FINISH' in replanner
+
+
 def test_general_worker_keeps_short_write_before_classification_example():
     text = Path('prompts/workers/general_worker.md').read_text(encoding='utf-8')
     assert '没有确认记录的需要新增' in text
@@ -184,6 +261,23 @@ def test_scheduler_plans_all_final_state_branches_and_full_scope_readback():
     assert '绝对不能把“我拥有的容器中的已标记对象”' in text
     assert '上述复杂范围必须填写Step.target_selection' in text
     assert 'applies_to_sets或used_for_sets' in text
+
+
+def test_scheduler_base_contract_keeps_web_general_and_code_boundaries_explicit():
+    text = Path('prompts/planning/step_contract.md').read_text(encoding='utf-8')
+    assert 'WEB负责公网搜索' in text
+    assert 'GENERAL只处理已给上下文' in text
+    assert '不是WEB失败后的联网兜底' in text
+    assert '“最新/当前/实时/现在最火”' in text
+    assert 'WEB查证当前热度与来源' in text
+    assert 'CODE读取交接材料生成和验证PDF' in text
+    assert '把我 Downloads 里的简历发给我' in text
+    assert '由 Worker 调用 ask_user' in text
+    assert '不得在 Worker 尝试搜索之前要求用户自己提供绝对路径' in text
+
+    appworld = Path('prompts/planning/step_contract_appworld.md').read_text(encoding='utf-8')
+    assert '只在 GENERAL 和 CODE 中选择' in appworld
+    assert '当前是 AppWorld 隔离评测环境' in appworld
 
 
 def test_scope_resolver_splits_independently_read_contexts():

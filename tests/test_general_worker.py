@@ -1,5 +1,6 @@
 """Offline tests for the minimal Deep Agents general worker."""
 
+import json
 import unittest
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -12,7 +13,7 @@ from pydantic import Field
 
 from workers.general_worker import (
     DEEP_AGENT_FILE_TOOLS,
-    LEGACY_TOOL_NAMES,
+    GENERAL_EXCLUDED_TOOL_NAMES,
     create_general_worker,
     select_general_worker_tools,
 )
@@ -26,7 +27,11 @@ class StaticWorkerModel(BaseChatModel):
 
     def with_structured_output(self, schema, **kwargs):
         if schema.__name__ == 'SkillChoice':
-            return RunnableLambda(lambda messages: {'parsed': {'skill_ids': [], 'reason': 'Offline business probe needs no skill'}})
+            def choose(messages):
+                request = json.loads(messages[0]['content'])
+                selected = ['plan-task-dependencies'] if request.get('role') == 'scheduler' else []
+                return {'parsed': {'skill_ids': selected, 'reason': 'Offline business probe'}}
+            return RunnableLambda(choose)
         return super().with_structured_output(schema, **kwargs)
 
     @property
@@ -83,6 +88,9 @@ class GeneralWorkerTests(unittest.TestCase):
                 "schedule_runs",
                 "windows_notify",
                 "capture_desktop_screenshot",
+                "host_list_files",
+                "host_search_files",
+                "host_import_file",
             ],
         )
 
@@ -121,15 +129,16 @@ class GeneralWorkerTests(unittest.TestCase):
         )
         self.assertNotIn("execute", initial_tools)
         self.assertNotIn("show_all_toolsets", initial_tools)
-        legacy_only_names = (
-            LEGACY_TOOL_NAMES.difference(DEEP_AGENT_FILE_TOOLS)
+        self.assertIn("request_additional_capabilities", initial_tools)
+        excluded_business_names = (
+            GENERAL_EXCLUDED_TOOL_NAMES.difference(DEEP_AGENT_FILE_TOOLS)
             .difference({"show_all_toolsets"})
         )
         self.assertTrue(
-            legacy_only_names.isdisjoint(initial_tools)
+            excluded_business_names.isdisjoint(initial_tools)
         )
         self.assertIn("report_general_result", model.seen_tool_names)
-        self.assertNotIn("submit_for_review", model.seen_tool_names)
+        self.assertNotIn("complete_web_step", model.seen_tool_names)
         self.assertNotIn("publish_worker_progress", model.seen_tool_names)
         self.assertNotIn("task", model.seen_tool_names)
         self.assertEqual(len(model.bound_tool_history), 1)

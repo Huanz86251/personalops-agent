@@ -13,7 +13,7 @@ from typing import Annotated, Literal
 
 from langchain_core.documents import Document
 from langchain.tools import ToolRuntime, tool
-from observability import trace_span, set_span_output
+from observability import trace_span, set_span_attributes, set_span_output
 from pydantic import Field
 
 SHARED_CODE = ContextVar("shared_code_knowledge", default=None)
@@ -156,6 +156,10 @@ async def automatic_rag(query, role, key=None, agent=None):
             snapshot_key = key or role
             existing = hub.snapshot(run, snapshot_key)
             if existing is not None:
+                set_span_attributes(span, **{
+                    "rag.status": "reused",
+                    "rag.selected_count": 0,
+                })
                 set_span_output(span, {
                     "status": "reused",
                     "injected_context": existing,
@@ -175,7 +179,25 @@ async def automatic_rag(query, role, key=None, agent=None):
                 results = [public_result(result) for result in results]
             from knowledge_rag.guidance import format_rag_context
             text = format_rag_context(results)
+            status = "injected" if results else "no_match"
+            top_score = max(
+                (
+                    float(result["relevance_score"])
+                    for result in results
+                    if result.get("relevance_score") is not None
+                ),
+                default=None,
+            )
+            set_span_attributes(span, **{
+                "rag.status": status,
+                "rag.selected_count": len(results),
+                "rag.top_score": top_score,
+            })
             set_span_output(span, {
+                "status": status,
+                "query": query,
+                "selected_count": len(results),
+                "top_score": top_score,
                 "results": results,
                 "injected_context": text,
                 "content_tokens": content_tokens,
@@ -185,6 +207,10 @@ async def automatic_rag(query, role, key=None, agent=None):
             hub.snapshot(run, snapshot_key, text)
             return text
         except Exception as error:
+            set_span_attributes(span, **{
+                "rag.status": "unavailable",
+                "rag.selected_count": 0,
+            })
             set_span_output(span, {"status": "unavailable", "error": str(error), "injected_context": ""})
             return ""
 

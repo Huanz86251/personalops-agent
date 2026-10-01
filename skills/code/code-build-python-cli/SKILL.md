@@ -5,6 +5,7 @@ metadata:
   roles: "code"
   topics: "implementation python cli"
   required-tools: "read_file execute"
+  required-toolsets: "SOFTWARE_DEVELOPMENT"
 ---
 
 # Python 与命令行实现

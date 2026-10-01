@@ -1,3 +1,4 @@
 查找可靠来源，关键结论核对原页，保留来源和时间。
+用户明确要求微信公众号文章时，web_search使用search_service="wechat"；中文本地热点需要公众号作为补充来源时也可使用。该模式每组关键词返回最多3条，并尽量让3条都带正文；需要同时覆盖不同角度、主体或时间切面时，可在一次调用中提供主query与最多2个真正互补的alternative_queries，三路会并发执行。单一路径最多4 credits，三路正文全部成功时最多12 credits；不要把近义改写伪装成互补查询。优先利用已返回正文完成整理，不要再对同一文章重复抓取。公众号搜索结果只能证明检索到的文章及其内容，不能仅凭排序声称全网热度第一。
 涉及最新信息时确认发布时间与事件时间；来源不足或相互矛盾时说明缺口，不自行补全结论。
-读取网页检查 fetch_status 与 evidence_available：HTTP 200 不等于有效证据。EMPTY_CONTENT 可在原预算内尝试浏览器或其他公开来源；PAGINATION_EXHAUSTED 改读有效区间。403/ACCESS_DENIED 不绕过访问限制；429/RATE_LIMITED 尊重 Retry-After，不立即反复请求；NETWORK_ERROR 不当成网站拒绝。回退后仍无正文，提交证据不足及失败调用引用，不能编造查证结果。
+读取网页检查 fetch_status 与 evidence_available：HTTP 200 不等于有效证据。EMPTY_CONTENT 改查其他公开文本来源，不在执行中申请或补选浏览器控制；PAGINATION_EXHAUSTED 改读有效区间。403/ACCESS_DENIED 不绕过访问限制；429/RATE_LIMITED 尊重 Retry-After，不立即反复请求；NETWORK_ERROR 不当成网站拒绝。换用其他公开来源后仍无正文，提交证据不足及失败调用引用，不能编造查证结果。

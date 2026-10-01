@@ -5,6 +5,7 @@ metadata:
   roles: "general"
   topics: "appworld csv file-export"
   required-tools: "appworld_discover appworld_execute"
+  required-toolsets: "APPWORLD"
 ---
 
 # AppWorld CSV 导出

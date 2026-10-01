@@ -20,6 +20,39 @@ def compact_json(value):
                       default=lambda item: item.model_dump(mode="json") if hasattr(item, "model_dump") else str(item))
 
 
+def scheduler_report_projection(report):
+    """Expose the Reviewer's verdict, not the Worker/material context.
+
+    E/A references remain as audit labels, but the Scheduler cannot dereference
+    them and does not receive answer text, raw evidence, API handoffs, or
+    Worker-authored knowledge.  The Reviewer is the context boundary.
+    """
+
+    value = (
+        report.model_dump(mode="json")
+        if hasattr(report, "model_dump")
+        else dict(report)
+    )
+    allowed = {
+        "step_id",
+        "summary",
+        "stop_reason",
+        "status",
+        "criterion_results",
+        "confirmed_results",
+        "completed_work",
+        "approved_artifact_refs",
+        "errors",
+        "unresolved_items",
+        "replan_reason",
+        "request_replan",
+        "next_action",
+        "assessment_source",
+        "recovery_proposal",
+    }
+    return {key: value[key] for key in allowed if key in value}
+
+
 @dataclass
 class SchedulerConversation:
     data: dict
@@ -173,12 +206,21 @@ class SchedulerConversation:
         self.data["compactions"] = self.data.get("compactions", 0) + 1
         self.data["evicted_process_messages"] = self.data.get("evicted_process_messages", 0) + len(removed)
 
-    def disclose(self, stage, schema):
+    def disclose(self, stage, schema, *, additional_prompts=(), include_schema=True):
         schema = copy.deepcopy(schema)
         if stage in {"supervisor", "replanner"}:
-            self.add("step_contract", load_prompt("planning/step_contract"), key="step_contract")
+            step_contract_prompt = (
+                "planning/step_contract_appworld"
+                if getattr(self.context, "execution_environment", "") == "appworld"
+                else "planning/step_contract"
+            )
+            self.add("step_contract", load_prompt(step_contract_prompt), key="step_contract")
         instruction = load_prompt("planning/" + stage)
-        text = instruction + "\nSchema:" + compact_json(compact_schema(schema))
+        for prompt_name in additional_prompts:
+            instruction += "\n\n" + load_prompt(prompt_name)
+        text = instruction
+        if include_schema:
+            text += "\nSchema:" + compact_json(compact_schema(schema))
         key = stage + "@" + hashlib.sha256(text.encode()).hexdigest()[:16]
         # A stage protocol is request-local, not durable history. Keeping old
         # Plan/Replan schemas beside the current schema wastes context and
@@ -203,9 +245,12 @@ def conversation(context):
 
 
 def record_graph_facts(session, state):
+    for interaction in state.get("step_user_interactions", []):
+        if isinstance(interaction, dict):
+            session.fact("用户补充问答", interaction)
     reports = list(state.get("completed_step_reports", []))
     for report in reports:
-        session.fact("StepReport", report)
+        session.fact("StepReport", scheduler_report_projection(report))
     current_step = state.get("current_step")
     if current_step is not None:
         current_step_id = (
@@ -304,10 +349,16 @@ def scheduler_node(handler, threshold):
     """Bind the same session to node work and child Worker progress callbacks."""
     async def wrapped(state, config):
         from planning_models import PlanningContextPack
+        from step_user_question import merge_ask_user_interactions
         context = PlanningContextPack.model_validate(state["context"]).model_copy(deep=True)
         session = SchedulerConversation(context.scheduler_session, context, threshold)
         token = CURRENT_SCHEDULER.set(session)
         current = {**state, "context": context}
+        runtime_interactions = merge_ask_user_interactions(
+            state.get("step_user_interactions", [])
+        )
+        if runtime_interactions:
+            current["step_user_interactions"] = runtime_interactions
         try:
             # Initialization follows initial skill preparation, not before it.
             if session.records:
@@ -315,6 +366,11 @@ def scheduler_node(handler, threshold):
             result = await handler(current, config)
             updates = result.update if hasattr(result, "update") and not isinstance(result, dict) else result
             updates = dict(updates or {})
+            runtime_interactions = merge_ask_user_interactions(
+                current.get("step_user_interactions", [])
+            )
+            if runtime_interactions:
+                updates["step_user_interactions"] = runtime_interactions
             updated_context = PlanningContextPack.model_validate(updates.get("context", context))
             updated_context = updated_context.model_copy(update={"scheduler_session": copy.deepcopy(session.data)})
             updates["context"] = updated_context
@@ -340,6 +396,7 @@ def scheduler_node(handler, threshold):
         return report_trace
     names = {
         "prepare_scheduler_node": "Scheduler / Prepare Context",
+        "direct_answer_node": "Scheduler / Direct Answer",
         "supervisor_node": "Scheduler / Plan",
         "step_executor_node": "Scheduler / Dispatch Step",
         "code_controller_node": "Scheduler / Code Recovery",

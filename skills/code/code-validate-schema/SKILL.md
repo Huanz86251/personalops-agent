@@ -5,6 +5,7 @@ metadata:
   roles: "code"
   topics: "implementation schema contracts"
   required-tools: "read_file execute"
+  required-toolsets: "SOFTWARE_DEVELOPMENT"
 ---
 
 # 结构与语义契约实现

@@ -1,6 +1,6 @@
 {
   "qwen3.7-flash": {
-    "thinking_budget": 1024,
-    "skill_selector_thinking_budget": 1024
+    "thinking_budget": 500,
+    "skill_selector_thinking_budget": 0
   }
 }

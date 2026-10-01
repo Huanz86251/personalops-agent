@@ -59,8 +59,22 @@ def _safe_relative_path(value: str) -> str:
         or any(":" in part for part in posix.parts)
         or any(part in _IGNORED_TREE_PARTS for part in posix.parts)
     ):
-        raise ValueError(f"unsafe artifact path: {value}")
+        raise ValueError(
+            f"unsafe artifact path: {value}; use a path relative to /workspace "
+            '(for example "个人名片.html" or "dist/index.html"), not an '
+            "absolute path"
+        )
     return posix.as_posix()
+
+
+def _candidate_relative_path(value: str) -> str:
+    """Accept the model-facing /workspace alias, then enforce a safe relative path."""
+
+    normalized = str(value).strip().replace("\\", "/")
+    workspace_prefix = "/workspace/"
+    if normalized.startswith(workspace_prefix):
+        normalized = normalized[len(workspace_prefix) :]
+    return _safe_relative_path(normalized)
 
 
 def compute_code_tree_revision(root: Path) -> str:
@@ -296,11 +310,11 @@ def publish_reviewed_candidate(
             raise ValueError("Worker submission references a stale candidate")
 
         proposed = {
-            _safe_relative_path(path)
+            _candidate_relative_path(path)
             for path in submission.proposed_artifact_paths
         }
         approved = tuple(
-            _safe_relative_path(path)
+            _candidate_relative_path(path)
             for path in approved_artifact_paths
         )
         unexpected = sorted(set(approved) - proposed)

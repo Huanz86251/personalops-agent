@@ -19,7 +19,7 @@
 
 工具型 Agent 最容易出现的问题，不是“不会聊天”，而是选错对象、调用错接口、写入后没有回读，或在 Worker 交接后重复劳动。因此项目用 AppWorld 的模拟业务环境检查完整任务结果，而不是把模型自报成功当成通过。
 
-在 **AppWorld Test-Normal／Test-Challenge 全量单次评测**中，任务通过率分别为 **83.3%（140/168）／75.5%（315/417）**；[官方榜单流程](https://github.com/StonyBrookNLP/appworld-leaderboard/pull/23)复算结果一致。云端规划与执行仅使用 Qwen3.8-Flash 和 GLM-5.3-Flash，不使用 Max/Pro；最高仅 Scope Resolver 使用 medium 推理，其余主要角色为 low 或关闭。两组单题估算成本 P50 分别为 **¥0.13／¥0.19**，端到端耗时 P50 为 **281／352 秒**；分位数、缓存命中和统计口径见[评测方法](docs/benchmark.md)。
+在 **AppWorld Test-Normal／Test-Challenge 全量单次评测**中，任务通过率分别为 **83.3%（140/168）／75.5%（315/417）**；[官方榜单流程](https://github.com/StonyBrookNLP/appworld-leaderboard/pull/23)复算结果一致。云端规划与执行仅使用 Qwen3.8-Flash 和 GLM-5.3-Flash，不使用 Max/Pro；主要角色使用 low 推理或关闭推理。两组单题估算成本 P50 分别为 **¥0.13／¥0.19**，端到端耗时 P50 为 **281／352 秒**；分位数、缓存命中和统计口径见[评测方法](docs/benchmark.md)。
 
 > 成本按可观测 usage 和公开价格估算，不是账单；少量请求缺少 usage，因此总成本仅是下界。原题、模拟账号、Trace 和运行归档只保存在本地，仓库仅发布[聚合统计和评测口径](docs/benchmark.md)。
 
@@ -94,8 +94,10 @@ PersonalOps Agent 通过飞书长连接接收消息，使用可独立配置的�
 | `FILE_INSPECTION` | 目录浏览、文件查找、文本读取与搜索 |
 | `FILE_EDITING` | 文本文件创建、写入和精确替换 |
 | `SOFTWARE_DEVELOPMENT` | Python、Git、测试及其他 Shell 调试任务 |
-| `SCHEDULED_AUTOMATION` | 持久化日程、Windows/飞书提醒与一次性 Agent Event |
-| `EMAIL_READING` | 本地 IMAP 邮件读取、受控附件下载与只存不发的草稿 |
+| `DOCUMENT_READING` / `DOCUMENT_CONVERSION` / `SPREADSHEET_WORK` | 文档读取OCR、格式转换和电子表格处理 |
+| `SCHEDULE_CREATION` / `SCHEDULE_MANAGEMENT` | 创建提醒、Windows/飞书通知、Agent Event及已有提醒管理 |
+| `EMAIL_READING` / `EMAIL_DRAFTING` | 本地 IMAP 邮件读取、受控附件下载与只存不发的草稿 |
+| `AMAP_POI` / `AMAP_ROUTE` / `AMAP_LOCATION_CONTEXT` / `AMAP_ACTION_LINKS` | 高德地点、路线、位置天气和客户端入口 |
 | `DESKTOP_OBSERVATION` | Windows 桌面截图与本地 OCR；不含点击和输入 |
 
 Toolset Router 先用本地 Cross Encoder 在用户请求与当前 Step 上选择少量能力域；低置信度时才调用当前 Worker 的同款模型做一次短选择。缺少必需工具的 Toolset 不会被标记为可用，完整工具目录也不会长期塞进每一轮上下文。
@@ -169,6 +171,8 @@ Worker 和 Reporter 都不直接写正式 Workspace；它们分别负责生产�
 
 Worker、Web Worker、Code Worker 与 Code Reviewer 的最终结构化提交如果被 Harness 判为字段或引用格式错误，会由原角色只修表，不重新执行业务动作，也不立即唤醒 Reviewer。该独立额度由 `RUNTIME_WORKER_SCHEMA_REPAIR_MAX_ROUNDS` 控制，当前默认及硬上限均为 3；真实模型调用仍计入整轮 Plan 的总成本与安全上限。
 
+运行时使用“连续静默”而不是“任务总时长”判断卡死：General/Web 默认连续 600 秒没有模型轮次、工具启动或规划/审核状态变化才超时；一旦本轮出现 Code Worker 或 Code Reviewer 活动，则提升为 900 秒。对应配置为 `RUNTIME_WORKER_INACTIVITY_TIMEOUT_SECONDS` 和 `RUNTIME_CODE_INACTIVITY_TIMEOUT_SECONDS`。等待用户回复期间暂停计时，因此持续正常交换的复杂任务不会因为总耗时较长而被终止。
+
 <br>
 
 ## 🧠 记忆检索
@@ -188,7 +192,7 @@ Write Gate不会直接生成正式长期记忆。明确的“请记住”类请�
 
 召回首先独立形成 Dense Top-8 与 BM25 Top-8 候选并集，再由同一个 BCE Cross-Encoder 选出 Top-2 图种子；从种子执行最多两跳、最多补充6条图候选，最后统一精排并只注入 Top-2。Dense只索引模型生成的规范化摘要；BM25额外索引typed字段和三元组，但不索引原始evidence。Dense与BM25的原始分数量纲不同，因此不直接相加；候选融合后由Cross-Encoder统一定标，confidence仅作本地降权，importance用于同分排序。`MEMORY_BM25_LIMIT`可调整词法候选数。
 
-旧Qwen GGUF只保留给独立的Memory Router配置；Read Gate已经完全由CrossEncoder阈值承担。动态工具组路由也已改用同一个常驻BCE Cross-Encoder，不再生成标签或JSON；能力卡、阈值、拒识和回退规则见[工具组路由说明](docs/toolset-routing.md)。
+旧Qwen GGUF只保留给独立的Memory Router配置；Read Gate仍由Cross Encoder阈值承担。Worker能力组路由采用 BM25 Top-3 与常驻 BCE Cross Encoder Top-5，经 RRF 合并后交给独立 Qwen3.7-Flash 选择 1–3 组；Worker还可提交一次有证据的能力补选申请。它不会复用当前Worker模型，也不会失败后展示全部工具。详见[工具组路由说明](docs/toolset-routing.md)。
 
 项目还维护一层内存中的关系图索引，用于从混合召回命中的记忆继续扩展相关节点；图关系只由宿主根据固定枚举生成，模型不能发明边。BM25和关系图都是可重建的辅助索引：启动时从active记忆重建，写入和retire时同步更新，SQLite Store仍然是持久化数据的唯一来源。
 

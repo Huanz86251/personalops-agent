@@ -6,7 +6,14 @@ import json
 
 SCOPES = ContextVar("usage_scopes", default=())
 FIELDS = ("input_tokens", "output_tokens", "total_tokens", "cache_read_tokens", "cache_creation_tokens", "reasoning_tokens")
-SCHEDULER_ROLES = {"scheduler", "code_scheduler", "replanner", "final_reviewer", "worker_leader", "reporter", "web_reporter"}
+SCHEDULER_ROLES = {
+    "scheduler",
+    "code_scheduler",
+    "replanner",
+    "final_reviewer",
+    "worker_leader",
+    "reporter",
+}
 
 
 def normalize_usage(response, messages):

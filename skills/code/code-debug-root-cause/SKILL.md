@@ -5,6 +5,7 @@ metadata:
   roles: "code"
   topics: "implementation debugging"
   required-tools: "read_file execute"
+  required-toolsets: "SOFTWARE_DEVELOPMENT"
 ---
 
 # 以因果证据驱动调试

@@ -214,10 +214,13 @@ class ScheduleToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("runtime", feishu_schema["parameters"]["properties"])
         self.assertNotIn("chat_id", feishu_schema["parameters"]["properties"])
         self.assertNotIn("runtime", agent_schema["parameters"]["properties"])
-        resolution = DEFAULT_TOOLSET_REGISTRY.resolve("SCHEDULED_AUTOMATION", ALL_TOOLS)
-        self.assertTrue(resolution.is_available)
-        self.assertTrue(expected <= set(resolution.tool_names))
-        self.assertIn("明天上午九点提醒我", resolution.spec.routing_profile)
+        creation = DEFAULT_TOOLSET_REGISTRY.resolve("SCHEDULE_CREATION", ALL_TOOLS)
+        management = DEFAULT_TOOLSET_REGISTRY.resolve("SCHEDULE_MANAGEMENT", ALL_TOOLS)
+        self.assertTrue(creation.is_available)
+        self.assertTrue(management.is_available)
+        self.assertTrue(expected <= set(creation.tool_names) | set(management.tool_names))
+        self.assertIn("明天上午九点提醒我", creation.spec.routing_profile)
+        self.assertIn("取消明天下午的开会提醒", management.spec.routing_profile)
 
     async def test_create_tool_persists_and_returns_id(self):
         with TemporaryDirectory() as temporary:

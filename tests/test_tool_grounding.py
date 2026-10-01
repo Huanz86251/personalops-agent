@@ -59,6 +59,39 @@ def test_catalog_distinguishes_user_rag_state_and_real_tool_results():
     assert set(catalog) == {"MODEL", "P1", "U1", "R1", "S1", "E1"}
 
 
+def test_catalog_accepts_parallel_web_result_references_without_tool_messages():
+    catalog = source_catalog(
+        [HumanMessage(content="task")],
+        {"search-a-row-1": "WA1", "search-b-row-3": "WB3"},
+    )
+    assert catalog["WA1"]["kind"] == "web_search_result"
+    assert catalog["WB3"]["canonical_id"] == "search-b-row-3"
+
+
+def test_optional_tool_discards_unknown_refs_without_forcing_model_retry():
+    request = Request({"name": "lookup", "id": "call", "args": {
+        "source_refs": ["U1", "S99", "U1"], "value": "x"}}, lookup,
+        {"messages": [HumanMessage(content="lookup x")]})
+    grounded = validate_and_strip_tool_call(request, {})
+    assert grounded.tool_call["args"] == {"value": "x"}
+
+
+def test_optional_tool_normalizes_singleton_source_string():
+    request = Request({"name": "lookup", "id": "call", "args": {
+        "source_refs": "U1", "value": "x"}}, lookup,
+        {"messages": [HumanMessage(content="lookup x")]})
+    grounded = validate_and_strip_tool_call(request, {})
+    assert grounded.tool_call["args"] == {"value": "x"}
+
+
+def test_parallel_web_result_ref_is_valid_for_optional_tool():
+    request = Request({"name": "lookup", "id": "call", "args": {
+        "source_refs": ["WA1"], "value": "x"}}, lookup,
+        {"messages": [HumanMessage(content="lookup x")]})
+    grounded = validate_and_strip_tool_call(request, {"search-row": "WA1"})
+    assert grounded.tool_call["args"] == {"value": "x"}
+
+
 def test_appworld_execute_accepts_visible_user_or_rag_ref_but_rejects_model_only():
     execute = make_execute_tool(World())
     state = {"messages": [HumanMessage(content="task")]}
@@ -82,7 +115,7 @@ def test_appworld_execute_accepts_successful_discover_result_and_rejects_unknown
         "args": {"source_refs": ["E1"], "reason": "signature", "code": "print(1)"}},
         execute, state), {"raw": "E1"})
     assert grounded.tool_call["args"]["source_refs"] == ["E1"]
-    with pytest.raises(ValueError, match="Unknown source_refs"):
+    with pytest.raises(ValueError, match="No valid source_refs remain"):
         validate_and_strip_tool_call(Request({"name": "appworld_execute", "id": "x",
             "args": {"source_refs": ["E9"], "reason": "bad", "code": "print(1)"}},
             execute, state), {"raw": "E1"})
@@ -92,7 +125,7 @@ def test_current_tool_inventory_is_explicitly_classified_and_terminal_is_exempt(
     from tools import ALL_TOOLS
     current = {tool.name for tool in ALL_TOOLS} | {
         "ls", "read_file", "write_file", "edit_file", "delete", "glob", "grep", "execute",
-        "search_knowledge", "read_knowledge", "read_execution_history", "read_review_material",
+        "search_knowledge", "read_knowledge", "read_execution_history", "read_review_materials",
         "appworld_discover", "appworld_execute", "appworld_verify",
         "browser_click", "browser_close", "browser_fill_form", "browser_find",
         "browser_navigate", "browser_navigate_back", "browser_select_option",

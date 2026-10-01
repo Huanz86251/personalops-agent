@@ -83,6 +83,8 @@ class RuntimeConcurrencyConfigTests(
             "RUNTIME_WORKER_SCHEMA_REPAIR_MAX_ROUNDS",
             "RUNTIME_WEB_DOWNLOAD_MAX_FILE_MIB",
             "RUNTIME_CODE_REVIEW_MAX_REPAIR_ROUNDS",
+            "RUNTIME_WORKER_INACTIVITY_TIMEOUT_SECONDS",
+            "RUNTIME_CODE_INACTIVITY_TIMEOUT_SECONDS",
             "RUNTIME_WORKER_WORKSPACE_RETENTION_MINUTES",
             "RUNTIME_CODE_SANDBOX_AUTO_BUILD",
             "RUNTIME_CODE_SANDBOX_MEMORY_MB",
@@ -133,6 +135,8 @@ class RuntimeConcurrencyConfigTests(
         self.assertEqual(worker_settings.leadership_single_worker_reports, 2)
         self.assertEqual(worker_settings.leadership_multi_worker_reports, 1)
         self.assertEqual(worker_settings.leadership_silence_timeout_seconds, 60)
+        self.assertEqual(worker_settings.worker_inactivity_timeout_seconds, 600)
+        self.assertEqual(worker_settings.code_inactivity_timeout_seconds, 900)
         self.assertEqual(worker_settings.workspace_retention_minutes, 14400)
         self.assertTrue(sandbox_settings.auto_build)
         self.assertEqual(sandbox_settings.memory_mb, 1536)
@@ -197,6 +201,13 @@ class RuntimeConcurrencyConfigTests(
             {
                 "RUNTIME_CODE_REVIEW_MAX_REPAIR_ROUNDS": "4",
             },
+        ):
+            with self.assertRaises(RuntimeError):
+                _load_worker_runtime_settings()
+
+        with patch.dict(
+            os.environ,
+            {"RUNTIME_REVIEW_EVIDENCE_MODE": "ignore-everything"},
         ):
             with self.assertRaises(RuntimeError):
                 _load_worker_runtime_settings()

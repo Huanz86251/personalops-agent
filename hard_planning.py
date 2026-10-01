@@ -21,6 +21,7 @@ from pydantic import (
     BaseModel,
     ValidationError,
 )
+from langchain_core.messages import ToolMessage
 
 from observability import (
     set_span_attributes,
@@ -249,6 +250,20 @@ def _build_validation_repair_message(
     )
 
 
+def _is_output_truncation_error(error: Any) -> bool:
+    """Recognize provider/SDK output-length failures through wrapped causes."""
+
+    current = error
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if "lengthfinishreason" in type(current).__name__.lower():
+            return True
+        current = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+    text = f"{type(error).__name__}: {error}".lower()
+    return "finish_reason" in text and "length" in text
+
+
 async def _invoke_structured(
     model,
     *,
@@ -267,6 +282,7 @@ async def _invoke_structured(
     scheduler_decision_key: str | None = None,
     scheduler_decision_protected: bool = True,
     candidate_validator: Callable[[SchemaT], SchemaT] | None = None,
+    retry_output_truncation: bool = True,
 ) -> PlanningCallResult[
     SchemaT
 ]:
@@ -290,18 +306,55 @@ async def _invoke_structured(
         output_schema.__name__
     )
 
-    structured_model = model.with_structured_output(
-        output_schema, method="json_mode", include_raw=True,
+    from step_user_question import ASK_USER_NAME, ask_user_available, create_ask_user_tool
+
+    ask_user_tool = None
+    tool_structured_model = None
+    if ask_user_available() and hasattr(model, "bind_tools"):
+        ask_user_tool = create_ask_user_tool(trace_name)
+        from structured_output_policy import strict_tool_schema_options
+        strict_options = strict_tool_schema_options(model)
+        try:
+            tool_structured_model = model.bind_tools(
+                [ask_user_tool, output_schema],
+                tool_choice="any",
+                parallel_tool_calls=False,
+                **strict_options,
+            )
+        except TypeError:
+            tool_structured_model = model.bind_tools(
+                [ask_user_tool, output_schema],
+                tool_choice="any",
+                **strict_options,
+            )
+
+    from structured_output_policy import (
+        textual_schema_fallback,
+        with_provider_structured_output,
+    )
+
+    structured_model = (
+        None
+        if tool_structured_model is not None
+        else with_provider_structured_output(
+            model,
+            output_schema,
+            include_raw=True,
+            fallback_method="json_mode",
+        )
     )
     if scheduler_messages is not None:
         messages = list(scheduler_messages)
     else:
-        from scheduler_runtime import compact_json, compact_schema
         fixed_prompt, runtime_context = split_prompt(normalized_prompt)
         methods = skill_prompt(skill_snapshot)
-        messages = [{"role": "system", "content": fixed_prompt + "\nSchema:"
-                     + compact_json(compact_schema(output_schema.model_json_schema()))
-                     + ("\n" + methods if methods else "")}]
+        schema_guidance = textual_schema_fallback(model, output_schema)
+        messages = [{
+            "role": "system",
+            "content": fixed_prompt
+            + (("\n" + schema_guidance) if schema_guidance else "")
+            + (("\n" + methods) if methods else ""),
+        }]
         if runtime_context:
             messages.append({"role": "user", "content": runtime_context})
 
@@ -309,6 +362,7 @@ async def _invoke_structured(
     validation_retry_count = 0
     failed_plan = None
     validation_errors = []
+    human_questions_used = 0
 
     last_error = (
         "未知结构化输出错误。"
@@ -362,12 +416,87 @@ async def _invoke_structured(
             failed_plan = None
 
             try:
-                response = await (
-                    structured_model
-                    .ainvoke(
-                        messages
-                    )
-                )
+                while True:
+                    if tool_structured_model is None:
+                        response = await structured_model.ainvoke(messages)
+                        break
+
+                    raw_response = await tool_structured_model.ainvoke(messages)
+                    calls = list(getattr(raw_response, "tool_calls", []) or [])
+                    ask_calls = [
+                        call for call in calls
+                        if str(call.get("name") or "") == ask_user_tool.name
+                    ]
+                    schema_calls = [
+                        call for call in calls
+                        if str(call.get("name") or "") == schema_name
+                    ]
+
+                    if ask_calls:
+                        if human_questions_used >= 3:
+                            raise ValueError(
+                                "当前角色连续询问用户已达到3次；请依据已有回答提交结果。"
+                            )
+                        call = ask_calls[0]
+                        # A Human Loop request is exclusive.  If the model also
+                        # emitted a premature decision, only the question is
+                        # preserved and the decision is regenerated after the
+                        # answer returns.
+                        additional_kwargs = dict(
+                            getattr(raw_response, "additional_kwargs", {}) or {}
+                        )
+                        raw_calls = additional_kwargs.get("tool_calls")
+                        if isinstance(raw_calls, list):
+                            additional_kwargs["tool_calls"] = [
+                                item for item in raw_calls
+                                if isinstance(item, dict)
+                                and str(item.get("id") or "") == str(call.get("id") or "")
+                            ]
+                        sanitized = raw_response.model_copy(
+                            update={
+                                "tool_calls": [call],
+                                "additional_kwargs": additional_kwargs,
+                            }
+                        )
+                        messages.append(sanitized)
+                        answer = await ask_user_tool.ainvoke(call.get("args") or {})
+                        messages.append(
+                            ToolMessage(
+                                content=str(answer),
+                                tool_call_id=str(call.get("id") or ASK_USER_NAME),
+                                name=ask_user_tool.name,
+                            )
+                        )
+                        human_questions_used += 1
+                        model_rounds_used += 1
+                        continue
+
+                    if len(schema_calls) == 1 and len(calls) == 1:
+                        response = {
+                            "parsed": schema_calls[0].get("args") or {},
+                            "raw": raw_response,
+                            "parsing_error": None,
+                        }
+                        break
+
+                    raw_content = getattr(raw_response, "content", "")
+                    try:
+                        parsed_content = output_schema.model_validate_json(
+                            raw_content
+                        )
+                    except Exception as parse_error:
+                        response = {
+                            "parsed": None,
+                            "raw": raw_response,
+                            "parsing_error": parse_error,
+                        }
+                    else:
+                        response = {
+                            "parsed": parsed_content,
+                            "raw": raw_response,
+                            "parsing_error": None,
+                        }
+                    break
 
             except Exception as error:
                 last_error = error
@@ -378,6 +507,10 @@ async def _invoke_structured(
                 if (
                     attempt_index < MAX_VALIDATION_RETRIES
                     and is_schema_repairable_error(error)
+                    and (
+                        retry_output_truncation
+                        or not _is_output_truncation_error(error)
+                    )
                 ):
                     continue
 
@@ -411,6 +544,11 @@ async def _invoke_structured(
                     except ValidationError as error:
                         last_error = error
 
+                if (
+                    not retry_output_truncation
+                    and _is_output_truncation_error(last_error)
+                ):
+                    break
                 continue
 
             try:
@@ -590,15 +728,18 @@ async def _invoke_structured(
 def _build_supervisor_fallback(
     error: str,
 ) -> SupervisorDecision:
-    """Return a deterministic failure; never invent a replacement task."""
+    """Return a valid inert plan record; the graph stops it before execution."""
 
     return SupervisorDecision(
-        action="FINAL",
-        final_answer=(
-            "本次任务失败：首次计划生成及一次修复均未获得有效计划。\n"
-            f"原因：{error}\n"
-            "尚未启动任务执行，已停止本次任务。"
-        ),
+        plan_objective="规划生成失败后的不可执行占位记录。",
+        plan_success_criteria=["不得启动该占位步骤。"],
+        steps=[PlanStep(
+            step_id=1,
+            objective=f"不可执行：规划生成失败。{error[:300]}",
+            success_criteria=["Harness 必须在启动 Worker 前终止。"],
+            tool_access="DISABLED",
+            worker_kind="GENERAL",
+        )],
     )
 
 
@@ -755,7 +896,7 @@ def _validate_supervisor_scope_contract(
     contract,
 ) -> SupervisorDecision:
     """Require one planned target contract to preserve the frozen scope tail."""
-    if contract is None or decision.action != "PLAN":
+    if contract is None:
         return decision
     expected_context = [
         item.model_dump(mode="json") for item in contract.required_context
@@ -821,6 +962,11 @@ async def run_hard_supervisor(
         ),
         candidate_validator=lambda decision: _validate_supervisor_scope_contract(
             decision, context.scope_contract
+        ),
+        additional_protocol_prompts=(
+            ("planning/scheduler_scope_contract",)
+            if context.scope_contract is not None
+            else ()
         ),
     )
 
@@ -900,7 +1046,67 @@ async def run_hard_code_scheduler(
         output_schema=SchedulerCodeDecision,
         trace_name="hard_code_scheduler",
         fallback_factory=_build_code_scheduler_fallback,
+        additional_protocol_prompts=("planning/code_controller_recovery",),
     )
+
+
+def _approved_recovery_proposal(
+    reports: list[StepReport],
+    *,
+    origin_step_id: int | None,
+    origin_worker_kind: str | None,
+) -> dict[str, Any] | None:
+    """Return the exact downgrade contract explicitly approved by the user."""
+
+    expected_kind = str(origin_worker_kind or "").upper()
+    for report in reversed(reports):
+        if origin_step_id is not None and report.step_id != origin_step_id:
+            continue
+        proposal = report.recovery_proposal
+        if not isinstance(proposal, dict):
+            continue
+        if str(proposal.get("proposal_kind") or "").upper() != expected_kind:
+            continue
+        decision = proposal.get("human_decision") or {}
+        if (
+            proposal.get("downgrade_recommended") is True
+            and isinstance(decision, dict)
+            and decision.get("status") == "APPROVED"
+        ):
+            return proposal
+    return None
+
+
+def _validate_approved_downgrade_replan(
+    decision: ReplanDecision,
+    proposal: dict[str, Any] | None,
+) -> ReplanDecision:
+    """An approved contract change is mandatory, not Scheduler advice."""
+
+    if proposal is None:
+        return decision
+    if decision.action != "CONTINUE":
+        raise ValueError(
+            "The user approved the exact downgrade; Replanner must choose CONTINUE "
+            "and execute that approved contract."
+        )
+    outcome = str(proposal.get("proposed_degraded_outcome") or "").strip()
+    disclosure = str(proposal.get("user_visible_disclosure") or "").strip()
+    serialized = json.dumps(
+        [step.model_dump(mode="json") for step in decision.remaining_steps],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    if not outcome or outcome not in serialized:
+        raise ValueError(
+            "The first replacement Step must copy proposed_degraded_outcome "
+            "verbatim into its executable contract."
+        )
+    if disclosure and disclosure not in serialized:
+        raise ValueError(
+            "The replacement plan must preserve user_visible_disclosure verbatim."
+        )
+    return decision
 
 
 async def run_hard_replanner(
@@ -921,6 +1127,9 @@ async def run_hard_replanner(
     remaining_budget: Any,
     next_step_id: int,
     max_remaining_steps: int,
+    replan_source: str = "unknown",
+    origin_worker_kind: str | None = None,
+    origin_step_id: int | None = None,
 ) -> PlanningCallResult[
     ReplanDecision
 ]:
@@ -942,13 +1151,16 @@ async def run_hard_replanner(
             "max_remaining_steps不能小于0。"
         )
 
-    from scheduler_runtime import conversation
+    from scheduler_runtime import conversation, scheduler_report_projection
     session = conversation(context)
     session.initialize()
     session.fact("验收目标", {"objective": plan_objective, "success_criteria": plan_success_criteria})
     for report in completed_step_reports:
-        session.fact("StepReport", report)
+        session.fact("StepReport", scheduler_report_projection(report))
     event = {
+        "replan_source": replan_source,
+        "origin_worker_kind": origin_worker_kind,
+        "origin_step_id": origin_step_id,
         "reason": replan_context,
         "completed_step_ids": [report.step_id for report in completed_step_reports],
         "remaining_steps": remaining_steps,
@@ -956,6 +1168,27 @@ async def run_hard_replanner(
         "next_step_id": next_step_id,
         "max_remaining_steps": max_remaining_steps,
     }
+
+    recovery_prompt = {
+        "WEB": "planning/replan_web_recovery",
+        "GENERAL": "planning/replan_general_recovery",
+        "CODE": "planning/replan_code_recovery",
+    }.get(str(origin_worker_kind or "").upper())
+
+    approved_proposal = _approved_recovery_proposal(
+        completed_step_reports,
+        origin_step_id=origin_step_id,
+        origin_worker_kind=origin_worker_kind,
+    )
+    protocol_prompts = tuple(
+        prompt
+        for prompt in (
+            "planning/scheduler_scope_contract" if context.scope_contract is not None else None,
+            recovery_prompt,
+            "planning/approved_downgrade" if approved_proposal is not None else None,
+        )
+        if prompt is not None
+    )
 
     return await _invoke_scheduler_stage(
         hard_model,
@@ -965,7 +1198,92 @@ async def run_hard_replanner(
         fallback_factory=(
             _build_replanner_fallback
         ),
+        additional_protocol_prompts=protocol_prompts,
+        candidate_validator=lambda decision: _validate_approved_downgrade_replan(
+            decision,
+            approved_proposal,
+        ),
     )
+
+
+def _review_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    dump = getattr(value, "model_dump", None)
+    if callable(dump):
+        return dump(mode="json")
+    return {}
+
+
+def _review_pick(value: Any, fields: tuple[str, ...]) -> dict[str, Any]:
+    source = _review_mapping(value)
+    return {field: source[field] for field in fields if field in source}
+
+
+def _final_review_step_projection(value: Any) -> dict[str, Any]:
+    return _review_pick(
+        value,
+        (
+            "step_id",
+            "worker_kind",
+            "objective",
+            "success_criteria",
+            "artifact_outputs",
+        ),
+    )
+
+
+def _final_review_report_projection(value: Any) -> dict[str, Any]:
+    """Keep adjudicated facts and deliverables, not Reporter internals."""
+
+    return _review_pick(
+        value,
+        (
+            "step_id",
+            "status",
+            "summary",
+            "answer_text",
+            "stop_reason",
+            "criterion_results",
+            "source_links",
+            "confirmed_results",
+            "artifacts",
+            "approved_artifact_refs",
+            "errors",
+            "unresolved_items",
+            "assessment_source",
+            "request_replan",
+            "replan_reason",
+            "next_action",
+        ),
+    )
+
+
+def _final_review_history_projection(value: Any, *, limit: int = 6) -> Any:
+    if not isinstance(value, (list, tuple)):
+        return value
+    rows = []
+    for item in value[-limit:]:
+        if not isinstance(item, Mapping):
+            rows.append(item)
+            continue
+        rows.append(_review_pick(
+            item,
+            (
+                "round",
+                "attempt",
+                "source",
+                "action",
+                "status",
+                "reason",
+                "replan_reason",
+                "repair_request",
+                "decision",
+                "outcome",
+                "human_decision",
+            ),
+        ))
+    return rows
 
 
 async def run_hard_final_reviewer(
@@ -1003,7 +1321,7 @@ async def run_hard_final_reviewer(
     # Scheduler capability catalogs, planning protocols, or process history.
     # It does receive the same Harness-owned clock label as every other role.
     from scheduler_runtime import compact_json
-    from schema_utils import compact_schema
+    from structured_output_policy import textual_schema_fallback
 
     reviewer_prompt = load_prompt("planning/final_reviewer")
     reviewer_skill = skill_prompt(
@@ -1011,10 +1329,14 @@ async def run_hard_final_reviewer(
     )
     if reviewer_skill:
         reviewer_prompt += "\n\n" + reviewer_skill
+    reviewer_schema_guidance = textual_schema_fallback(
+        hard_model,
+        FinalReviewDecision,
+    )
     reviewer_messages = [{
         "role": "system",
-        "content": reviewer_prompt + "\nSchema:"
-        + compact_json(compact_schema(FinalReviewDecision.model_json_schema())),
+        "content": reviewer_prompt
+        + (("\n" + reviewer_schema_guidance) if reviewer_schema_guidance else ""),
     }, {
         "role": "user",
         "content": compact_json({
@@ -1024,12 +1346,20 @@ async def run_hard_final_reviewer(
             "计划验收目标": {
                 "objective": plan_objective,
                 "success_criteria": plan_success_criteria,
-                "steps": plan_steps or [],
+                "steps": [
+                    _final_review_step_projection(step)
+                    for step in (plan_steps or [])
+                ],
             },
             "独立审核材料": {
-                "step_reports": step_reports,
+                "step_reports": [
+                    _final_review_report_projection(report)
+                    for report in step_reports
+                ],
                 "latest_worker_evidence": latest_worker_evidence or {},
-                "final_worker_repair_history": repair_history or [],
+                "final_worker_repair_history": _final_review_history_projection(
+                    repair_history or []
+                ),
                 "stop_reason": overall_stop_reason,
                 "return_to_worker_available": (
                     repair_round < max_repair_rounds
@@ -1038,7 +1368,7 @@ async def run_hard_final_reviewer(
                 "repair_round": repair_round,
                 "max_repair_rounds": max_repair_rounds,
                 "replan_available": replan_available,
-                "replan_history": replan_history,
+                "replan_history": _final_review_history_projection(replan_history),
             },
         }),
     }]
@@ -1060,18 +1390,25 @@ async def run_hard_final_reviewer(
             plan_success_criteria=plan_success_criteria,
             error=_error,
         ),
+        retry_output_truncation=False,
     )
 
 
 async def _invoke_scheduler_stage(
     model, *, context, stage, event, output_schema, trace_name,
-    fallback_factory, candidate_validator=None,
+    fallback_factory, candidate_validator=None, additional_protocol_prompts=(),
 ):
     from scheduler_runtime import compact_json, conversation
+    from structured_output_policy import supports_strict_json_schema
     session = conversation(context)
     async with session.lock:
         session.initialize()
-        protocol = session.disclose(stage, output_schema.model_json_schema())
+        protocol = session.disclose(
+            stage,
+            output_schema.model_json_schema(),
+            additional_prompts=additional_protocol_prompts,
+            include_schema=not supports_strict_json_schema(model),
+        )
         # Stage inputs and structured outputs are request-local UI blocks.
         # Canonical state is retained separately as graph facts/projections,
         # so old plans, Web progress packets, and final-answer drafts do not
@@ -1108,7 +1445,7 @@ async def _invoke_scheduler_stage(
                     result.output.model_dump(mode="json"),
                     role="assistant",
                 )
-            elif stage == "supervisor" and result.output.action == "PLAN":
+            elif stage == "supervisor" and not result.used_fallback:
                 session.set_active(
                     "活动计划",
                     {

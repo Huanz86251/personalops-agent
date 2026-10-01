@@ -37,6 +37,7 @@ from workers.context import WorkerRuntimeContextMiddleware
 from workers.evidence_refs import EvidenceReferenceMiddleware
 from workers.general_worker import _tool_name, select_general_worker_tools
 from workers.tool_access import WorkerToolAllowlistMiddleware
+from step_user_question import ASK_USER_NAME, create_ask_user_tool
 
 
 CODE_REVIEWER_NAME = "code_reviewer"
@@ -74,6 +75,7 @@ def create_code_reviewer(
         REQUEST_CODE_WORKER_REPAIR_NAME,
         PUBLISH_REVIEWED_CANDIDATE_NAME,
         SUBMIT_CODE_REVIEW_NAME,
+        ASK_USER_NAME,
     }
     if any(_tool_name(item) in reserved for item in business_tools):
         raise ValueError(
@@ -106,10 +108,12 @@ def create_code_reviewer(
     progress = CodeReviewerProgressMiddleware(
         schema_repair_max_rounds=schema_repair_max_rounds,
         finalization_tools=(SUBMIT_CODE_REVIEW_NAME,))
+    ask_user = create_ask_user_tool("CODE_REVIEWER")
     graph = create_deep_agent(
         model=model,
         tools=[
             *business_tools,
+            ask_user,
             request_code_worker_repair,
             publish_reviewed_candidate,
             submit_code_review,

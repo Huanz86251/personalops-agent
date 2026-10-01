@@ -36,7 +36,11 @@ class GeneralModel(BaseChatModel):
 
     def with_structured_output(self, schema, **kwargs):
         if schema.__name__ == 'SkillChoice':
-            return RunnableLambda(lambda messages: {'parsed': {'skill_ids': [], 'reason': 'Offline business probe needs no skill'}})
+            def choose(messages):
+                request = json.loads(messages[0]['content'])
+                selected = ['plan-task-dependencies'] if request.get('role') == 'scheduler' else []
+                return {'parsed': {'skill_ids': selected, 'reason': 'Offline business probe'}}
+            return RunnableLambda(choose)
         return super().with_structured_output(schema, **kwargs)
 
     @property
@@ -52,7 +56,7 @@ class GeneralModel(BaseChatModel):
         start = max(i for i, m in enumerate(messages) if isinstance(m, HumanMessage))
         observed = [m for m in messages[start:] if isinstance(m, ToolMessage)]
         has_criteria = any("HARNESS_CRITERIA:" in str(m.content) for m in messages)
-        if self.tool_names == ["report_general_result"]:
+        if set(self.tool_names) == {"ask_user", "report_general_result"}:
             call = {"id": "finish", "name": "report_general_result", "args": {"result": {
                 "status": "BLOCKED", "summary": "Execution stopped at budget boundary; no further work performed.",
                 "unresolved_items": ["Need Scheduler help to complete remaining work."]}}}
@@ -146,7 +150,9 @@ class SchedulerModel:
     def with_structured_output(self, schema, **kwargs):
         async def respond(messages):
             if schema.__name__ == 'SkillChoice':
-                return {'parsed': {'skill_ids': [], 'reason': 'Offline test has no matching skill'}}
+                request = json.loads(messages[0]['content'])
+                selected = ['plan-task-dependencies'] if request.get('role') == 'scheduler' else []
+                return {'parsed': {'skill_ids': selected, 'reason': 'Offline test routing'}}
             self.schemas.append(schema.__name__)
             if schema.__name__ == "StepReport":
                 prompt = "\n".join(str(m.get("content", "") if isinstance(m, dict) else m.content) for m in messages)
@@ -158,7 +164,13 @@ class SchedulerModel:
                 if not self.artifact:
                     value["status"] = "FAILED" if "HARNESS_FALLBACK" in prompt and "incomplete summary" not in prompt else "BLOCKED" if "Required tool is unavailable" in prompt else "PARTIAL" if "incomplete summary" in prompt else "COMPLETED"
                     if value["status"] != "COMPLETED":
-                        value["criterion_results"][0]["status"] = "UNKNOWN"
+                        value["criterion_results"][0]["status"] = (
+                            "NOT_MET"
+                            if "HARNESS_FALLBACK" in prompt and "incomplete summary" not in prompt
+                            else "PARTIAL"
+                            if "incomplete summary" in prompt
+                            else "UNKNOWN"
+                        )
             elif schema.__name__ == "SupervisorDecision":
                 step = {
                     "step_id": 1,
@@ -219,7 +231,7 @@ class GeneralSimpleTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertTrue(
             {
-                "submit_for_review",
+                "complete_web_step",
                 "publish_worker_progress",
                 "task",
                 "execute",
@@ -251,7 +263,6 @@ class GeneralSimpleTests(unittest.IsolatedAsyncioTestCase):
                 "messages": [HumanMessage(content="A task")],
                 "executor_model_run_limit": 1,
                 "executor_tool_run_limit": 3,
-                "show_all_toolsets_run_limit": 0,
             }
         )
         self.assertEqual(len(model.requests), 1)
@@ -259,11 +270,14 @@ class GeneralSimpleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["general_result"]["forced_finalization"])
         self.assertEqual(result["executor_model_calls_used"], 1)
         self.assertEqual(result["worker_finalization_model_calls_used"], 1)
-        self.assertEqual(model.tool_names, ["report_general_result"])
+        self.assertEqual(
+            model.tool_names,
+            ["ask_user", "report_general_result"],
+        )
 
 
 
-    async def test_invalid_final_report_is_repaired_by_same_worker_after_budget_limit(self):
+    async def test_missing_final_claim_is_completed_without_model_repair(self):
         model = RepairingGeneralModel()
         graph = create_general_worker(
             model,
@@ -279,24 +293,23 @@ class GeneralSimpleTests(unittest.IsolatedAsyncioTestCase):
             ],
             "executor_model_run_limit": 1,
             "executor_tool_run_limit": 1,
-            "show_all_toolsets_run_limit": 0,
         })
 
-        self.assertEqual(len(model.requests), 2)
+        self.assertEqual(len(model.requests), 1)
         self.assertEqual(result["general_result"]["status"], "BLOCKED")
         self.assertEqual(
             result["general_result"]["criterion_claims"][0]["criterion_id"],
             "C1",
         )
         self.assertEqual(result["executor_model_calls_used"], 1)
-        self.assertEqual(result["worker_schema_repair_model_calls_used"], 1)
-        self.assertEqual(result["worker_finalization_model_calls_used"], 2)
+        self.assertEqual(result.get("worker_schema_repair_model_calls_used", 0), 0)
+        self.assertEqual(result["worker_finalization_model_calls_used"], 1)
 
     async def test_tool_exhaustion_still_reports_without_more_business_actions(self):
         model = GeneralModel()
         graph = create_general_worker(model, tools=[business_probe], middleware=[DynamicExecutionBudgetMiddleware()])
         result = await graph.ainvoke({"messages": [HumanMessage(content="A task")],
-            "executor_model_run_limit": 5, "executor_tool_run_limit": 1, "show_all_toolsets_run_limit": 0})
+            "executor_model_run_limit": 5, "executor_tool_run_limit": 1})
         self.assertEqual(len(model.requests), 2)
         self.assertEqual(result["executor_model_calls_used"], 2)
         self.assertEqual(result["executor_tool_calls_used"], 1)
@@ -308,7 +321,7 @@ class GeneralSimpleTests(unittest.IsolatedAsyncioTestCase):
         model = GeneralModel()
         graph = create_general_worker(model, tools=[business_probe], middleware=[DynamicExecutionBudgetMiddleware()])
         result = await graph.ainvoke({"messages": [HumanMessage(content="A task")],
-            "executor_model_run_limit": 0, "executor_tool_run_limit": 1, "show_all_toolsets_run_limit": 0})
+            "executor_model_run_limit": 0, "executor_tool_run_limit": 1})
         self.assertEqual(len(model.requests), 0)
         self.assertFalse(result.get("general_result"))
 
@@ -415,7 +428,7 @@ class GeneralSimpleTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("general_report", nodes)
                 self.assertNotIn("step_reporter", nodes)
                 self.assertNotIn("code_controller", nodes)
-                needs_review = status != "COMPLETED" or natural or artifact or no_budget
+                needs_review = status != "COMPLETED" or natural or no_budget
                 self.assertEqual("StepReport" in scheduler.schemas, needs_review)
                 self.assertEqual(len(model.requests), 0 if no_budget else 2)
                 report = final["completed_step_reports"][0]
@@ -424,7 +437,7 @@ class GeneralSimpleTests(unittest.IsolatedAsyncioTestCase):
                     "INDEPENDENT_REVIEW" if needs_review else "GENERAL_SELF_REPORT",
                 )
                 self.assertEqual(final["current_step_report_rounds"], 1 if needs_review else 0)
-                if artifact and approve:
+                if artifact and status == "COMPLETED" and not natural and not no_budget:
                     self.assertEqual(len(report.artifacts), 1)
                     receipt = final["handoff_publication_receipts"][0]
                     self.assertEqual(
@@ -449,10 +462,10 @@ class GeneralSimpleTests(unittest.IsolatedAsyncioTestCase):
         report = await self.run_planning(natural=True)
         self.assertEqual(report.status, "PARTIAL")
 
-    async def test_general_files_require_independent_report_before_shared_handoff(self):
+    async def test_completed_general_file_uses_verified_self_report_handoff(self):
         await self.run_planning(artifact=True)
 
-    async def test_general_file_is_not_shared_without_reporter_approval(self):
+    async def test_completed_general_file_does_not_depend_on_reporter_approval(self):
         await self.run_planning(artifact=True, approve=False)
 
     async def test_unstarted_general_with_no_budget_skips_review(self):

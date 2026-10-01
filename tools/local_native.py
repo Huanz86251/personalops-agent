@@ -24,7 +24,7 @@ import zipfile
 from functools import wraps
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from langchain.tools import ToolRuntime
 from langchain_core.messages import ToolMessage
@@ -40,7 +40,8 @@ OCR_WORKER_SCRIPT = (
 OCR_TIMEOUT_SECONDS = 180
 from file_limits import TASK_FILE_MAX_BYTES as MAX_BYTES
 MAX_TEXT = 12000
-_capacity = threading.BoundedSemaphore(1)
+_local_capacity = threading.BoundedSemaphore(1)
+_web_fetch_capacity = threading.BoundedSemaphore(3)
 
 
 def _dependency(name):
@@ -56,25 +57,43 @@ def _dependency(name):
         ) from error
 
 
-def _bounded(function):
-    @wraps(function)
-    def invoke(*args, **kwargs):
-        if not _capacity.acquire(blocking=False):
-            raise ToolException(
-                "Another local conversion/check is running; try after it finishes."
-            )
-        try:
-            return function(*args, **kwargs)
-        except ToolException:
-            raise
-        except Exception as error:
-            raise ToolException(
-                f"{type(error).__name__}: {str(error)[:1200]}"
-            ) from error
-        finally:
-            _capacity.release()
+def _bounded_by(capacity, busy_message):
+    def decorate(function):
+        @wraps(function)
+        def invoke(*args, **kwargs):
+            if not capacity.acquire(blocking=False):
+                raise ToolException(busy_message)
+            try:
+                return function(*args, **kwargs)
+            except ToolException:
+                raise
+            except Exception as error:
+                raise ToolException(
+                    f"{type(error).__name__}: {str(error)[:1200]}"
+                ) from error
+            finally:
+                capacity.release()
 
-    return invoke
+        return invoke
+    return decorate
+
+
+def _bounded(function):
+    """Bound CPU/file conversion tools independently from public web reads."""
+
+    return _bounded_by(
+        _local_capacity,
+        "Another local conversion/check is running; try after it finishes.",
+    )(function)
+
+
+def _bounded_web_fetch(function):
+    """Allow the Web Worker's supported three-way fetch fan-out."""
+
+    return _bounded_by(
+        _web_fetch_capacity,
+        "Three public webpage reads are already running; wait for one to finish.",
+    )(function)
 
 
 def _virtual(path: str) -> str:
@@ -782,7 +801,9 @@ def python_static_check(code: str) -> dict:
     }
 
 
-def _public_url(url):
+def _public_url(url) -> str:
+    """Return one validated public address that the HTTP client must pin to."""
+
     parts = urlsplit(url)
     if (
         parts.scheme not in {"http", "https"}
@@ -793,16 +814,48 @@ def _public_url(url):
         raise ValueError("Use a public http(s) URL without embedded credentials.")
     port = parts.port or (443 if parts.scheme == "https" else 80)
     addresses = socket.getaddrinfo(parts.hostname, port, type=socket.SOCK_STREAM)
-    if not addresses or any(
-        not ipaddress.ip_address(entry[4][0]).is_global for entry in addresses
-    ):
+    public: list[tuple[int, str]] = []
+    for entry in addresses:
+        address = str(entry[4][0]).split("%", 1)[0]
+        if ipaddress.ip_address(address).is_global:
+            candidate = (entry[0], address)
+            if candidate not in public:
+                public.append(candidate)
+    if not public:
         raise ValueError(
             "Private, loopback and local network destinations are not allowed."
         )
+    # Prefer IPv4 where both families exist.  The chosen address is not merely
+    # advisory: _fetch_webpage connects to this exact IP and preserves the
+    # original hostname for Host and TLS SNI, preventing DNS rebinding to a
+    # private address between validation and connection.
+    public.sort(key=lambda item: item[0] != socket.AF_INET)
+    return public[0][1]
+
+
+def _pinned_request(url: str) -> tuple[str, str, str]:
+    """Build (pinned URL, Host header, SNI hostname) for one logical URL."""
+
+    parts = urlsplit(url)
+    address = _public_url(url)
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    pinned_host = f"[{address}]" if ":" in address else address
+    pinned_url = urlunsplit((
+        parts.scheme,
+        f"{pinned_host}:{port}",
+        parts.path or "/",
+        parts.query,
+        "",
+    ))
+    default_port = 443 if parts.scheme == "https" else 80
+    host_header = parts.hostname or ""
+    if port != default_port:
+        host_header = f"{host_header}:{port}"
+    return pinned_url, host_header, parts.hostname or ""
 
 
 @tool
-@_bounded
+@_bounded_web_fetch
 def fetch_webpage(url: str, start_index: int = 0, max_length: int = 8000) -> dict:
     """Read public text, returning fetch_status, http_status, content and next_action.
 
@@ -822,7 +875,8 @@ def fetch_webpage(url: str, start_index: int = 0, max_length: int = 8000) -> dic
             403: ("ACCESS_DENIED", "Use another permitted public source; do not bypass access restrictions."),
             429: ("RATE_LIMITED", "Respect Retry-After and the task budget; do not immediately retry."),
         }.get(code, ("HTTP_ERROR", "Report the HTTP failure or use another source within the task budget."))
-        return {"source_url": url, "final_url": str(error.response.url), "http_status": code,
+        logical_url = str(error.response.extensions.get("logical_url") or error.response.url)
+        return {"source_url": url, "final_url": logical_url, "http_status": code,
                 "fetch_status": status, "content": "", "total_chars": 0, "next_index": None,
                 "evidence_available": False, "next_action": action,
                 "retry_after": error.response.headers.get("retry-after")}
@@ -855,15 +909,23 @@ def _fetch_webpage(url: str, start_index: int = 0, max_length: int = 8000) -> di
     import httpx
 
     original = url
-    with httpx.Client(
-        timeout=15,
-        follow_redirects=False,
-        trust_env=False,
-        headers={"User-Agent": "PersonalOps/1.0 (public-page reader)"},
-    ) as client:
-        for _ in range(6):
-            _public_url(url)
-            with client.stream("GET", url) as response:
+    for _ in range(6):
+        pinned_url, host_header, sni_hostname = _pinned_request(url)
+        # One client per redirect avoids reusing a TLS connection when two
+        # different hostnames happen to resolve to the same pinned address.
+        with httpx.Client(
+            timeout=15,
+            follow_redirects=False,
+            trust_env=False,
+            headers={"User-Agent": "PersonalOps/1.0 (public-page reader)"},
+        ) as client:
+            with client.stream(
+                "GET",
+                pinned_url,
+                headers={"Host": host_header},
+                extensions={"sni_hostname": sni_hostname},
+            ) as response:
+                response.extensions["logical_url"] = url
                 if response.is_redirect:
                     location = response.headers.get("location")
                     if not location:
@@ -891,8 +953,8 @@ def _fetch_webpage(url: str, start_index: int = 0, max_length: int = 8000) -> di
                     response.encoding or "utf-8", errors="replace"
                 )
                 break
-        else:
-            raise ValueError("Too many redirects.")
+    else:
+        raise ValueError("Too many redirects.")
     if mime in {"text/html", "application/xhtml+xml"}:
         # Bytes retain meta-charset/GBK detection. HTTPX defaults to UTF-8 even
         # when a legacy Chinese page declares its encoding only in HTML.

@@ -4,6 +4,7 @@ import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 from typing import (
     Any,
     Literal,
@@ -48,7 +49,7 @@ from reporting import (
     materialize_worker_review_trace,
 )
 from run_workspace import RUN_WORKSPACE_ROOT, initialize_run_workspace
-from step_execution import run_step_reporter
+from step_execution import build_report_source_links, run_step_reporter
 from workers.coordinator import WorkerGroupCoordinator
 from workers.group import (
     ACTIVE_ATTEMPT_STATUSES,
@@ -58,6 +59,7 @@ from workers.group import (
 )
 from workers.registry import WorkerAgentRegistry
 from workers.code_review_models import (
+    CodeWorkerSubmission,
     CodeReviewLoopState,
     CodeReviewReport,
     SchedulerCodeDecision,
@@ -67,10 +69,29 @@ from progress_events import (
     ProgressEvent,
     sanitize_progress_text,
 )
+from prompt_loader import load_prompt
 from skill_runtime import load_catalog, prepare_skills
 from scheduler_runtime import scheduler_node
+from step_user_question import merge_ask_user_interactions
 
 HARD_CALL_MAX_ROUNDS = MAX_VALIDATION_RETRIES + 1
+
+
+def _model_text(message: Any) -> str:
+    """Normalize one plain chat response without asking the model to repair it."""
+
+    content = getattr(message, "content", message)
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") in {"text", "output_text"}:
+                parts.append(str(block.get("text") or ""))
+        return "\n".join(part for part in parts if part).strip()
+    return str(content or "").strip()
 
 
 def _terminal_completion_contract(
@@ -91,8 +112,106 @@ def _record_skill_traces(context, traces):
     return context.model_copy(update={"role_skill_snapshots": snapshots})
 
 
+async def _audit_from_failed_worker_checkpoint(worker: Any, thread_id: str) -> dict[str, Any]:
+    """Keep completed tool evidence when a Worker fails before returning details.
+
+    This is a read-only, best-effort recovery. The last checkpoint may omit a
+    tool still in flight, so an empty snapshot must not be presented as proof
+    that the Worker made no tool calls.
+    """
+
+    get_state = getattr(worker, "aget_state", None)
+    if not callable(get_state):
+        return {}
+    try:
+        snapshot = await get_state({"configurable": {"thread_id": thread_id}})
+        values = getattr(snapshot, "values", None)
+        if not isinstance(values, dict) or not isinstance(values.get("messages"), list):
+            return {}
+        recovered = materialize_worker_review_trace({"messages": values["messages"]})
+        if not recovered["tool_audit"]:
+            return {}
+        return {
+            "tool_audit": recovered["tool_audit"],
+            "tool_audit_available": True,
+        }
+    except Exception:
+        # Do not hide the original Worker exception behind an audit failure.
+        return {}
+
+
+def _mapping_view(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    dump = getattr(value, "model_dump", None)
+    if callable(dump):
+        return dump(mode="json")
+    return {}
+
+
+def _pick_mapping(value: Any, fields: tuple[str, ...]) -> dict[str, Any]:
+    source = _mapping_view(value)
+    return {field: source[field] for field in fields if field in source}
+
+
+def _project_submission_record(value: Any) -> dict[str, Any] | None:
+    """Remove raw tool bodies while retaining the Worker deliverable and claims."""
+
+    record = _mapping_view(value)
+    if not record:
+        return None
+    projected = _pick_mapping(
+        record,
+        ("submitted_at", "worker_id", "event_id", "step_id", "total_tool_calls"),
+    )
+    submission = _pick_mapping(
+        record.get("submission"),
+        (
+            "summary",
+            "answer_text",
+            "criterion_claims",
+            "artifact_candidates",
+            "unresolved_items",
+            "final_conclusion",
+            "plan_challenge",
+            "candidate",
+            "requirement_status",
+            "implemented_interfaces",
+            "changed_files",
+            "proposed_artifact_paths",
+            "self_checks",
+            "limitations",
+        ),
+    )
+    if submission:
+        projected["submission"] = submission
+    artifacts = []
+    for item in record.get("resolved_artifacts", []) or []:
+        artifact = _pick_mapping(
+            item,
+            (
+                "candidate_id",
+                "output_id",
+                "kind",
+                "description",
+                "review_ref",
+                "size_bytes",
+                "sha256",
+                "media_type",
+            ),
+        )
+        if artifact:
+            artifacts.append(artifact)
+    if artifacts:
+        projected["resolved_artifacts"] = artifacts
+    projected["resolved_evidence_count"] = len(record.get("resolved_evidence", []) or [])
+    return projected
+
+
 def _final_worker_evidence(state: "PlanningState") -> dict[str, Any]:
-    """Build a bounded evidence packet; preserve reports and recent tool outcomes."""
+    """Build a minimal final-review projection, never a second raw trace."""
 
     step = state.get("current_step")
     trace = dict(state.get("current_step_trace") or {})
@@ -104,23 +223,82 @@ def _final_worker_evidence(state: "PlanningState") -> dict[str, Any]:
             kind = message.get("type", message.get("role"))
             if kind != "tool":
                 continue
+            content = str(message.get("content", ""))
             recent_tools.append({
                 "tool_call_id": message.get("tool_call_id"),
                 "name": message.get("name"),
                 "status": message.get("status"),
-                "content": str(message.get("content", ""))[:1600],
+                "result_chars": len(content),
+                "has_result": bool(content.strip()),
             })
+    step_view = _pick_mapping(
+        step,
+        (
+            "step_id",
+            "worker_kind",
+            "objective",
+            "success_criteria",
+            "artifact_outputs",
+        ),
+    )
+    general_result = _pick_mapping(
+        trace.get("general_result"),
+        (
+            "status",
+            "summary",
+            "answer_text",
+            "criterion_claims",
+            "unresolved_items",
+            "files",
+            "plan_challenge",
+        ),
+    )
     return {
-        "step": step.model_dump(mode="json"),
+        "step": step_view,
         "attempt": trace.get("attempt"),
         "worker_id": trace.get("worker_id"),
         "finish_reason": trace.get("finish_reason"),
         "stop_reason": trace.get("stop_reason"),
-        "execution_summary": trace.get("execution_summary", {}),
-        "general_result": trace.get("general_result"),
-        "worker_submission": trace.get("worker_submission"),
-        "code_review_report": trace.get("code_review_report"),
-        "code_publication_receipt": trace.get("code_publication_receipt"),
+        "execution_summary": _pick_mapping(
+            trace.get("execution_summary"),
+            (
+                "model_call_count",
+                "tool_call_count",
+                "tool_result_count",
+                "finalization_model_call_count",
+                "finalization_tool_call_count",
+            ),
+        ),
+        "general_result": general_result or None,
+        "worker_submission": _project_submission_record(trace.get("worker_submission")),
+        "code_worker_submission": _project_submission_record(trace.get("code_worker_submission")),
+        "code_review_report": _pick_mapping(
+            trace.get("code_review_report"),
+            (
+                "summary",
+                "verification_summary",
+                "verified_requirement_ids",
+                "check_results",
+                "failed_test_summaries",
+                "changed_files",
+                "verdict",
+                "approved_artifact_paths",
+                "published_artifact_paths",
+                "delivery_location",
+                "publication_id",
+                "recommended_action",
+            ),
+        ) or None,
+        "code_publication_receipt": _pick_mapping(
+            trace.get("code_publication_receipt"),
+            (
+                "publication_id",
+                "published_artifact_paths",
+                "delivery_location",
+                "applied_revision",
+                "status",
+            ),
+        ) or None,
         "recent_tool_results": recent_tools,
     }
 
@@ -160,7 +338,6 @@ class PlanningState(TypedDict, total=False):
     current_step_report_rounds: int
     current_step_model_rounds: int
     current_step_tool_calls: int
-    current_step_show_all_toolsets_calls: int
     current_step_trace: dict[str, Any]
     current_step_worker_traces: list[dict[str, Any]]
     current_worker_group_id: str
@@ -168,6 +345,7 @@ class PlanningState(TypedDict, total=False):
     current_step_replacement_history: list[dict[str, Any]]
     current_step_stop_reason: str
     retry_current_step: bool
+    step_user_interactions: list[dict[str, Any]]
     current_code_runtime_session_id: str
     current_code_scheduler_decision: dict[str, Any] | None
     current_code_control_rounds: int
@@ -218,9 +396,76 @@ class PlanningState(TypedDict, total=False):
     scheduler_final_decision: bool
     # Separate provenance for a deterministic Harness terminal report.
     harness_terminal_decision: bool
+    # Bounded structured terminal verdict used by the next-turn summary.  It
+    # is separate from intermediate StepReports and from the user-facing text.
+    final_review_decision: dict[str, Any] | None
     final_answer: str
     unmet_success_criteria: list[str]
     overall_stop_reason: str
+
+
+def _append_verified_source_links(
+    answer: str,
+    decision: FinalReviewDecision,
+    reports: list[StepReport],
+) -> str:
+    """Append only links bound to evidence that Final Reviewer actually cited."""
+
+    cited = {
+        str(reference).strip()
+        for review in decision.criterion_reviews
+        for reference in review.evidence_refs
+        if str(reference).strip()
+    }
+    accepted_criterion_ids = {
+        str(review.criterion_id or "").strip()
+        for review in decision.criterion_reviews
+        if review.status == "MET" and str(review.criterion_id or "").strip()
+    }
+    for report in reports:
+        for criterion in report.criterion_results:
+            if criterion.status != "MET":
+                continue
+            if (
+                decision.status == "COMPLETED"
+                or str(criterion.criterion_id or "").strip()
+                in accepted_criterion_ids
+            ):
+                cited.update(
+                    str(reference).strip()
+                    for reference in criterion.evidence
+                    if str(reference).strip()
+                )
+    if not cited:
+        return answer
+    rows: list[str] = []
+    seen: set[str] = set()
+    for report in reports:
+        for source in report.source_links:
+            if source.evidence_ref not in cited:
+                continue
+            key = source.href
+            if key in seen:
+                continue
+            seen.add(key)
+            title = source.title.replace("[", "（").replace("]", "）")
+            host = urlsplit(source.href).hostname or "公开网页"
+            rows.append(
+                f"- 🌐 **{title}** · [{host}]({source.href}) · `{source.evidence_ref}`"
+            )
+    if not rows:
+        return answer
+    return answer.rstrip() + "\n\n参考来源\n\n" + "\n".join(rows)
+
+
+def _final_review_decision_record(
+    decision: FinalReviewDecision,
+) -> dict[str, Any]:
+    """Persist the verdict without duplicating the potentially long answer."""
+
+    record = decision.model_dump(mode="json")
+    record.pop("final_answer", None)
+    return record
 
 def _read_progress_callback(
     config: RunnableConfig,
@@ -536,19 +781,6 @@ def _remaining_budget(
             ),
         ),
 
-        "step_show_all_toolsets_calls": max(
-            0,
-
-            (
-                1
-
-                - state.get(
-                    "current_step_show_all_toolsets_calls",
-                    0,
-                )
-            ),
-        ),
-
         "step_attempts": max(
             0,
 
@@ -764,7 +996,7 @@ def _build_step_instruction(
     else:
         tool_budget_instruction = (
             "本次Attempt的工具额度为0。"
-            "不要尝试调用任何工具，也不要调用show_all_toolsets；"
+            "不要尝试调用任何业务工具或申请额外能力；"
             "请只依据用户请求、此前StepReport、长期记忆和"
             "已经确认的执行结果完成分析、整理或收口。"
             "无法确认的内容必须明确说明，不得编造。"
@@ -806,6 +1038,16 @@ def _build_step_instruction(
 
     from reporting.criteria import criterion_registry
 
+    interactions = merge_ask_user_interactions(
+        state.get("step_user_interactions", [])
+    )
+    interaction_block = (
+        "\n\n[用户补充问答：先前角色通过ask_user取得，后续角色必须保留]\n"
+        + _json_text(interactions)
+        if interactions
+        else ""
+    )
+
     return (
         load_prompt("workers/step_scope") + "\n\n"
         "以下是背景，不是本次执行清单：\n"
@@ -828,6 +1070,7 @@ def _build_step_instruction(
         f"{_json_text(reports)}\n\n"
 
         f"{worker_budget}\n{api_suggestion_block}{leadership_block}"
+        f"{interaction_block}"
     )
 
 
@@ -1009,8 +1252,19 @@ def _build_general_step_report(current_step, trace, packet):
         unresolved = ["General did not provide a complete self-report; do not assume the task succeeded."]
     if status == "COMPLETED" and unresolved:
         status = "PARTIAL"
+    approved_artifact_refs = (
+        [
+            candidate.review_ref
+            for attempt in packet.attempts
+            for candidate in attempt.resolved_artifacts
+            if candidate.review_ref
+        ]
+        if status == "COMPLETED"
+        else []
+    )
     return StepReport(
         step_id=current_step.step_id, status=status, summary=summary,
+        answer_text=result.answer_text if result else None,
         criterion_results=[StepCriterionResult(criterion_id=f'C{i}',criterion=criterion,
             status='MET' if any(c.criterion==criterion for c in (result.criterion_claims if result else [])) and status=='COMPLETED' else 'UNKNOWN',
             evidence=[c.conclusion for c in (result.criterion_claims if result else []) if c.criterion==criterion])
@@ -1023,8 +1277,10 @@ def _build_general_step_report(current_step, trace, packet):
         completed_work=[summary] if result else [],
         unresolved_items=unresolved,
         evidence=[f"Tool call: {e.tool_call_id}" for a in packet.attempts for e in a.resolved_evidence],
-        # Self-report never approves file publication.
-        approved_artifact_refs=[],
+        # The candidate path, bytes and digest were already resolved by
+        # Harness. A completed General self-report may publish that verified
+        # candidate without paying for an unconditional model Reviewer.
+        approved_artifact_refs=approved_artifact_refs,
     )
 
 
@@ -1253,6 +1509,234 @@ def _build_forced_final_decision(
     )
 
 
+def _build_web_step_report(
+    current_step: PlanStep,
+    traces: list[dict[str, Any]],
+    packet: StepReviewPacket,
+) -> StepReport:
+    """Use Web Worker-authored reports; never launch an independent Web Reviewer."""
+
+    from workers.web_report import WebStepReportRecord
+
+    records: list[WebStepReportRecord] = []
+    report_errors: list[str] = []
+    for trace in traces:
+        raw = trace.get("web_step_report")
+        if raw:
+            try:
+                records.append(WebStepReportRecord.model_validate(raw))
+            except Exception as error:
+                report_errors.append(
+                    f"Invalid Web self-report: {type(error).__name__}: {error}"
+                )
+        if trace.get("web_step_report_error"):
+            report_errors.append(str(trace["web_step_report_error"])[:2000])
+
+    artifact_refs: dict[tuple[str, str], str] = {}
+    for attempt in packet.attempts:
+        worker_id = str(attempt.worker_id or "").strip()
+        for artifact in attempt.resolved_artifacts:
+            if artifact.review_ref:
+                artifact_refs[(worker_id, artifact.candidate_id)] = artifact.review_ref
+
+    if not records:
+        summaries = [attempt.summary for attempt in packet.attempts if attempt.summary]
+        answer_parts = [attempt.answer_text for attempt in packet.attempts if attempt.answer_text]
+        unresolved = list(current_step.success_criteria)
+        return StepReport(
+            step_id=current_step.step_id,
+            status="PARTIAL",
+            summary=(
+                "Web Worker 已提交执行结果，但唯一一次 StepReport 结案调用未产生合法报告。"
+                + ((" Worker摘要：" + "；".join(summaries)) if summaries else "")
+            )[:8000],
+            answer_text="\n\n".join(answer_parts) or None,
+            stop_reason="Web self-report finalization failed; Harness closed conservatively.",
+            criterion_results=[
+                StepCriterionResult(
+                    criterion_id=f"C{i}",
+                    criterion=criterion,
+                    status="UNKNOWN",
+                    evidence=[],
+                )
+                for i, criterion in enumerate(current_step.success_criteria, 1)
+            ],
+            assessment_source="RUNTIME_FAILURE",
+            errors=(report_errors or ["Web Worker did not submit a valid StepReport."]),
+            unresolved_items=unresolved,
+            next_action="Scheduler只能依据已保存的Worker正文和证据保守收口或重规划。",
+        )
+
+    if len(records) == 1:
+        record = records[0]
+        report = record.report
+        answer = next(
+            (
+                attempt.answer_text
+                for attempt in reversed(packet.attempts)
+                if attempt.answer_text
+                and (
+                    not record.worker_id
+                    or str(attempt.worker_id or "") == record.worker_id
+                )
+            ),
+            None,
+        )
+        approved = [
+            artifact_refs[(str(record.worker_id or ""), candidate_id)]
+            for candidate_id in record.approved_artifact_candidate_ids
+            if (str(record.worker_id or ""), candidate_id) in artifact_refs
+        ]
+        report = report.model_copy(
+            update={
+                "answer_text": answer,
+                "approved_artifact_refs": approved,
+                "errors": [*report.errors, *report_errors],
+            }
+        )
+    else:
+        criteria_by_id: dict[str, list[StepCriterionResult]] = {}
+        for record in records:
+            for item in record.report.criterion_results:
+                criteria_by_id.setdefault(str(item.criterion_id or ""), []).append(item)
+
+        merged_criteria: list[StepCriterionResult] = []
+        unresolved: list[str] = []
+        for index, criterion in enumerate(current_step.success_criteria, 1):
+            criterion_id = f"C{index}"
+            rows = criteria_by_id.get(criterion_id, [])
+            statuses = {row.status for row in rows}
+            if rows and statuses == {"MET"}:
+                status = "MET"
+            elif "NOT_MET" in statuses:
+                status = "NOT_MET"
+            elif "PARTIAL" in statuses or ("MET" in statuses and len(statuses) > 1):
+                status = "PARTIAL"
+            else:
+                status = "UNKNOWN"
+            evidence = list(dict.fromkeys(
+                ref for row in rows for ref in row.evidence
+            ))
+            if status != "MET":
+                unresolved.append(criterion)
+            merged_criteria.append(
+                StepCriterionResult(
+                    criterion_id=criterion_id,
+                    criterion=criterion,
+                    status=status,
+                    evidence=evidence,
+                )
+            )
+
+        proposals = [
+            record.report.recovery_proposal
+            for record in records
+            if record.report.recovery_proposal is not None
+        ]
+        unique_proposals = {
+            json.dumps(proposal, ensure_ascii=False, sort_keys=True)
+            for proposal in proposals
+        }
+        recovery_proposal = proposals[0] if len(unique_proposals) == 1 else None
+        request_replan = any(record.report.request_replan for record in records)
+        replan_reasons = list(dict.fromkeys(
+            str(record.report.replan_reason)
+            for record in records
+            if record.report.replan_reason
+        ))
+        if len(unique_proposals) > 1:
+            report_errors.append(
+                "Parallel Web Workers proposed conflicting recovery contracts; "
+                "Harness withheld automatic downgrade approval."
+            )
+        status = (
+            "COMPLETED"
+            if merged_criteria and all(row.status == "MET" for row in merged_criteria)
+            else "PARTIAL"
+        )
+        approved: list[str] = []
+        for record in records:
+            for candidate_id in record.approved_artifact_candidate_ids:
+                reference = artifact_refs.get(
+                    (str(record.worker_id or ""), candidate_id)
+                )
+                if reference and reference not in approved:
+                    approved.append(reference)
+        report = StepReport(
+            step_id=current_step.step_id,
+            status=status,
+            summary="\n".join(
+                f"{record.worker_id or 'Web Worker'}：{record.report.summary}"
+                for record in records
+            )[:12000],
+            answer_text="\n\n".join(
+                attempt.answer_text
+                for attempt in packet.attempts
+                if attempt.answer_text
+            ) or None,
+            stop_reason="All parallel Web Workers submitted self-reports; Harness merged them deterministically.",
+            criterion_results=merged_criteria,
+            confirmed_results=list(dict.fromkeys(
+                item for record in records for item in record.report.confirmed_results
+            )),
+            assessment_source="WEB_SELF_REPORT",
+            completed_work=list(dict.fromkeys(
+                item for record in records for item in record.report.completed_work
+            )),
+            evidence=list(dict.fromkeys(
+                item for record in records for item in record.report.evidence
+            )),
+            errors=[
+                *list(dict.fromkeys(
+                    item for record in records for item in record.report.errors
+                )),
+                *report_errors,
+            ],
+            unresolved_items=unresolved,
+            replan_reason="；".join(replan_reasons) or None,
+            request_replan=request_replan,
+            next_action=next(
+                (
+                    record.report.next_action
+                    for record in records
+                    if record.report.next_action
+                ),
+                None,
+            ),
+            recovery_proposal=recovery_proposal,
+            approved_artifact_refs=approved,
+        )
+
+    used_refs = {
+        ref
+        for item in report.criterion_results
+        for ref in item.evidence
+    }
+    used_refs.update(report.evidence)
+    source_links = [
+        *report.source_links,
+        *(
+            source
+            for record in records
+            for source in record.report.source_links
+        ),
+        *build_report_source_links(packet, used_refs),
+    ]
+    deduplicated_links = []
+    seen_links: set[tuple[str, str]] = set()
+    for source in source_links:
+        key = (source.evidence_ref, source.href)
+        if key in seen_links:
+            continue
+        seen_links.add(key)
+        deduplicated_links.append(source)
+    return report.model_copy(
+        update={
+            "source_links": deduplicated_links,
+        }
+    )
+
+
 def _build_budget_exhausted_final_decision(
     state: PlanningState,
 ) -> FinalReviewDecision:
@@ -1288,6 +1772,7 @@ def build_planning_graph(
     role_models: dict | None = None,
     reporter_output_limits: dict | None = None,
     web_max_parallelism: int = 3,
+    review_evidence_mode: str = "balanced",
     checkpointer: BaseCheckpointSaver | None = None,
     run_storage_root: Path = RUN_WORKSPACE_ROOT,
 ):
@@ -1295,6 +1780,8 @@ def build_planning_graph(
 
     if web_max_parallelism < 1 or web_max_parallelism > 3:
         raise ValueError("web_max_parallelism must be between 1 and 3.")
+    if review_evidence_mode not in {"strict", "balanced"}:
+        raise ValueError("review_evidence_mode must be strict or balanced.")
 
     models = role_models or {}
     def role_model(role, fallback):
@@ -1325,6 +1812,21 @@ def build_planning_graph(
             mode=context.skill_mode, fixed_ids=context.skill_fixed_ids.get(role, []),
             allow_model=_plan_model_rounds_remaining(state, planning) > HARD_CALL_MAX_ROUNDS,
         )
+        if snapshot.selected and callable(
+            (config.get("configurable") or {}).get("progress_callback")
+        ):
+            await _emit_progress(
+                config,
+                ProgressEvent(
+                    stage="CAPABILITY_SELECTED",
+                    message=(
+                        f"已为规划阶段选用 Skill："
+                        + "、".join(asset.name for asset in snapshot.selected)
+                        + "。"
+                    ),
+                    capability=role,
+                ),
+            )
         updated_context = context.model_copy(update={
             "skill_catalog": catalog,
             "role_skill_snapshots": {**context.role_skill_snapshots, role: snapshot.model_dump(mode="json")},
@@ -1334,17 +1836,100 @@ def build_planning_graph(
             "model_rounds_used": state.get("model_rounds_used", 0) + (snapshot.model_calls if saved is None else 0),
         }
 
-    async def prepare_scheduler_node(state: PlanningState, config: RunnableConfig):
+    async def prepare_scheduler_node(
+        state: PlanningState,
+        config: RunnableConfig,
+    ) -> Command[Literal["direct_answer", "supervisor"]]:
+        if callable((config.get("configurable") or {}).get("progress_callback")):
+            await _emit_progress(
+                config,
+                ProgressEvent(
+                    stage="CAPABILITY_SELECTED",
+                    message="正在识别任务并选择适用的 Skill。",
+                    capability="PREPARING",
+                ),
+            )
+        # Skill/Scale routing runs before scope resolution. A DIRECT question
+        # therefore pays for neither the Scheduler protocol nor a scope model.
+        prepared = await prepare_role(state, config, "scheduler")
+        prepared_context = PlanningContextPack.model_validate(prepared["context"])
+        snapshot = prepared_context.role_skill_snapshots.get("scheduler", {})
+        if snapshot.get("execution_route") == "DIRECT":
+            return Command(update=prepared, goto="direct_answer")
+
         context, resolver_calls = await prepare_scope_context(
-            _context(state), role_model("scope_resolver", hard_model),
+            prepared_context, role_model("scope_resolver", hard_model),
         )
-        prepared = await prepare_role({**state, "context": context}, config, "scheduler")
-        return {
-            **prepared,
-            "scope_resolver_model_rounds": (
-                state.get("scope_resolver_model_rounds", 0) + resolver_calls
-            ),
+        return Command(
+            update={
+                **prepared,
+                "context": context,
+                "scope_resolver_model_rounds": (
+                    state.get("scope_resolver_model_rounds", 0) + resolver_calls
+                ),
+            },
+            goto="supervisor",
+        )
+
+    async def direct_answer_node(
+        state: PlanningState,
+        config: RunnableConfig,
+    ) -> Command[Literal["__end__"]]:
+        context = _context(state)
+        payload = {
+            "current_user_request": context.user_request,
+            "recent_dialogue": [
+                message.model_dump(mode="json")
+                for message in context.recent_dialogue[-4:]
+            ],
+            "conversation_summary": context.conversation_summary[:2000],
+            "relevant_memory": context.memory_context[:2000],
         }
+        model_config = dict(config or {})
+        model_config["metadata"] = {
+            **model_config.get("metadata", {}),
+            "runtime.model_role": "direct_answer",
+        }
+        try:
+            from step_user_question import invoke_with_ask_user
+
+            response, direct_rounds = await invoke_with_ask_user(
+                role_model("scheduler", hard_model),
+                [
+                    {"role": "system", "content": load_prompt("planning/direct_answer")},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                role="SCHEDULER_DIRECT_ANSWER",
+                config=model_config,
+            )
+            answer = _model_text(response)
+            if not answer:
+                raise ValueError("Direct answer model returned empty content.")
+            status = "COMPLETED"
+            stop_reason = "direct_answer"
+            unmet: list[str] = []
+        except Exception as error:
+            direct_rounds = max(int(locals().get("direct_rounds", 0)), 1)
+            answer = (
+                "这次直接回答没有成功生成，任务已安全停止。\n"
+                f"原因：{type(error).__name__}"
+            )
+            status = "FAILED"
+            stop_reason = "direct_answer_generation_failed"
+            unmet = ["直接回答模型没有返回可发送的正文。"]
+        return Command(
+            update={
+                "model_rounds_used": state.get("model_rounds_used", 0) + direct_rounds,
+                "final_status": status,
+                "final_answer": answer,
+                "unmet_success_criteria": unmet,
+                "overall_stop_reason": stop_reason,
+                "scheduler_final_decision": False,
+                "harness_terminal_decision": status == "FAILED",
+                "final_review_decision": None,
+            },
+            goto=END,
+        )
 
 
     async def supervisor_node(
@@ -1380,21 +1965,30 @@ def build_planning_graph(
             + result.model_rounds_used
         )
 
-        if decision.action == "FINAL":
+        if result.used_fallback:
+            error = (
+                result.validation_errors[-1]
+                if result.validation_errors
+                else "Scheduler未能生成合法计划。"
+            )
             return Command(
                 update={
                     "model_rounds_used": model_rounds_used,
-                    "final_status": "FAILED" if result.used_fallback else "COMPLETED",
-                    "final_answer": decision.final_answer or "",
-                    "unmet_success_criteria": [],
-                    "overall_stop_reason": "supervisor_generation_failed" if result.used_fallback else "supervisor_final",
-                    "planning_failure": ({
+                    "final_status": "FAILED",
+                    "final_answer": (
+                        "本次任务失败：Scheduler 未能生成有效计划。\n"
+                        f"原因：{error}\n"
+                        "尚未启动 Worker，已停止本次任务。"
+                    ),
+                    "unmet_success_criteria": ["未能生成可执行计划。"],
+                    "overall_stop_reason": "supervisor_generation_failed",
+                    "planning_failure": {
                         "stage": "supervisor",
                         "attempts": result.model_rounds_used,
                         "validation_retries": result.validation_retry_count,
                         "errors": list(result.validation_errors),
                         "workers_started": False,
-                    } if result.used_fallback else {}),
+                    },
                 },
                 goto=END,
             )
@@ -1445,7 +2039,6 @@ def build_planning_graph(
             "current_step_report_rounds": 0,
             "current_step_model_rounds": 0,
             "current_step_tool_calls": 0,
-            "current_step_show_all_toolsets_calls": 0,
             "current_step_trace": {},
             "current_step_worker_traces": [],
             "current_worker_group_id": "",
@@ -1469,6 +2062,7 @@ def build_planning_graph(
             "final_review_rounds": 0,
             "scheduler_final_decision": False,
             "harness_terminal_decision": False,
+            "final_review_decision": None,
             "final_worker_repair_round": 0,
             "final_worker_repair_request": None,
             "final_worker_repair_history": [],
@@ -1511,7 +2105,6 @@ def build_planning_graph(
         outer_attempt: int,
         model_limit: int,
         tool_limit: int,
-        show_all_toolsets_limit: int,
         runtime_configurable: dict[str, Any],
     ) -> list[dict[str, Any]]:
         """Run one logical slot, including bounded Leadership replacement."""
@@ -1525,7 +2118,6 @@ def build_planning_graph(
             return _slot_review_traces(group, assignment_key)
         remaining_model = model_limit
         remaining_tools = tool_limit
-        remaining_show_all_toolsets = show_all_toolsets_limit
         traces: list[dict[str, Any]] = []
         worker_agent = worker_registry.require(current_step.worker_kind)
 
@@ -1548,12 +2140,10 @@ def build_planning_graph(
                     "execution_summary": {
                         "model_call_count": 0,
                         "tool_call_count": 0,
-                        "show_all_toolsets_call_count": 0,
                     },
                     "applied_limits": {
                         "model_rounds": 0,
                         "tool_calls": remaining_tools,
-                        "show_all_toolsets_calls": remaining_show_all_toolsets,
                     },
                 }
                 trace = materialize_worker_review_trace(trace)
@@ -1605,6 +2195,10 @@ def build_planning_graph(
                     separators=(",", ":"),
                 ),
                 "step_tool_access": current_step.tool_access,
+                "requires_host_file_access": current_step.requires_host_file_access,
+                "host_original_user_request": _context(provisional).user_request,
+                "host_current_step": worker_attempt.objective,
+                "host_worker_kind": current_step.worker_kind,
                 "toolset_route_fallback_query": _context(provisional).user_request,
                 "toolset_route_full_user_request": _context(provisional).user_request,
                 "execution_instructions": (
@@ -1615,13 +2209,16 @@ def build_planning_graph(
                 ),
                 "current_time_context": _context(provisional).current_time_context(),
                 "conversation_id": thread_id,
+                "toolset_route_cache_key": (
+                    f"{provisional.get('planning_run_id') or provisional.get('event_id') or 'planning'}:"
+                    f"step_{current_step.step_id}:slot_{assignment_key}"
+                ),
                 "conversation_title": (
                     f"Planning Step {current_step.step_id} / {assignment_key}"
                 ),
                 "memory_context": _context(provisional).memory_context,
                 "executor_model_run_limit": remaining_model,
                 "executor_tool_run_limit": remaining_tools,
-                "show_all_toolsets_run_limit": remaining_show_all_toolsets,
                 "worker_id": worker_attempt.worker_id,
                 "event_id": str(
                     provisional.get("event_id")
@@ -1629,6 +2226,10 @@ def build_planning_graph(
                     or "event"
                 ),
                 "step_id": str(current_step.step_id),
+                "worker_criterion_refs": {
+                    f"C{i}": text
+                    for i, text in enumerate(current_step.success_criteria, 1)
+                },
                 "worker_total_tool_calls": 0,
                 "worker_last_progress_tool_call": 0,
                 "worker_progress_reports": [],
@@ -1656,6 +2257,8 @@ def build_planning_graph(
             leadership_decisions: list[dict[str, Any]] = []
             replacement_assignment = ""
             worker_submission = None
+            web_step_report = None
+            web_step_report_error = None
             worker_error = False
             details: dict[str, Any] = {}
 
@@ -1682,6 +2285,8 @@ def build_planning_graph(
                     details.get("worker_leadership_decisions", [])
                 )
                 worker_submission = details.get("worker_submission")
+                web_step_report = details.get("web_step_report")
+                web_step_report_error = details.get("web_step_report_error")
                 if leadership_decisions:
                     decision = leadership_decisions[-1].get("decision", {})
                     if isinstance(decision, dict):
@@ -1690,16 +2295,11 @@ def build_planning_graph(
                         ).strip()
                 used_models = max(int(summary.get("model_call_count", 0) or 0), 0)
                 used_tools = max(int(summary.get("tool_call_count", 0) or 0), 0)
-                used_toolset = max(
-                    int(summary.get("show_all_toolsets_call_count", 0) or 0),
-                    0,
-                )
             except Exception as error:
                 worker_error = True
                 summary = {}
                 used_models = 0
                 used_tools = 0
-                used_toolset = 0
                 stop_reason = "General Worker发生异常。"
                 details = {
                     "error": f"{type(error).__name__}: {error}",
@@ -1707,10 +2307,6 @@ def build_planning_graph(
 
             remaining_model = max(0, remaining_model - used_models)
             remaining_tools = max(0, remaining_tools - used_tools)
-            remaining_show_all_toolsets = max(
-                0,
-                remaining_show_all_toolsets - used_toolset,
-            )
 
             if terminal_action == "ACCEPT":
                 stop_reason = "Leadership要求当前Worker立即提交独立验收。"
@@ -1764,15 +2360,19 @@ def build_planning_graph(
                 "worker_terminal_action": terminal_action,
                 "worker_leadership_decisions": leadership_decisions,
                 "worker_submission": worker_submission,
+                "tool_audit": details.get("tool_audit", []),
+                "tool_audit_available": bool(
+                    details.get("tool_audit_available", False)
+                ),
+                "review_evidence": details.get("review_evidence", []),
+                "web_step_report": web_step_report,
+                "web_step_report_error": web_step_report_error,
                 "worker_cancellation_record": details.get(
                     "worker_cancellation_record"
                 ),
                 "applied_limits": {
                     "model_rounds": remaining_model + used_models,
                     "tool_calls": remaining_tools + used_tools,
-                    "show_all_toolsets_calls": (
-                        remaining_show_all_toolsets + used_toolset
-                    ),
                 },
                 "finish_reason": finish_reason,
                 "stop_reason": stop_reason,
@@ -1797,7 +2397,6 @@ def build_planning_graph(
                     replacement.group,
                     assignment_key,
                 )
-                remaining_show_all_toolsets = 0
                 continue
 
             await worker_group_coordinator.finish_attempt(
@@ -1826,11 +2425,8 @@ def build_planning_graph(
     ]:
         """执行当前Step的一次Attempt。
 
-        普通模型、工具和show_all_toolsets额度
-        都由Planning Graph计算后写入Agent State。
-
-        show_all_toolsets的额度属于整个Step，
-        不会因为创建新的Attempt Thread而重置。
+        普通模型和业务工具额度由Planning Graph计算后写入Agent State。
+        能力补选由Worker内的一次性控制工具管理，不占业务工具额度。
         """
 
         raw_pending_code_decision = state.get(
@@ -1928,14 +2524,6 @@ def build_planning_graph(
                 0,
             )
 
-            step_show_all_toolsets_calls = (
-                0
-                if same_worker_resume
-                else state.get(
-                    "current_step_show_all_toolsets_calls",
-                    0,
-                )
-            )
             leadership_override = str(
                 state.get("current_step_leadership_override", "")
             )
@@ -1977,8 +2565,6 @@ def build_planning_graph(
             step_model_rounds = 0
             step_tool_calls = 0
 
-            # 新Step重新获得一次工具组刷新机会。
-            step_show_all_toolsets_calls = 0
             leadership_override = ""
             replacement_history = []
             code_runtime_session_id = ""
@@ -2018,10 +2604,6 @@ def build_planning_graph(
 
                 "current_step_tool_calls": (
                     step_tool_calls
-                ),
-
-                "current_step_show_all_toolsets_calls": (
-                    step_show_all_toolsets_calls
                 ),
 
                 "remaining_steps": (
@@ -2089,10 +2671,6 @@ def build_planning_graph(
 
                     "current_step_tool_calls": (
                         step_tool_calls
-                    ),
-
-                    "current_step_show_all_toolsets_calls": (
-                        step_show_all_toolsets_calls
                     ),
 
                     "current_step_trace": {
@@ -2188,29 +2766,14 @@ def build_planning_graph(
                     total_steps
                 ),
 
+                capability=(
+                    current_step.worker_kind
+                ),
+
                 status=(
                     f"ATTEMPT_{attempt}"
                 ),
             ),
-        )
-
-        # show_all_toolsets属于Step级额度。
-
-        #
-        # 第一次Attempt尚未使用时为1；
-        # 任意Attempt真正调用过一次后，
-        # 后续Attempt全部为0。
-        show_all_toolsets_limit = (
-            0
-
-            if tool_limit <= 0
-
-            else max(
-                0,
-
-                1
-                - step_show_all_toolsets_calls,
-            )
         )
 
         if current_step.execution_mode == "PARALLEL":
@@ -2247,11 +2810,6 @@ def build_planning_graph(
                         outer_attempt=attempt,
                         model_limit=model_budgets[slot_index],
                         tool_limit=tool_budgets[slot_index],
-                        show_all_toolsets_limit=(
-                            show_all_toolsets_limit
-                            if slot_index == 0
-                            else 0
-                        ),
                         runtime_configurable={
                             key: value
                             for key, value in (
@@ -2260,6 +2818,7 @@ def build_planning_graph(
                             if key in {
                                 "event_pause_control",
                                 "resume_from_checkpoint",
+                                "progress_callback",
                             }
                         },
                     )
@@ -2310,29 +2869,9 @@ def build_planning_graph(
                 )
                 for trace in worker_traces
             )
-            parallel_toolset_calls = min(
-                1,
-                sum(
-                    max(
-                        int(
-                            trace.get("execution_summary", {}).get(
-                                "show_all_toolsets_call_count",
-                                0,
-                            )
-                            or 0
-                        ),
-                        0,
-                    )
-                    for trace in worker_traces
-                ),
-            )
             executor_rounds += parallel_model_rounds
             step_model_rounds += parallel_model_rounds
             step_tool_calls += parallel_tool_calls
-            step_show_all_toolsets_calls = min(
-                1,
-                step_show_all_toolsets_calls + parallel_toolset_calls,
-            )
             model_rounds_used = (
                 state.get("model_rounds_used", 0)
                 + parallel_model_rounds
@@ -2366,9 +2905,6 @@ def build_planning_graph(
                     "current_step_report_rounds": report_rounds,
                     "current_step_model_rounds": step_model_rounds,
                     "current_step_tool_calls": step_tool_calls,
-                    "current_step_show_all_toolsets_calls": (
-                        step_show_all_toolsets_calls
-                    ),
                     "current_step_trace": aggregate_trace,
                     "current_step_worker_traces": worker_traces,
                     "context": _record_skill_traces(_context(state), worker_traces),
@@ -2423,6 +2959,10 @@ def build_planning_graph(
                 separators=(",", ":"),
             ),
             "step_tool_access": current_step.tool_access,
+            "requires_host_file_access": current_step.requires_host_file_access,
+            "host_original_user_request": _context(state).user_request,
+            "host_current_step": current_step.objective,
+            "host_worker_kind": current_step.worker_kind,
             "toolset_route_fallback_query": _context(state).user_request,
             "toolset_route_full_user_request": _context(state).user_request,
             "execution_instructions": _context(state).execution_instructions,
@@ -2432,6 +2972,10 @@ def build_planning_graph(
             "current_time_context": _context(state).current_time_context(),
             "conversation_id": (
                 thread_id
+            ),
+            "toolset_route_cache_key": (
+                f"{state.get('planning_run_id') or state.get('event_id') or 'planning'}:"
+                f"step_{current_step.step_id}:slot_primary"
             ),
 
             "conversation_title": (
@@ -2451,10 +2995,6 @@ def build_planning_graph(
 
             "executor_tool_run_limit": (
                 tool_limit
-            ),
-
-            "show_all_toolsets_run_limit": (
-                show_all_toolsets_limit
             ),
 
             # Stable control-plane identity. The Leadership Bridge requires
@@ -2488,6 +3028,23 @@ def build_planning_graph(
                 "",
             ),
         }
+        if final_repair_active:
+            # Final review resumes the same Worker checkpoint so its messages
+            # and tool evidence survive. Submission/finalization flags belong
+            # to the *previous invocation*, however: leaving them in place
+            # makes WorkerProgressMiddleware end the repair before any model
+            # or tool call can run.
+            agent_state.update({
+                "worker_review_requested": False,
+                "worker_submission": None,
+                "worker_finalize_requested": False,
+                "worker_finalize_reason": None,
+                "worker_finalization_model_calls_used": 0,
+                "worker_finalization_tool_calls_used": 0,
+                "worker_schema_repair_model_calls_used": 0,
+                "worker_terminal_action": None,
+                "worker_control_fingerprint": "",
+            })
         if current_step.worker_kind == "CODE":
             if current_step.code_task is None:
                 raise RuntimeError("CODE Step is missing its frozen contract")
@@ -2535,6 +3092,8 @@ def build_planning_graph(
         leadership_decisions: list[dict[str, Any]] = []
         replacement_assignment = ""
         worker_submission = None
+        web_step_report = None
+        web_step_report_error = None
         code_worker_submission = None
         code_review_loop = None
         code_review_report = None
@@ -2573,6 +3132,7 @@ def build_planning_graph(
                         if key in {
                             "event_pause_control",
                             "resume_from_checkpoint",
+                            "progress_callback",
                         }
                     },
 
@@ -2600,6 +3160,8 @@ def build_planning_graph(
             worker_submission = details.get(
                 "worker_submission"
             )
+            web_step_report = details.get("web_step_report")
+            web_step_report_error = details.get("web_step_report_error")
             code_worker_submission = details.get(
                 "code_worker_submission"
             )
@@ -2626,6 +3188,28 @@ def build_planning_graph(
             code_scheduler_decision_applied = details.get(
                 "code_scheduler_decision_applied"
             )
+            previous_code_report = (
+                state.get("current_step_trace", {}).get("code_review_report")
+                or {}
+            )
+            previous_recovery_proposal = (
+                previous_code_report.get("recovery_proposal")
+                if isinstance(previous_code_report, dict)
+                else None
+            )
+            if (
+                isinstance(code_review_report, dict)
+                and previous_recovery_proposal is not None
+                and isinstance(code_scheduler_decision_applied, dict)
+                and code_scheduler_decision_applied.get("action") == "STOP"
+            ):
+                # STOP archives the frozen CODE runtime. Preserve the reviewed
+                # proposal and human decision for the global Replanner; a new
+                # CONTINUE/RESTART attempt must earn a fresh review instead.
+                code_review_report = {
+                    **code_review_report,
+                    "recovery_proposal": previous_recovery_proposal,
+                }
             code_superseded_attempt_records_result = list(
                 details.get("code_superseded_attempt_records")
                 or code_superseded_attempt_records
@@ -2655,18 +3239,6 @@ def build_planning_graph(
                 int(
                     summary.get(
                         "tool_call_count",
-                        0,
-                    )
-                    or 0
-                ),
-            )
-
-            attempt_show_all_toolsets_calls = max(
-                0,
-
-                int(
-                    summary.get(
-                        "show_all_toolsets_call_count",
                         0,
                     )
                     or 0
@@ -2711,6 +3283,13 @@ def build_planning_graph(
                 "worker_leadership_decisions": leadership_decisions,
 
                 "worker_submission": worker_submission,
+                "tool_audit": details.get("tool_audit", []),
+                "tool_audit_available": bool(
+                    details.get("tool_audit_available", False)
+                ),
+                "review_evidence": details.get("review_evidence", []),
+                "web_step_report": web_step_report,
+                "web_step_report_error": web_step_report_error,
                 "general_result": details.get("general_result"),
                 "role_skill_snapshot": details.get("role_skill_snapshot"),
                 "worker_cancellation_record": details.get(
@@ -2754,13 +3333,8 @@ def build_planning_graph(
                     "tool_calls": (
                         tool_limit
                     ),
-
-                    "show_all_toolsets_calls": (
-                        show_all_toolsets_limit
-                    ),
                 },
             }
-
         except Exception as error:
             if current_step.worker_kind == "CODE":
                 detail = f"{type(error).__name__}: {error}"
@@ -2806,7 +3380,6 @@ def build_planning_graph(
             worker_error = True
             attempt_model_rounds = 0
             attempt_tool_calls = 0
-            attempt_show_all_toolsets_calls = 0
 
             stop_reason = (
                 "General Worker发生异常。"
@@ -2836,12 +3409,14 @@ def build_planning_graph(
                     "tool_calls": (
                         tool_limit
                     ),
-
-                    "show_all_toolsets_calls": (
-                        show_all_toolsets_limit
-                    ),
                 },
             }
+            trace.update(
+                await _audit_from_failed_worker_checkpoint(
+                    worker_registry.require(current_step.worker_kind),
+                    thread_id,
+                )
+            )
 
         executor_rounds += (
             attempt_model_rounds
@@ -2853,17 +3428,6 @@ def build_planning_graph(
 
         step_tool_calls += (
             attempt_tool_calls
-        )
-
-        # 理论上Middleware已经保证不会超过1。
-        # 这里再夹到1，维护Step State的不变量。
-        step_show_all_toolsets_calls = min(
-            1,
-
-            (
-                step_show_all_toolsets_calls
-                + attempt_show_all_toolsets_calls
-            ),
         )
 
         model_rounds_used = (
@@ -3025,7 +3589,6 @@ def build_planning_graph(
                 "current_step_report_rounds": report_rounds,
                 "current_step_model_rounds": step_model_rounds,
                 "current_step_tool_calls": step_tool_calls,
-                "current_step_show_all_toolsets_calls": step_show_all_toolsets_calls,
                 "current_step_trace": trace,
                 "current_step_worker_traces": [trace],
                 "context": _record_skill_traces(_context(state), [trace]),
@@ -3090,10 +3653,6 @@ def build_planning_graph(
 
                 "current_step_tool_calls": (
                     step_tool_calls
-                ),
-
-                "current_step_show_all_toolsets_calls": (
-                    step_show_all_toolsets_calls
                 ),
 
                 "current_step_trace": (
@@ -3218,8 +3777,54 @@ def build_planning_graph(
 
         control_rounds = state.get("current_code_control_rounds", 0)
         model_remaining = _plan_model_rounds_remaining(state, planning)
+        proposal_rounds = 0
+        proposal_error = None
+        if (
+            report.recovery_proposal is None
+            and model_remaining >= HARD_CALL_MAX_ROUNDS + 3
+        ):
+            from review_recovery import build_recovery_proposal
+
+            proposal, proposal_rounds, proposal_error = await build_recovery_proposal(
+                role_model("code_reviewer", simple_model),
+                worker_kind="CODE",
+                user_request=_context(state).user_request,
+                current_step=current_step,
+                review_output=report,
+                trigger_source="code_reviewer",
+            )
+            if proposal is not None:
+                report = report.model_copy(update={"recovery_proposal": proposal})
+                trace["code_review_report"] = report.model_dump(mode="json")
+            model_remaining = max(0, model_remaining - proposal_rounds)
+        if report.recovery_proposal is not None:
+            from review_recovery import resolve_recovery_human_decision
+
+            resolved_proposal = await resolve_recovery_human_decision(
+                report.recovery_proposal,
+                event_id=str(
+                    state.get("event_id")
+                    or state.get("planning_run_id")
+                    or "planning"
+                ),
+                user_request=_context(state).user_request,
+                current_step=current_step,
+            )
+            report = report.model_copy(
+                update={"recovery_proposal": resolved_proposal}
+            )
+            trace["code_review_report"] = report.model_dump(mode="json")
         forced_reason = ""
-        if report.confirmed_plan_challenge is not None:
+        human_decision = (
+            (report.recovery_proposal or {}).get("human_decision") or {}
+        )
+        if human_decision.get("status") == "APPROVED":
+            forced_reason = (
+                "The user approved a Reviewer-proposed CODE contract downgrade. "
+                "Stop and archive the current frozen session; only the global "
+                "Replanner may create the revised CODE contract."
+            )
+        elif report.confirmed_plan_challenge is not None:
             forced_reason = (
                 "Code Reviewer confirmed a material plan conflict; stop this frozen "
                 "CODE session so the Planning Graph can ask Scheduler to adjudicate it."
@@ -3257,6 +3862,8 @@ def build_planning_graph(
             controller_rounds = result.model_rounds_used
             used_fallback = result.used_fallback
 
+        controller_rounds += proposal_rounds
+
         history = list(state.get("code_control_history", []))
         history.append(
             {
@@ -3268,6 +3875,8 @@ def build_planning_graph(
                 "scheduler_decision": decision.model_dump(mode="json"),
                 "used_fallback": used_fallback,
                 "model_rounds_used": controller_rounds,
+                "recovery_proposal_generated": report.recovery_proposal is not None,
+                "recovery_proposal_error": proposal_error,
                 "decided_at": datetime.now(timezone.utc).isoformat(),
             }
         )
@@ -3290,6 +3899,7 @@ def build_planning_graph(
                 "current_code_scheduler_decision": decision.model_dump(
                     mode="json"
                 ),
+                "current_step_trace": trace,
                 "current_code_control_rounds": control_rounds + 1,
                 "code_control_history": history,
                 "model_rounds_used": (
@@ -3374,6 +3984,18 @@ def build_planning_graph(
                     "Parallel Step Reporter is already owned by another review."
                 )
 
+        current_review_trace = state.get("current_step_trace", {})
+        worker_review_traces = state.get("current_step_worker_traces")
+        if current_step.worker_kind == "WEB":
+            current_review_trace = materialize_worker_review_trace(
+                current_review_trace
+            )
+            if worker_review_traces:
+                worker_review_traces = [
+                    materialize_worker_review_trace(trace)
+                    for trace in worker_review_traces
+                ]
+
         review_packet = build_step_review_packet(
             user_request=_context(state).user_request,
             current_time_context=_context(state).current_time_context(),
@@ -3386,12 +4008,9 @@ def build_planning_graph(
                 "current_step_replacement_history",
                 [],
             ),
-            current_attempt=state.get(
-                "current_step_trace",
-                {},
-            ),
+            current_attempt=current_review_trace,
             worker_attempts=(
-                state.get("current_step_worker_traces")
+                worker_review_traces
                 if worker_group_id
                 else None
             ),
@@ -3404,6 +4023,9 @@ def build_planning_graph(
                 state,
                 planning,
             ),
+            user_interactions=merge_ask_user_interactions(
+                state.get("step_user_interactions", [])
+            ),
         )
 
         reporter_context = _context(state)
@@ -3415,6 +4037,21 @@ def build_planning_graph(
             review_reasons.append("terminal_appworld_completion")
         if persisted_report is not None:
             report = persisted_report
+            reporter_rounds = 0
+
+        elif current_step.worker_kind == "WEB":
+            # The Web Worker closes its own Step in the same checkpoint and
+            # model context.  Harness validates/normalizes the one submitted
+            # report and never replays Web evidence through another model.
+            web_traces = list(
+                state.get("current_step_worker_traces")
+                or [state.get("current_step_trace", {})]
+            )
+            report = _build_web_step_report(
+                current_step,
+                web_traces,
+                review_packet,
+            )
             reporter_rounds = 0
 
         elif current_step.worker_kind=='GENERAL' and not review_reasons and not worker_group_id:
@@ -3453,9 +4090,20 @@ def build_planning_graph(
             reporter_rounds = 0
 
         else:
+            await _emit_progress(
+                config,
+                ProgressEvent(
+                    stage="STEP_REVIEW_STARTED",
+                    message=(
+                        f"正在审核第{current_step.step_id}步的执行结果与证据。"
+                    ),
+                    step_id=current_step.step_id,
+                    status=f"ATTEMPT_{state.get('current_step_attempt', 1)}",
+                ),
+            )
             result = await (
                 run_step_reporter(
-                    role_model("web_reporter" if current_step.worker_kind == "WEB" else "reporter", simple_model),
+                    role_model("reporter", simple_model),
 
                     current_step=(
                         current_step
@@ -3466,13 +4114,21 @@ def build_planning_graph(
                     skill_mode=_context(state).skill_mode,
                     skill_fixed_ids=_context(state).skill_fixed_ids.get("step_reporter", []),
                     saved_skill_snapshot=reporter_context.role_skill_snapshots.get(reporter_snapshot_key),
+                    step_attempt=state.get("current_step_attempt", 1),
+                    repair_round=state.get("final_worker_repair_round", 0),
+                    review_trigger=(
+                        "final_reviewer_repair"
+                        if state.get("final_worker_repair_round", 0)
+                        else "worker_attempt_complete"
+                    ),
+                    review_evidence_mode=review_evidence_mode,
 
                     max_model_rounds=(
                         limit
                     ),
                     model_output_max_tokens=(
                         reporter_output_limits.get(
-                            "web_reporter" if current_step.worker_kind == "WEB" else "reporter",
+                            "reporter",
                             model_output_max_tokens,
                         )
                     ),
@@ -3488,6 +4144,36 @@ def build_planning_graph(
 
             reporter_rounds = (
                 result.model_rounds_used
+            )
+
+        # The Reporter judges the result, but cannot silently replace text
+        # authored by the Worker. Keep the last single Worker's full draft for
+        # the Final Reviewer and for later Steps without treating it as proof.
+        if current_step.worker_kind == "GENERAL" and current_step.execution_mode == "SINGLE":
+            latest_attempt = review_packet.attempts[-1]
+            report = report.model_copy(update={"answer_text": latest_attempt.answer_text})
+        elif current_step.worker_kind == "WEB":
+            # The Web self-report builder already preserves the single draft or
+            # deterministically joins parallel Worker drafts.
+            pass
+        elif current_step.execution_mode != "SINGLE" or not state.get("current_step_trace", {}).get("code_review_report"):
+            report = report.model_copy(update={"answer_text": None})
+
+        if report.request_replan and report.recovery_proposal is not None:
+            from review_recovery import resolve_recovery_human_decision
+
+            recovery_proposal = await resolve_recovery_human_decision(
+                report.recovery_proposal,
+                event_id=str(
+                    state.get("event_id")
+                    or state.get("planning_run_id")
+                    or "planning"
+                ),
+                user_request=_context(state).user_request,
+                current_step=current_step,
+            )
+            report = report.model_copy(
+                update={"recovery_proposal": recovery_proposal}
             )
 
         publication_receipts: list[ArtifactPublicationReceipt] = []
@@ -3690,6 +4376,17 @@ def build_planning_graph(
             1,
         )
 
+        # Show a small, deterministic part of the Reviewer's decision. Never
+        # relay free-form evidence, tool output, or internal reviewer prompts.
+        criterion_count = len(report.criterion_results)
+        met_count = sum(
+            item.status == "MET" for item in report.criterion_results
+        )
+        review_count_text = (
+            f"审核确认{met_count}/{criterion_count}项要求，"
+            if criterion_count else ""
+        )
+
         # ProgressEvent.stage表示审核结果。
         #
         # status使用Attempt编号参与去重，
@@ -3703,7 +4400,9 @@ def build_planning_graph(
                     ),
 
                     message=(
-                        f"第{step_id}步已完成。"
+                        f"第{step_id}步已完成，"
+                        f"{review_count_text.rstrip('，')}。"
+                        if review_count_text else f"第{step_id}步已完成。"
                     ),
 
                     step_id=(
@@ -3726,6 +4425,7 @@ def build_planning_graph(
                     message=(
                         f"第{step_id}步"
                         "已部分完成，"
+                        f"{review_count_text}"
                         "仍有内容尚未确认。"
                     ),
 
@@ -3743,18 +4443,21 @@ def build_planning_graph(
             if replan_available:
                 progress_message = (
                     f"第{step_id}步受到阻塞，"
+                    f"{review_count_text}"
                     "正在判断新的执行路径。"
                 )
 
             elif can_retry:
                 progress_message = (
                     f"第{step_id}步受到阻塞，"
+                    f"{review_count_text}"
                     "正在准备重试。"
                 )
 
             else:
                 progress_message = (
                     f"第{step_id}步受到阻塞，"
+                    f"{review_count_text}"
                     "将根据已有结果继续收口。"
                 )
 
@@ -3791,6 +4494,7 @@ def build_planning_graph(
                 progress_message = (
                     f"第{step_id}步"
                     "未能获得可靠结果，"
+                    f"{review_count_text}"
                     "正在判断新的执行路径。"
                 )
 
@@ -3798,6 +4502,7 @@ def build_planning_graph(
                 progress_message = (
                     f"第{step_id}步"
                     "未能获得可靠结果，"
+                    f"{review_count_text}"
                     "正在准备重试。"
                 )
 
@@ -3805,6 +4510,7 @@ def build_planning_graph(
                 progress_message = (
                     f"第{step_id}步"
                     "未能获得可靠结果，"
+                    f"{review_count_text}"
                     "将根据已有结果继续收口。"
                 )
 
@@ -4106,6 +4812,18 @@ def build_planning_graph(
                 max_remaining_steps=(
                     max_steps
                 ),
+
+                replan_source=state.get("pending_replan_source", "unknown"),
+                origin_worker_kind=(
+                    state["current_step"].worker_kind
+                    if state.get("current_step") is not None
+                    else None
+                ),
+                origin_step_id=(
+                    state["current_step"].step_id
+                    if state.get("current_step") is not None
+                    else None
+                ),
             )
         )
 
@@ -4221,6 +4939,18 @@ def build_planning_graph(
                     )
                 ),
 
+                "origin_worker_kind": (
+                    state["current_step"].worker_kind
+                    if state.get("current_step") is not None
+                    else None
+                ),
+
+                "origin_step_id": (
+                    state["current_step"].step_id
+                    if state.get("current_step") is not None
+                    else None
+                ),
+
                 "request_reason": (
                     reason
                 ),
@@ -4308,7 +5038,6 @@ def build_planning_graph(
                     "current_step_report_rounds": 0,
                     "current_step_model_rounds": 0,
                     "current_step_tool_calls": 0,
-                    "current_step_show_all_toolsets_calls": 0,
                     "current_step_replacement_history": [],
                     "current_code_runtime_session_id": "" if not resume_same_worker else state.get("current_code_runtime_session_id", ""),
                     "current_code_scheduler_decision": None,
@@ -4356,9 +5085,6 @@ def build_planning_graph(
             "current_step_model_rounds": 0,
 
             "current_step_tool_calls": 0,
-
-            "current_step_show_all_toolsets_calls": 0,
-
             "current_step_trace": {},
 
             "current_step_worker_traces": [],
@@ -4488,6 +5214,7 @@ def build_planning_graph(
             decision = _build_forced_final_decision(state)
             return Command(
                 update={
+                    "final_review_decision": _final_review_decision_record(decision),
                     "final_status": decision.status or "FAILED",
                     "final_answer": decision.final_answer or "",
                     "unmet_success_criteria": decision.unmet_success_criteria,
@@ -4548,6 +5275,7 @@ def build_planning_graph(
                         "final_review_rounds": final_review_rounds + 1,
                         "scheduler_final_decision": False,
                         "harness_terminal_decision": True,
+                        "final_review_decision": _final_review_decision_record(decision),
                         "final_status": decision.status or "FAILED",
                         "final_answer": decision.final_answer or "",
                         "unmet_success_criteria": decision.unmet_success_criteria,
@@ -4675,6 +5403,15 @@ def build_planning_graph(
                 )
             decision = _build_forced_final_decision(current)
 
+        if decision.action == "FINAL" and decision.final_answer:
+            decision = decision.model_copy(update={
+                "final_answer": _append_verified_source_links(
+                    decision.final_answer,
+                    decision,
+                    state.get("completed_step_reports", []),
+                )
+            })
+
         return Command(
             update={
                 "context": context,
@@ -4687,6 +5424,7 @@ def build_planning_graph(
                 "harness_terminal_decision": (
                     result.output.action == "FINAL" and result.used_fallback
                 ),
+                "final_review_decision": _final_review_decision_record(decision),
                 "final_status": decision.status or "FAILED",
                 "final_answer": decision.final_answer or "",
                 "unmet_success_criteria": decision.unmet_success_criteria,
@@ -4703,7 +5441,10 @@ def build_planning_graph(
         PlanningState
     )
     workflow.add_node("prepare_scheduler", scheduler_node(prepare_scheduler_node, planning.scheduler_summary_trigger_tokens))
-    workflow.add_edge("prepare_scheduler", "supervisor")
+    workflow.add_node(
+        "direct_answer",
+        scheduler_node(direct_answer_node, planning.scheduler_summary_trigger_tokens),
+    )
 
     workflow.add_node(
         "supervisor",
@@ -4746,6 +5487,7 @@ def build_planning_graph(
             + planning.max_total_steps
             * planning.max_step_attempts
             * 4
+            + planning.max_total_steps
             + planning.max_final_worker_repair_rounds * 4
     )
 
@@ -4774,6 +5516,20 @@ def _build_code_step_report(
     """
 
     report = CodeReviewReport.model_validate(trace.get("code_review_report"))
+    raw_code_submission = trace.get("code_worker_submission") or {}
+    submission_data = (
+        raw_code_submission.get("submission")
+        if isinstance(raw_code_submission, dict) else None
+    )
+    try:
+        code_submission = CodeWorkerSubmission.model_validate(submission_data) if submission_data else None
+    except (TypeError, ValueError):
+        code_submission = None
+    code_answer_text = (
+        code_submission.answer_text
+        if code_submission is not None and code_submission.candidate == report.candidate
+        else None
+    )
     loop = CodeReviewLoopState.model_validate(trace.get("code_review_loop"))
     if report.candidate != loop.candidate:
         raise ValueError("CODE report and review loop reference different candidates")
@@ -4844,11 +5600,18 @@ def _build_code_step_report(
         # reached.  A terminal STOP must not accidentally fall back to the old
         # generic retry/replan path because the Reviewer had recommended a
         # different action one state transition earlier.
-        request_replan = report.confirmed_plan_challenge is not None
+        request_replan = (
+            report.confirmed_plan_challenge is not None
+            or report.recovery_proposal is not None
+        )
         replan_reason = (
             report.confirmed_plan_challenge.reason
             if report.confirmed_plan_challenge is not None
-            else None
+            else (
+                str(report.recovery_proposal.get("reason") or report.summary)
+                if report.recovery_proposal is not None
+                else None
+            )
         )
         stop_reason = (
             "Code Reviewer escalated the candidate and Scheduler applied "
@@ -4906,9 +5669,11 @@ def _build_code_step_report(
     )
     return StepReport(
         step_id=current_step.step_id,
+        answer_text=code_answer_text,
         handoff_knowledge=collect_handoff_knowledge([trace]),
         handoff_apis=collect_api_handoffs([trace]),
         handoff_api_receipts=collect_api_handoff_receipts([trace]),
+        recovery_proposal=report.recovery_proposal,
         status=status,
         summary=report.summary,
         stop_reason=stop_reason,

@@ -1,6 +1,7 @@
 """Provider-free checks of real local conversions, tool wiring and file boundaries."""
 
 import base64
+import socket
 import json
 import unittest
 from pathlib import Path
@@ -233,6 +234,7 @@ class NativeToolTests(unittest.TestCase):
                                     "output_path": "/artifacts/demo.xlsx",
                                     "sheet": "Demo",
                                     "rows": [["A", 2]],
+                                    "source_refs": ["MODEL"],
                                 },
                             }
                         ],
@@ -266,7 +268,7 @@ class NativeToolTests(unittest.TestCase):
             )
         )
         with (
-            patch.object(local, "_public_url"),
+            patch.object(local, "_public_url", return_value="93.184.216.34"),
             patch(
                 "httpx.Client",
                 side_effect=lambda **kwargs: factory(transport=transport, **kwargs),
@@ -278,13 +280,42 @@ class NativeToolTests(unittest.TestCase):
         with self.assertRaises(ToolException):
             local.fetch_webpage.func("http://127.0.0.1")
 
+    def test_mixed_dns_pins_only_the_validated_public_address(self):
+        answers = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443)),
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001::1", 443, 0, 0)),
+        ]
+        with patch("socket.getaddrinfo", return_value=answers):
+            self.assertEqual(local._public_url("https://example.com/a"), "93.184.216.34")
+            pinned, host, sni = local._pinned_request("https://example.com/a?q=1")
+        self.assertEqual(pinned, "https://93.184.216.34:443/a?q=1")
+        self.assertEqual(host, "example.com")
+        self.assertEqual(sni, "example.com")
+
+    def test_fetch_is_independent_from_local_conversion_capacity(self):
+        import httpx
+
+        factory = httpx.Client
+        transport = httpx.MockTransport(lambda request: httpx.Response(
+            200, text="public body", headers={"content-type": "text/plain"}
+        ))
+        self.assertTrue(local._local_capacity.acquire(blocking=False))
+        try:
+            with patch.object(local, "_public_url", return_value="93.184.216.34"), patch(
+                "httpx.Client", side_effect=lambda **kw: factory(transport=transport, **kw)
+            ):
+                result = local.fetch_webpage.func("https://example.com/page")
+        finally:
+            local._local_capacity.release()
+        self.assertEqual(result["fetch_status"], "SUCCESS")
+
     def test_chinese_html_meta_charset_is_preserved(self):
         import httpx
         factory = httpx.Client
         html = '<html><meta charset="gb2312"><p>开放时间与地铁路线</p></html>'.encode("gb2312")
         transport = httpx.MockTransport(lambda request: httpx.Response(200,
             headers={"content-type": "text/html"}, content=html))
-        with patch.object(local, "_public_url"), patch("httpx.Client", side_effect=lambda **kw: factory(transport=transport, **kw)):
+        with patch.object(local, "_public_url", return_value="93.184.216.34"), patch("httpx.Client", side_effect=lambda **kw: factory(transport=transport, **kw)):
             result = local.fetch_webpage.func("https://example.com/visit")
         self.assertIn("开放时间与地铁路线", result["content"])
 

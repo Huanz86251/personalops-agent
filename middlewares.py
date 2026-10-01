@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import MutableMapping
 from pathlib import Path
 from typing import Any
 
@@ -42,13 +43,10 @@ from observability import (
     set_span_output,
     trace_span,
 )
-from dataclasses import (
-    dataclass,
-)
-from tools.show_all_toolsets import (
-    SHOW_ALL_TOOLSETS_NAME,
-    SHOW_ALL_TOOLSETS_PREFIX,
-)
+from dataclasses import dataclass, replace
+from capability_expansion_contract import REQUEST_ADDITIONAL_CAPABILITIES_NAME
+from step_user_question import ASK_USER_NAME
+from runtime_tool_visibility import visible_model_tools_scope
 
 logger = logging.getLogger("agent")
 
@@ -73,9 +71,10 @@ TOOLSET_ROUTE_USER_WEIGHT = 0.6
 # Scheduler关闭工具访问时仍需允许角色提交结果或进入既有审核协议。
 # 检索、历史、文件和业务工具都不在此集合中。
 NO_ACCESS_CONTROL_TOOL_NAMES = frozenset({
+    ASK_USER_NAME,
     "report_general_result",
     "publish_worker_progress",
-    "submit_for_review",
+    "complete_web_step",
     "submit_code_for_review",
     "respond_to_code_review",
     "submit_continued_code_for_review",
@@ -113,11 +112,19 @@ class ToolsetRouteCacheEntry:
         ...,
     ]
 
-    # 本地加权路由和同Worker模型都失败时缓存控制面结果，避免每轮
+    # 混合召回和独立轻量选择器都无法产生有效路由时，
+    # 缓存控制面结果，避免每轮重复计算。
     # 重复付费；不会把全部业务工具暴露给模型。
     routing_failed: bool = False
 
     fallback_reason: str | None = None
+
+    capability_expansion_applied: bool = False
+
+    capability_expansion_closed: bool = False
+
+    # 仅Web初始能力选择器可开启。缺失、非法输出和路由失败均保持False。
+    require_progress_checkpoint: bool = False
 
 def _message_content_to_text(
     content: Any,
@@ -365,69 +372,6 @@ def _get_current_toolset_route(
             "none",
         )
 
-    # 只检查最近用户消息之后的ToolMessage。
-    #
-    # 旧Turn中的show_all_toolsets结果
-    # 不能影响当前用户请求。
-    for message in reversed(
-        messages[
-            latest_user_index + 1:
-        ]
-    ):
-        (
-            role,
-            name,
-            content,
-        ) = _read_message_fields(
-            message
-        )
-
-        if (
-            role != "tool"
-
-            or name
-            != SHOW_ALL_TOOLSETS_NAME
-        ):
-            continue
-
-        normalized_content = (
-            content.strip()
-        )
-
-        if not (
-            normalized_content
-            .startswith(
-                SHOW_ALL_TOOLSETS_PREFIX
-            )
-        ):
-            continue
-
-        requested_task = (
-            normalized_content[
-                len(
-                    SHOW_ALL_TOOLSETS_PREFIX
-                ):
-            ]
-            .strip()
-        )
-
-        if not requested_task:
-            continue
-
-        return (
-            user_turn_number,
-
-            _compact_tool_selector_text(
-                requested_task,
-
-                max_chars=(
-                    TOOL_SELECTOR_QUERY_MAX_CHARS
-                ),
-            ),
-
-            "show_all_toolsets",
-        )
-
     return (
         user_turn_number,
         latest_user_text,
@@ -504,15 +448,20 @@ def _infer_model_round(
         + 1
     )
 
-def _get_conversation_key(
-    request: ModelRequest,
-) -> str:
-    """读取当前Conversation的缓存Key。"""
+def _get_conversation_key_from_state(state) -> str:
+    """从Worker状态读取稳定的Step级工具路由缓存Key。"""
 
-    state = (
-        request.state
-        or {}
+    state = state or {}
+
+    # Planning为同一个Step的首次执行和Reviewer返工使用不同的
+    # checkpoint thread_id。工具能力没有变化时不应因此重新调用选择器，
+    # 所以优先使用Harness提供的稳定Step/slot缓存键。
+    stable_route_key = state.get(
+        "toolset_route_cache_key",
+        "",
     )
+    if isinstance(stable_route_key, str) and stable_route_key.strip():
+        return stable_route_key.strip()
 
     conversation_id = state.get(
         "conversation_id",
@@ -534,6 +483,14 @@ def _get_conversation_key(
     #
     # 这里作为单用户模式下的安全回退。
     return "__single_user__"
+
+
+def _get_conversation_key(
+    request: ModelRequest,
+) -> str:
+    """读取当前Conversation的缓存Key。"""
+
+    return _get_conversation_key_from_state(request.state)
 
 
 def _read_tool_name(
@@ -897,9 +854,6 @@ class ExecutionBudgetState(
         int
     ]
 
-    show_all_toolsets_calls_used: NotRequired[
-        int
-    ]
     skill_preparation_calls_used: NotRequired[int]
     worker_compaction_calls_used: NotRequired[int]
     worker_archived_messages: NotRequired[list[Any]]
@@ -912,6 +866,7 @@ class ExecutionBudgetState(
     worker_finalization_tool_calls_used: NotRequired[int]
     worker_schema_repair_model_run_limit: NotRequired[int]
     worker_schema_repair_model_calls_used: NotRequired[int]
+    capability_expansion_requests: NotRequired[list[dict[str, Any]]]
 
 
 class DynamicExecutionBudgetMiddleware(
@@ -1090,13 +1045,6 @@ class DynamicExecutionBudgetMiddleware(
             )
         )
 
-        show_all_toolsets_limit = (
-            _read_dynamic_limit(
-                state,
-                "show_all_toolsets_run_limit",
-            )
-        )
-
         messages = list(
             state.get(
                 "messages",
@@ -1134,13 +1082,6 @@ class DynamicExecutionBudgetMiddleware(
             )
         )
 
-        show_all_toolsets_used_before = int(
-            state.get(
-                "show_all_toolsets_calls_used",
-                0,
-            )
-        )
-
         current_tool_calls = (
             _read_ai_tool_calls(
                 last_message
@@ -1151,10 +1092,11 @@ class DynamicExecutionBudgetMiddleware(
             state.get("worker_review_requested")
         )
         if self.enable_worker_finalization and finalizing:
+            terminal_tool = "complete_web_step"
             allowed_tool_calls = [
                 tool_call
                 for tool_call in current_tool_calls
-                if _read_tool_call_name(tool_call) == "submit_for_review"
+                if _read_tool_call_name(tool_call) == terminal_tool
             ][:1]
             blocked_tool_calls = [
                 tool_call
@@ -1170,7 +1112,7 @@ class DynamicExecutionBudgetMiddleware(
                         last_message,
                         tool_calls=allowed_tool_calls,
                         fallback_content=(
-                            "Worker finalization only permits submit_for_review."
+                            f"Worker finalization only permits {terminal_tool}."
                         ),
                     ),
                 ]
@@ -1195,12 +1137,6 @@ class DynamicExecutionBudgetMiddleware(
             - total_used_before,
         )
 
-        show_all_toolsets_remaining = max(
-            0,
-            show_all_toolsets_limit
-            - show_all_toolsets_used_before,
-        )
-
         allowed_tool_calls: list[
             Any
         ] = []
@@ -1221,6 +1157,12 @@ class DynamicExecutionBudgetMiddleware(
                 )
             )
 
+            # 能力补选是一次控制面申请，不消耗业务工具额度；第二次申请
+            # 仍需真正执行，以便工具本身切换现有finalization状态。
+            if tool_name in {REQUEST_ADDITIONAL_CAPABILITIES_NAME, ASK_USER_NAME}:
+                allowed_tool_calls.append(tool_call)
+                continue
+
             if total_remaining <= 0:
                 blocked_tool_calls.append(
                     {
@@ -1236,49 +1178,11 @@ class DynamicExecutionBudgetMiddleware(
 
                 continue
 
-            if (
-                tool_name
-                == SHOW_ALL_TOOLSETS_NAME
-                and show_all_toolsets_remaining
-                <= 0
-            ):
-                blocked_tool_calls.append(
-                    {
-                        "tool_name": (
-                            tool_name
-                        ),
-
-                        "reason": (
-                            "show_all_toolsets_run_limit"
-                        ),
-                    }
-                )
-
-                continue
-
             allowed_tool_calls.append(
                 tool_call
             )
 
             total_remaining -= 1
-
-            if (
-                tool_name
-                == SHOW_ALL_TOOLSETS_NAME
-            ):
-                show_all_toolsets_remaining -= 1
-
-        allowed_show_all_toolsets_calls = sum(
-            1
-
-            for tool_call
-            in allowed_tool_calls
-
-            if _read_tool_call_name(
-                tool_call
-            )
-            == SHOW_ALL_TOOLSETS_NAME
-        )
 
         counter_updates = {
             "executor_model_calls_used": (
@@ -1289,13 +1193,12 @@ class DynamicExecutionBudgetMiddleware(
             "executor_tool_calls_used": (
                 total_used_before
                 + len(
-                    allowed_tool_calls
+                    [
+                        call for call in allowed_tool_calls
+                        if _read_tool_call_name(call)
+                        not in {REQUEST_ADDITIONAL_CAPABILITIES_NAME, ASK_USER_NAME}
+                    ]
                 )
-            ),
-
-            "show_all_toolsets_calls_used": (
-                show_all_toolsets_used_before
-                + allowed_show_all_toolsets_calls
             ),
         }
 
@@ -1345,16 +1248,8 @@ class DynamicExecutionBudgetMiddleware(
                     tool_limit
                 ),
 
-                "show_all_toolsets_limit": (
-                    show_all_toolsets_limit
-                ),
-
                 "used_before": (
                     total_used_before
-                ),
-
-                "show_all_toolsets_used_before": (
-                    show_all_toolsets_used_before
                 ),
 
                 "requested_tool_names": [
@@ -1382,10 +1277,6 @@ class DynamicExecutionBudgetMiddleware(
 
                 "budget.tools.blocked_current": len(
                     blocked_tool_calls
-                ),
-
-                "budget.show_all_toolsets.limit": (
-                    show_all_toolsets_limit
                 ),
             },
         ) as span:
@@ -1443,6 +1334,9 @@ class ToolsetRouterMiddleware(
         *,
         baseline_tool_names: Sequence[str] = (),
         minimum_score: float = 0.4,
+        selector_model: Any | None = None,
+        route_cache: MutableMapping[str, ToolsetRouteCacheEntry] | None = None,
+        select_web_progress_checkpoint: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1462,12 +1356,29 @@ class ToolsetRouterMiddleware(
             if str(name).strip()
         )
 
+        # 工具路由使用独立的轻量模型。生产路径不得回退到当前Worker模型，
+        # 否则路由判断会污染Worker上下文并使不同角色行为漂移。
+        self.selector_model = selector_model
+
+        # 只有Web Worker启用。它复用同一次轻量能力选择，不增加模型调用。
+        self.select_web_progress_checkpoint = bool(
+            select_web_progress_checkpoint
+        )
+
         # 单用户应用：
         # 每个Conversation只保存最近一次路由结果。
-        self._route_cache: dict[
+        self._route_cache: MutableMapping[
             str,
             ToolsetRouteCacheEntry,
-        ] = {}
+        ] = route_cache if route_cache is not None else {}
+
+    def progress_checkpoint_required(self, state) -> bool:
+        """返回当前Step缓存的Web强制进度检查决定；任何缺失均安全降级为False。"""
+
+        if not self.select_web_progress_checkpoint:
+            return False
+        entry = self._route_cache.get(_get_conversation_key_from_state(state))
+        return bool(entry and entry.require_progress_checkpoint)
 
     async def awrap_model_call(
         self,
@@ -1484,6 +1395,20 @@ class ToolsetRouterMiddleware(
             request.state
             or {}
         )
+
+        # A selected execution Skill may declare a small deterministic front
+        # door.  Semantic routing still ranks additional groups, but it cannot
+        # accidentally remove the tools required by the policy it just loaded.
+        required_skill_toolsets: list[str] = []
+        skill_snapshot = request_state.get("role_skill_snapshot") or {}
+        if isinstance(skill_snapshot, dict):
+            for asset in skill_snapshot.get("selected", []) or []:
+                if not isinstance(asset, dict):
+                    continue
+                for raw_name in asset.get("required_toolsets", []) or []:
+                    name = str(raw_name or "").strip().upper()
+                    if name and name not in required_skill_toolsets:
+                        required_skill_toolsets.append(name)
 
         tool_limit = (
             _read_dynamic_limit(
@@ -1566,31 +1491,27 @@ class ToolsetRouterMiddleware(
             )
         )
 
-        # show_all_toolsets属于控制面工具，
-        # 不交给本地Router参与业务工具组展开。
-        show_all_toolsets_tool = next(
-            (
-                current_tool
-
-                for current_tool
-                in available_tools
-
-                if (
-                    _read_tool_name(
-                        current_tool
-                    )
-                    == SHOW_ALL_TOOLSETS_NAME
-                )
-            ),
-
-            None,
-        )
-
         always_visible_tools = [
             current_tool
             for current_tool in available_tools
             if _read_tool_name(current_tool) in self.baseline_tool_names
         ]
+
+        # Scheduler only declares that this Step crosses the host-file
+        # boundary.  Exact paths and operations are still proposed by the
+        # Worker and approved by the Harness.  When the bit is set, make the
+        # small host tool group deterministic instead of trusting a semantic
+        # router to rediscover it.
+        host_file_tool_names = {
+            "host_list_files", "host_search_files", "host_import_file"
+        }
+        if request_state.get("requires_host_file_access"):
+            visible_names = {_read_tool_name(item) for item in always_visible_tools}
+            for current_tool in available_tools:
+                name = _read_tool_name(current_tool)
+                if name in host_file_tool_names and name not in visible_names:
+                    always_visible_tools.append(current_tool)
+                    visible_names.add(name)
 
         business_tools = [
             current_tool
@@ -1599,12 +1520,12 @@ class ToolsetRouterMiddleware(
             in available_tools
 
             if (
-                _read_tool_name(
-                    current_tool
-                )
-                != SHOW_ALL_TOOLSETS_NAME
-                and _read_tool_name(current_tool)
+                _read_tool_name(current_tool)
                 not in self.baseline_tool_names
+                and not (
+                    request_state.get("requires_host_file_access")
+                    and _read_tool_name(current_tool) in host_file_tool_names
+                )
             )
         ]
 
@@ -1659,6 +1580,8 @@ class ToolsetRouterMiddleware(
 
         selected_request = request
 
+        require_progress_checkpoint = False
+
         with trace_span(
             (
                 "model_call."
@@ -1689,6 +1612,7 @@ class ToolsetRouterMiddleware(
                 ),
                 "step_tool_access": "ENABLED" if tool_access_enabled else "DISABLED",
                 "fallback_routing_task": fallback_route_query,
+                "required_skill_toolsets": required_skill_toolsets,
 
                 "available_tools": (
                     available_tool_items
@@ -1732,31 +1656,29 @@ class ToolsetRouterMiddleware(
                         available_business_tool_items
                     ),
 
-                    "control_tool": (
-                        _tool_to_trace_item(
-                            show_all_toolsets_tool
-                        )
-
-                        if show_all_toolsets_tool
-                        is not None
-
-                        else None
-                    ),
+                    "control_tools": [
+                        _tool_to_trace_item(current_tool)
+                        for current_tool in always_visible_tools
+                    ],
                 },
             ) as selection_span:
 
                 if tool_calls_remaining <= 0:
-                    # 工具预算耗尽时，不再把任何工具暴露给模型。
-                    # 模型仍然正常调用，但只能基于已有信息分析和收口。
+                    # 业务工具预算耗尽时仍保留Human Loop。询问用户是控制面
+                    # 暂停，不是可借此继续执行业务调用的额外预算。
                     selection_mode = (
                         "tool_budget_exhausted"
                     )
 
-                    selected_tools = []
+                    selected_tools = [
+                        current_tool
+                        for current_tool in always_visible_tools
+                        if _read_tool_name(current_tool) == ASK_USER_NAME
+                    ]
 
                 elif not tool_access_enabled:
                     # Scheduler已经声明该Step只依赖当前上下文。报告工具仍需保留，
-                    # 使Worker能够提交结果；业务工具和show_all均不挂载。
+                    # 使Worker能够提交结果；业务工具均不挂载。
                     selection_mode = "scheduler_tools_disabled"
                     selected_tools = [
                         current_tool
@@ -1777,7 +1699,15 @@ class ToolsetRouterMiddleware(
                     selected_tools = [
                         current_tool
                         for current_tool in always_visible_tools
-                        if _read_tool_name(current_tool) in NO_ACCESS_CONTROL_TOOL_NAMES
+                        if (
+                            _read_tool_name(current_tool)
+                            in NO_ACCESS_CONTROL_TOOL_NAMES
+                            or (
+                                request_state.get("requires_host_file_access")
+                                and _read_tool_name(current_tool)
+                                in host_file_tool_names
+                            )
+                        )
                     ]
                     logger.warning(
                         "工具组路由没有找到有效请求，本次只保留提交控制工具。"
@@ -1874,6 +1804,10 @@ class ToolsetRouterMiddleware(
                     if cache_is_usable:
                         cache_hit = True
 
+                        require_progress_checkpoint = bool(
+                            cached_entry.require_progress_checkpoint
+                        )
+
                         if cached_entry.routing_failed:
                             selection_mode = "turn_cache_model_routing_failed"
                             fallback_reason = (
@@ -1883,7 +1817,17 @@ class ToolsetRouterMiddleware(
                             selected_tools = [
                                 current_tool
                                 for current_tool in always_visible_tools
-                                if _read_tool_name(current_tool) in NO_ACCESS_CONTROL_TOOL_NAMES
+                                if (
+                                    _read_tool_name(current_tool)
+                                    in NO_ACCESS_CONTROL_TOOL_NAMES
+                                    or (
+                                        request_state.get(
+                                            "requires_host_file_access"
+                                        )
+                                        and _read_tool_name(current_tool)
+                                        in host_file_tool_names
+                                    )
+                                )
                             ]
                         else:
                             selection_mode = (
@@ -1898,34 +1842,58 @@ class ToolsetRouterMiddleware(
                     else:
                         router_called = True
 
-                        route_decision = await self.toolset_router.route(
-                            task_text=routing_task,
-                            available_tools=business_tools,
-                            allow_no_tool=False,
-                            user_request_text=fallback_route_query,
-                            step_weight=TOOLSET_ROUTE_STEP_WEIGHT,
-                            user_weight=TOOLSET_ROUTE_USER_WEIGHT,
-                        )
-                        route_stage = "weighted_cross_encoder"
-
-                        if route_decision is None:
-                            route_decision = await self.toolset_router.route_with_model(
-                                getattr(request, "model", None),
+                        if self.selector_model is not None:
+                            route_decision = await self.toolset_router.route_hybrid_with_model(
+                                self.selector_model,
                                 primary_task=routing_task,
                                 user_request_window=full_user_request,
                                 available_tools=business_tools,
+                                select_progress_checkpoint=(
+                                    self.select_web_progress_checkpoint
+                                ),
+                            )
+                            route_stage = "bm25_cross_encoder_qwen_selector"
+                        else:
+                            # 仅供离线组件测试或显式未配置选择器的降级路径；
+                            # 生产ConversationRuntime始终传入专用Qwen选择器。
+                            route_decision = await self.toolset_router.route(
+                                task_text=routing_task,
+                                available_tools=business_tools,
+                                allow_no_tool=False,
+                                user_request_text=fallback_route_query,
+                                step_weight=TOOLSET_ROUTE_STEP_WEIGHT,
+                                user_weight=TOOLSET_ROUTE_USER_WEIGHT,
+                            )
+                            route_stage = "local_cross_encoder_without_selector"
+
+                        if route_decision is None and required_skill_toolsets:
+                            route_decision = self.toolset_router.resolve_selected_toolsets(
+                                required_skill_toolsets,
+                                business_tools,
+                                routing_task=routing_task,
                                 allow_no_tool=False,
                             )
-                            route_stage = "same_worker_model"
+                            if route_decision is not None:
+                                route_stage = "skill_required_toolsets_only"
 
                         if route_decision is None:
                             selection_mode = "model_routing_failed"
-                            fallback_reason = "加权本地路由和同Worker模型均未形成合法工具组"
+                            fallback_reason = "BM25/Cross Encoder与专用能力选择器未形成合法工具组"
 
                             selected_tools = [
                                 current_tool
                                 for current_tool in always_visible_tools
-                                if _read_tool_name(current_tool) in NO_ACCESS_CONTROL_TOOL_NAMES
+                                if (
+                                    _read_tool_name(current_tool)
+                                    in NO_ACCESS_CONTROL_TOOL_NAMES
+                                    or (
+                                        request_state.get(
+                                            "requires_host_file_access"
+                                        )
+                                        and _read_tool_name(current_tool)
+                                        in host_file_tool_names
+                                    )
+                                )
                             ]
 
                             logger.warning(
@@ -1958,18 +1926,45 @@ class ToolsetRouterMiddleware(
                             )
 
                         else:
-                            selection_mode = route_stage
+                            require_progress_checkpoint = bool(
+                                route_decision.require_progress_checkpoint
+                            )
+                            merged_toolsets = [
+                                *required_skill_toolsets,
+                                *route_decision.selected_toolset_names,
+                            ]
+                            merged_decision = self.toolset_router.resolve_selected_toolsets(
+                                merged_toolsets,
+                                business_tools,
+                                routing_task=routing_task,
+                                allow_no_tool=False,
+                            )
+                            if merged_decision is None:
+                                selection_mode = "required_toolset_resolution_failed"
+                                fallback_reason = "所选Skill要求的能力组在当前真实工具池中不可用"
+                                selected_tools = [
+                                    item for item in always_visible_tools
+                                    if _read_tool_name(item) in NO_ACCESS_CONTROL_TOOL_NAMES
+                                ]
+                                route_decision = None
+                            else:
+                                route_decision = replace(
+                                    merged_decision,
+                                    require_progress_checkpoint=(
+                                        require_progress_checkpoint
+                                    ),
+                                )
+                                selection_mode = route_stage
 
                             selected_toolset_names = list(
-                                route_decision
-                                .selected_toolset_names
-                            )
+                                route_decision.selected_toolset_names
+                            ) if route_decision is not None else []
 
                             # route_decision.tools已经在
                             # toolset_router.py中按tool.name去重。
                             selected_business_tools = list(
                                 route_decision.tools
-                            )
+                            ) if route_decision is not None else []
 
                             # 单用户项目不需要复杂LRU。
                             #
@@ -2024,10 +2019,86 @@ class ToolsetRouterMiddleware(
                                         for current_tool
                                         in selected_business_tools
                                     ),
+                                    routing_failed=route_decision is None,
+                                    fallback_reason=fallback_reason,
+                                    require_progress_checkpoint=(
+                                        require_progress_checkpoint
+                                        if route_decision is not None
+                                        else False
+                                    ),
                                 )
                             )
 
-                    if fallback_reason is None:
+                    expansion_requests = list(
+                        request_state.get("capability_expansion_requests", []) or []
+                    )
+                    current_cache = self._route_cache.get(conversation_key)
+                    if (
+                        fallback_reason is None
+                        and len(expansion_requests) == 1
+                        and current_cache is not None
+                        and not current_cache.capability_expansion_applied
+                        and not current_cache.capability_expansion_closed
+                    ):
+                        expansion_decision = await self.toolset_router.expand_with_model(
+                            self.selector_model,
+                            primary_task=routing_task,
+                            user_request_window=full_user_request,
+                            available_tools=business_tools,
+                            mounted_toolsets=selected_toolset_names,
+                            capability_request=expansion_requests[0],
+                        )
+                        if expansion_decision is None:
+                            selection_mode = "capability_expansion_no_match_closeout"
+                            fallback_reason = (
+                                "完整能力目录没有形成合法补选；停止执行并依据已有证据收尾"
+                            )
+                            self._route_cache[conversation_key] = replace(
+                                current_cache,
+                                capability_expansion_closed=True,
+                                fallback_reason=fallback_reason,
+                            )
+                            selected_tools = [
+                                current_tool
+                                for current_tool in always_visible_tools
+                                if _read_tool_name(current_tool) in NO_ACCESS_CONTROL_TOOL_NAMES
+                            ]
+                        else:
+                            selection_mode = "capability_expansion_full_catalog"
+                            existing_names = {
+                                _read_tool_name(item) for item in selected_business_tools
+                            }
+                            for item in expansion_decision.tools:
+                                if _read_tool_name(item) not in existing_names:
+                                    selected_business_tools.append(item)
+                                    existing_names.add(_read_tool_name(item))
+                            for name in expansion_decision.selected_toolset_names:
+                                if name not in selected_toolset_names:
+                                    selected_toolset_names.append(name)
+                            updated = replace(
+                                current_cache,
+                                selected_toolset_names=tuple(selected_toolset_names),
+                                selected_tool_names=tuple(
+                                    _read_tool_name(item) for item in selected_business_tools
+                                ),
+                                capability_expansion_applied=True,
+                            )
+                            self._route_cache[conversation_key] = updated
+
+                    if (
+                        len(expansion_requests) >= 2
+                        or (
+                            current_cache is not None
+                            and current_cache.capability_expansion_closed
+                        )
+                    ):
+                        selection_mode = "capability_expansion_forced_closeout"
+                        selected_tools = [
+                            current_tool
+                            for current_tool in always_visible_tools
+                            if _read_tool_name(current_tool) in NO_ACCESS_CONTROL_TOOL_NAMES
+                        ]
+                    elif fallback_reason is None:
                         selected_tools = list(
                             selected_business_tools
                         )
@@ -2090,12 +2161,8 @@ class ToolsetRouterMiddleware(
                             selected_tools
                         ),
 
-                        "tools.show_all_toolsets_visible": (
-                            show_all_toolsets_tool
-                            is not None
-
-                            and SHOW_ALL_TOOLSETS_NAME
-                            in final_visible_tool_names
+                        "toolset.require_progress_checkpoint": (
+                            require_progress_checkpoint
                         ),
                     },
                 )
@@ -2128,6 +2195,8 @@ class ToolsetRouterMiddleware(
                             selected_toolset_names
                         ),
 
+                        "required_skill_toolsets": required_skill_toolsets,
+
                         "selected_business_tool_names": [
                             _read_tool_name(
                                 current_tool
@@ -2136,21 +2205,16 @@ class ToolsetRouterMiddleware(
                             for current_tool
                             in selected_business_tools
                         ],
-
-                        "show_all_toolsets_always_visible": (
-                            show_all_toolsets_tool
-                            is not None
-
-                            and SHOW_ALL_TOOLSETS_NAME
-                            in final_visible_tool_names
-                        ),
-
                         "final_visible_tool_names": (
                             final_visible_tool_names
                         ),
 
                         "visibility_stage": (
                             "post_route_pre_tool_gates"
+                        ),
+
+                        "require_progress_checkpoint": (
+                            require_progress_checkpoint
                         ),
                     },
                 )
@@ -2190,6 +2254,10 @@ class ToolsetRouterMiddleware(
                     "tools.visible_count": len(
                         selected_tools
                     ),
+
+                    "toolset.require_progress_checkpoint": (
+                        require_progress_checkpoint
+                    ),
                 },
             )
 
@@ -2197,9 +2265,13 @@ class ToolsetRouterMiddleware(
             #
             # LangChain生成的ChatModel Span
             # 会成为当前model_call节点的子节点。
-            model_response = await handler(
-                selected_request
-            )
+            # Provider callbacks do not consistently expose the bound tool schemas in
+            # invocation_params.  Carry the exact post-route list in async-local state
+            # so the LLM span can show what the model really saw.
+            with visible_model_tools_scope(selected_tools):
+                model_response = await handler(
+                    selected_request
+                )
 
             set_span_output(
                 model_call_span,
@@ -2227,6 +2299,10 @@ class ToolsetRouterMiddleware(
 
                     "final_visible_tool_names": (
                         final_visible_tool_names
+                    ),
+
+                    "require_progress_checkpoint": (
+                        require_progress_checkpoint
                     ),
 
                     "model_response_type": (

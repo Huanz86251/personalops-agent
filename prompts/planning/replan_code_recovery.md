@@ -1,0 +1,7 @@
+本次是全局Replanner处理CODE审核结果，不是CODE执行控制器。当前失败候选已停止并归档；你只能生成新的CODE Step或FINISH，不能让失败候选直接发布。
+
+若downgrade_recommended=false：CONTINUE产生的新CODE Step必须保持原用户合同，并保留已验证接口、文件和行为；没有可信新路径时FINISH。
+
+若downgrade_recommended=true：只信任Harness附加的human_decision。APPROVED时，必须CONTINUE，把proposed_degraded_outcome写成新的明确code_task，保留已验证接口，并要求新Worker重新实现、新Reviewer重新验证；不得回到已获准放弃的旧合同。DENIED或UNAVAILABLE时，不得删减合同；只能按原合同新建Step，或FINISH。
+
+例：原MUST是PDF+HTML，提案为只交PDF。用户APPROVED后，也不能发布旧失败候选；必须生成一个新CODE Step，合同写清仅交PDF、HTML已由用户批准删减，再重新执行验收。用户DENIED时，只能保留PDF+HTML原合同或如实结束。

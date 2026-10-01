@@ -58,13 +58,13 @@ from .group import (
 )
 from .wake_policy import LeadershipWakePolicy
 from .submission import (
-    SUBMIT_FOR_REVIEW_NAME,
+    COMPLETE_WEB_STEP_NAME,
     ResolvedToolEvidence,
     WorkerCriterionClaim,
     WorkerSubmission,
     WorkerSubmissionRecord,
     resolve_tool_evidence,
-    submit_for_review,
+    complete_web_step,
 )
 from .progress import (
     PUBLISH_WORKER_PROGRESS_NAME,
@@ -158,7 +158,7 @@ __all__ = [
     "ACTIVE_ATTEMPT_STATUSES",
     "COMPLETION_TERMINAL_STATUSES",
     "PUBLISH_WORKER_PROGRESS_NAME",
-    "SUBMIT_FOR_REVIEW_NAME",
+    "COMPLETE_WEB_STEP_NAME",
     "CodeCandidateRef",
     "CODE_REVIEWER_NAME",
     "CODE_WORKER_NAME",
@@ -269,7 +269,7 @@ __all__ = [
     "respond_to_code_review",
     "submit_continued_code_for_review",
     "start_worker_attempt",
-    "submit_for_review",
+    "complete_web_step",
     "submit_code_for_review",
     "submit_code_review",
     "apply_scheduler_code_decision",

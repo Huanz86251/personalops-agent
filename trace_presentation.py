@@ -5,11 +5,58 @@ from datetime import datetime
 from time import perf_counter
 from threading import RLock
 from uuid import uuid4
+import re
 
 PARENT = ContextVar("trace_timing_parent", default=None)
 
 def run_name(purpose):
     return f"{purpose} · {datetime.now().astimezone():%m-%d %H:%M:%S} · {uuid4().hex[:4]}"
+
+
+_TRACE_SECRET_PATTERNS = (
+    re.compile(
+        r"(?i)\b(api[_ -]?key|token|secret|password|authorization)\b\s*[:=]\s*[^\s,;。]+"
+    ),
+    re.compile(r"(?i)\bbearer\s+[a-z0-9._~+/=-]+"),
+    re.compile(r"\b(?:sk|ak)-[A-Za-z0-9_-]{12,}\b"),
+)
+_WINDOWS_ABSOLUTE_PATH = re.compile(r"(?i)\b[A-Z]:[\\/][^\s\"'<>|]+")
+
+
+def trace_title(text: str, *, max_chars: int = 40) -> str:
+    """Return a short, privacy-safe title derived without another model call."""
+
+    normalized = " ".join(str(text or "").split())
+    for pattern in _TRACE_SECRET_PATTERNS:
+        normalized = pattern.sub("[已隐藏凭证]", normalized)
+    normalized = _WINDOWS_ABSOLUTE_PATH.sub("[已隐藏路径]", normalized)
+    normalized = re.sub(r"\b(?:ou|oc)_[A-Za-z0-9_-]{12,}\b", "[已隐藏账号]", normalized)
+    normalized = normalized.strip(" ·-|") or "未命名任务"
+    if len(normalized) <= max_chars:
+        return normalized
+    return normalized[: max_chars - 1].rstrip() + "…"
+
+
+def conversation_trace_name(
+    query: str,
+    *,
+    status: str | None = None,
+    resumed: bool = False,
+) -> str:
+    """Name only the root conversation trace; child spans keep role names."""
+
+    title = trace_title(query)
+    if status is None:
+        prefix = "续跑" if resumed else "任务"
+        return f"{prefix} · {title}"
+    normalized_status = str(status or "").strip().upper()
+    if normalized_status == "COMPLETED":
+        icon = "✅"
+    elif normalized_status in {"PARTIAL", "BLOCKED", "PAUSED", "INTERRUPTED"}:
+        icon = "⚠️"
+    else:
+        icon = "❌"
+    return f"{icon} {title}"
 
 def role_badge(name):
     for role, badge in (("Code Reviewer", "🔍"), ("Code Worker", "🛠️"), ("Code Agent", "🧩"),

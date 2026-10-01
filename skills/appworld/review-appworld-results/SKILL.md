@@ -9,7 +9,7 @@ metadata:
 
 # AppWorld 操作结果审核
 
-你只看到审核契约和已登记材料，不继承 Worker 的临时变量；本角色不能运行 AppWorld Python 或修改业务数据。read_review_material 读取的是登记证据，不是再次查询现场。只使用当前工具表中的工具。
+你只看到审核契约和已登记材料，不继承 Worker 的临时变量；本角色不能运行 AppWorld Python 或修改业务数据。read_review_materials 批量读取的是登记证据，不是再次查询现场。只使用当前工具表中的工具。
 
 ## 1. 先固定验收表，再读记录
 
@@ -44,7 +44,7 @@ metadata:
 **只补缺失证据。** 现在缺的是正文核对，不是接口文档；不重新登录或修改笔记。
 ```python
 # 读取本轮目录明确对应E3的材料；不是重新执行AppWorld查询。
-read_review_material(reference="M3", offset=0)
+read_review_materials(requests=[{"reference":"M3","offset":0}])
 ```
 **读取返回。** 该登记材料包含修改前后正文与回读标题，足以确认标题符合要求、正文一致，next_offset为null。C1得到支持；C2仍未尝试。读取旧记录不能代替调用完成接口，Reviewer不能自行补业务操作。
 

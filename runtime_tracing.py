@@ -10,12 +10,14 @@ from observability import trace_span, set_span_output, set_span_attributes
 TRACE_IDS = ContextVar("personalops_trace_ids", default={})
 ROLE_NAMES = {
     "skill_selector": "Skill Selector",
+    "capability_selector": "Capability Selector",
+    "host_file_judge": "Host File Judge",
     "scope_resolver": "Scope Resolver",
     "scheduler": "Scheduler", "code_scheduler": "Scheduler / Code Recovery",
     "replanner": "Scheduler / Replan", "final_reviewer": "Scheduler / Final Review",
     "worker_leader": "Scheduler / Worker Leader", "general": "General Agent",
     "web": "Web Agent", "code": "Code Worker", "reviewer": "Code Reviewer", "code_reviewer": "Code Reviewer",
-    "reporter": "General Reviewer", "web_reporter": "Web Reporter",
+    "reporter": "General Reviewer",
     "extraction": "Memory Extractor", "title": "Conversation Title",
     "summary": "Conversation Summary", "general_summary": "General Summary",
     "web_summary": "Web Summary", "code_summary": "Code Worker Summary",
