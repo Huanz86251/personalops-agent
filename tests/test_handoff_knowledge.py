@@ -15,18 +15,21 @@ from planning_models import StepReport
 
 
 def item(**updates):
-    return dict(topic="note lookup", source="simple_note.show_note",
+    value = dict(topic="note lookup", source="simple_note.show_note",
                 usage="show_note(note_id=target_id, access_token=token)\nObtain both from real queries/login.",
                 observed_result="Documented object with title/content; not executed yet.",
-                next_action="Read the actual note before modifying it.", **updates)
+                next_action="Read the actual note before modifying it.")
+    value.update(updates)
+    return value
 
 
 @pytest.mark.parametrize("tool", [report_general_result, complete_web_step, submit_code_for_review, submit_code_review])
 def test_all_submission_schemas_explain_fresh_agent(tool):
     schema = json.dumps(convert_to_openai_tool(tool))
-    for text in ("handoff_apis", "documentation", "parameters", "call_example", "next_action"):
+    for text in ("handoff_knowledge", "evidence_refs", "usage", "observed_result", "next_action"):
         assert text in schema
-    assert '"handoff_knowledge"' not in schema
+    assert '"handoff_apis"' not in schema
+    assert '"evidence_check"' not in schema
 
 
 def test_accepted_knowledge_survives_report_serialization_and_corrects_prior_item():
@@ -135,173 +138,147 @@ def test_skill_examples_parse_and_wrong_call_is_not_executable():
     assert "apis.simple_note.show_note" in calls
 
 
-def test_next_step_receives_one_compact_direct_api_handoff():
-    from planning_graph import _build_step_instruction
-    from planning_models import PlanStep, PlanningContextPack
-    from test_planning_handoff_publication import planning_settings
-    api = {
-        "name": "service.update",
-        "purpose": "update record",
-        "documentation": {"tool_call_id": "doc", "pointer": "/name"},
-        "parameters": [
-            {
-                "name": "record_id",
-                "required": True,
-                "purpose": "target",
-                "source": {"tool_call_id": "query", "pointer": "/id"},
-            }
-        ],
-        "call_example": "service.update(record_id=record_id)",
-        "next_action": "apply then verify",
-    }
-    report = StepReport(
-        step_id=1,
-        status="COMPLETED",
-        summary="done",
-        stop_reason="done",
-        handoff_apis=[api],
-    )
-    state = {
-        "context": PlanningContextPack(current_time="now", user_request="Continue task"),
-        "plan_objective": "Continue task",
-        "completed_step_reports": [report],
-    }
-    prompt = _build_step_instruction(
-        state,
-        PlanStep(step_id=2, worker_kind="GENERAL", objective="Continue", success_criteria=["done"]),
-        1,
-        model_limit=4,
-        tool_limit=4,
-        planning=planning_settings(),
-    )
-    assert "前序Worker直接交接" in prompt
-    assert '"validated_apis"' in prompt
-    assert "service.update(record_id=record_id)" in prompt
-    prior_reports = prompt.split("此前StepReport：", 1)[1]
-    assert "handoff_apis" not in prior_reports
-    assert "handoff_knowledge" not in prior_reports
 
 
-def test_latest_direct_handoff_ignores_legacy_budget_and_keeps_whole_entries():
-    from handoff_knowledge import compact_direct_handoff
-    api = {
-        "name": "service.update",
-        "purpose": "x" * 500,
-        "documentation": {"tool_call_id": "doc", "pointer": ""},
-        "parameters": [],
-        "call_example": "service.update()",
-    }
-    report = StepReport(
-        step_id=1,
-        status="COMPLETED",
-        summary="done",
-        stop_reason="done",
-        handoff_apis=[api],
-    )
-    payload = compact_direct_handoff([report], max_chars=120)
-    assert len(payload["validated_apis"] ) == 1
-    assert payload["validated_apis"][0]["purpose"] == "x" * 500
-    assert "omitted_entries" not in payload
-    assert len(json.dumps(payload, ensure_ascii=False, separators=(",", ":"))) > 120
+def evidence_state(content="brand;price\nA;100", status="success", tool="read_file"):
+    from langchain_core.messages import AIMessage, ToolMessage
+    return {"step_id":"1", "worker_id":"worker-1", "worker_evidence_refs":{"raw-call":"E1"},
+            "messages":[AIMessage(content="",tool_calls=[{"id":"raw-call","name":tool,"args":{"path":"prices.csv"}}]),
+                        ToolMessage(content=content,tool_call_id="raw-call",name=tool,status=status)]}
 
 
-def test_next_step_sees_rejected_api_lead_and_validation_reason():
-    from api_handoff import ApiHandoffReceipt
-    from handoff_knowledge import compact_direct_handoff
-    api = {
-        "name": "service.update",
-        "purpose": "update record",
-        "documentation": {"tool_call_id": "doc", "pointer": ""},
-        "parameters": [],
-        "call_example": "service.update()",
-    }
-    report = StepReport(
-        step_id=1,
-        status="PARTIAL",
-        summary="handoff validation failed",
-        stop_reason="needs correction",
-        handoff_api_receipts=[
-            ApiHandoffReceipt(
-                api=api,
-                validation_status="REJECTED",
-                validation_error="documentation source call missing",
-            )
-        ],
-    )
-    payload = compact_direct_handoff([report])
-    assert payload["validated_apis"] == []
-    assert payload["rejected_api_leads"][0]["name"] == "service.update"
-    assert "missing" in payload["rejected_api_leads"][0]["validation_error"]
+def test_knowledge_resolves_real_sources_and_keeps_partial_claims_without_repair():
+    from handoff_knowledge import check_handoff_knowledge, compact_direct_handoff
+    raw=item(evidence_refs=["E1","E99","E1"])
+    checked=check_handoff_knowledge([raw],evidence_state())[0]
+    assert checked.evidence_check == "PARTIAL"
+    assert checked.evidence_refs == ["raw-call"]
+    assert checked.unresolved_evidence_refs == ["E99"]
+    assert checked.usage == raw["usage"]
+    assert checked.resolved_evidence[0]["result"] == "brand;price\nA;100"
+    assert checked.resolved_evidence[0]["arguments"] == {"path":"prices.csv"}
+    assert checked.resolved_evidence[0]["origin_step"] == "1"
+    # Accepted record survives a trace with all messages removed.
+    trace={"worker_submission":{"submission":{"handoff_knowledge":[checked.model_dump(mode="json")]}}}
+    restored=collect_handoff_knowledge([trace])[0]
+    assert restored == checked
+    report=StepReport(step_id=1,status="PARTIAL",summary="partial",stop_reason="missing",handoff_knowledge=[restored])
+    restored_report=StepReport.model_validate_json(report.model_dump_json())
+    note=compact_direct_handoff([restored_report])["worker_notes"][0]
+    assert note["evidence_check"] == "PARTIAL"
+    assert note["unresolved_evidence_refs"] == ["E99"]
+    assert note["evidence_sources"][0]["tool_call_id"] == "raw-call"
+    assert "brand;price" not in json.dumps(note)  # Raw body stays in the durable record.
 
 
-def test_failed_review_is_directly_visible_without_api_handoff():
-    from handoff_knowledge import compact_direct_handoff
-    report = StepReport(
-        step_id=3,
-        status="FAILED",
-        summary="verification did not pass",
-        stop_reason="reviewer found missing read-back",
-        unresolved_items=["write succeeded but final state was not verified"],
-        errors=["verification call returned an error"],
-    )
-    payload = compact_direct_handoff([report])
-    assert payload["review_failures"][0]["step_id"] == 3
-    assert payload["review_failures"][0]["status"] == "FAILED"
-    assert "read-back" in payload["review_failures"][0]["stop_reason"]
+@pytest.mark.parametrize("state", [evidence_state(content=""),
+    {"messages":[]}, evidence_state(tool="submit_code_review")])
+def test_unusable_refs_preserve_knowledge_as_unsupported(state):
+    from handoff_knowledge import check_handoff_knowledge
+    checked=check_handoff_knowledge([item(evidence_refs=["E1"])],state)[0]
+    assert checked.evidence_check == "UNSUPPORTED"
+    assert checked.resolved_evidence == []
+    assert checked.unresolved_evidence_refs == ["E1"]
+    assert checked.usage == item()["usage"]
 
 
-
-def _rejected_receipt(name, *, next_action=""):
-    from api_handoff import ApiHandoffReceipt
-    return ApiHandoffReceipt(
-        api={
-            "name": name,
-            "purpose": f"use {name}",
-            "documentation": {"tool_call_id": f"doc-{name}", "pointer": ""},
-            "parameters": [],
-            "call_example": f"{name}()",
-            "next_action": next_action,
-        },
-        validation_status="REJECTED",
-        validation_error="documentation source call missing",
-    )
+def test_failed_results_are_real_evidence_but_not_success_proof():
+    from handoff_knowledge import check_handoff_knowledge
+    checked=check_handoff_knowledge([item(evidence_refs=["E1"])],evidence_state(content="permission denied",status="error"))[0]
+    assert checked.evidence_check == "RESOLVED"
+    assert checked.resolved_evidence[0]["result_status"] == "error"
+    assert checked.resolved_evidence[0]["result"] == "permission denied"
 
 
-def test_direct_handoff_keeps_latest_failure_before_old_rejected_leads():
-    from handoff_knowledge import compact_direct_handoff
+def test_harness_fields_cannot_be_forged_by_submission():
+    from handoff_knowledge import check_handoff_knowledge
+    forged=item(evidence_refs=["E99"],evidence_check="RESOLVED",
+                resolved_evidence=[{"tool_call_id":"fake","result":"success"}])
+    checked=check_handoff_knowledge([forged],evidence_state())[0]
+    assert checked.evidence_check == "UNSUPPORTED"
+    assert checked.resolved_evidence == []
 
-    old = StepReport(
-        step_id=1,
-        status="PARTIAL",
-        summary="old",
-        stop_reason="old read failed",
-        handoff_api_receipts=[
-            _rejected_receipt(f"service.read_{index}")
-            for index in range(5)
-        ],
-    )
-    latest = StepReport(
-        step_id=2,
-        status="FAILED",
-        summary="latest",
-        stop_reason="write still needs to run",
-        unresolved_items=["create the missing records"],
-        handoff_api_receipts=[
-            _rejected_receipt(
-                "service.create_record",
-                next_action="Create the missing records, then verify.",
-            )
-        ],
-    )
-    payload = compact_direct_handoff([old, latest], max_chars=900)
 
+def test_knowledge_refs_do_not_fail_whole_report_reference_adapter():
+    from workers.evidence_refs import canonical_arguments
+    raw={"evidence_refs":["E1"],"handoff_knowledge":[item(evidence_refs=["E1","bad"])]}
+    adapted=canonical_arguments(raw,{"raw-call":"E1"},eligible={"raw-call"})
+    assert adapted["evidence_tool_call_ids"] == ["raw-call"]
+    assert adapted["handoff_knowledge"][0]["evidence_refs"] == ["E1","bad"]
+
+
+def test_general_submission_checks_knowledge_before_saving():
+    from types import SimpleNamespace
+    from workers.general_completion import GeneralResult
+    state=evidence_state()
+    runtime=SimpleNamespace(state=state,tool_call_id="report",stream_writer=lambda _:None)
+    value=GeneralResult(summary="read file",handoff_knowledge=[item(evidence_refs=["E1","bad"])])
+    command=report_general_result.func(value,runtime)
+    saved=command.update["worker_submission"]["submission"]["handoff_knowledge"][0]
+    assert saved["evidence_check"] == "PARTIAL"
+    assert saved["resolved_evidence"][0]["result"] == "brand;price\nA;100"
+    assert command.update["general_result"]["handoff_knowledge"][0] == saved
+
+
+def test_web_submission_checks_knowledge_and_preserves_it_in_step_report():
+    from types import SimpleNamespace
+    from workers.submission import WorkerSubmission
+    state=evidence_state()
+    runtime=SimpleNamespace(state=state,tool_call_id="report",stream_writer=lambda _:None)
+    command=complete_web_step.func(WorkerSubmission(summary="read",final_conclusion="read",handoff_knowledge=[item(evidence_refs=["E1","bad"])]),runtime)
+    saved=command.update["worker_submission"]["submission"]["handoff_knowledge"][0]
+    assert saved["evidence_check"] == "PARTIAL"
+    assert command.update["web_step_report"]["report"]["handoff_knowledge"][0] == saved
+
+
+def test_latest_knowledge_survives_small_budget_with_original_text():
+    from handoff_knowledge import check_handoff_knowledge, compact_direct_handoff
+    newest=check_handoff_knowledge([item(usage="x"*5500,evidence_refs=["E1"])],evidence_state())[0]
+    old=StepReport(step_id=1,status="COMPLETED",summary="old",stop_reason="done",handoff_knowledge=[item()])
+    latest=StepReport(step_id=2,status="FAILED",summary="failed",stop_reason="not done",handoff_knowledge=[newest])
+    payload=compact_direct_handoff([old,latest],max_chars=500)
+    assert payload["worker_notes"][0]["usage"] == "x"*5500
     assert payload["review_failures"][0]["step_id"] == 2
-    assert any(
-        item["name"] == "service.create_record"
-        for item in payload["rejected_api_leads"]
-    )
-    assert payload["omitted_entries"] >= 1
-    assert next(
-        item for item in payload["rejected_api_leads"]
-        if item["name"] == "service.create_record"
-    )["next_action"] == "Create the missing records, then verify."
+    assert "validated_apis" not in payload
+    assert "rejected_api_leads" not in payload
+
+
+def test_code_submission_saves_resolved_knowledge_even_with_invalid_reference():
+    from workers.code_submission import _build_submission_record
+    from workers.code_review_models import CodeCandidateRef, CodeWorkerSubmission
+    from planning_models import PlanStep
+    candidate=CodeCandidateRef(event_id="event",step_id=1,attempt_id="attempt",workspace_id="workspace",candidate_revision=1)
+    step=PlanStep(step_id=1,objective="read",worker_kind="CODE",success_criteria=["read"])
+    contract=step.code_task
+    state={**evidence_state(),"code_candidate":candidate.model_dump(),"code_task":contract.model_dump()}
+    submission=CodeWorkerSubmission(candidate=candidate,summary="read",requirement_status={r.requirement_id:"MET" for r in contract.requirements},handoff_knowledge=[item(evidence_refs=["E1","bad"])])
+    record=_build_submission_record(state,submission)
+    saved=record.submission.handoff_knowledge[0]
+    assert saved.evidence_check == "PARTIAL"
+    assert saved.resolved_evidence[0]["result"] == "brand;price\nA;100"
+    assert collect_handoff_knowledge([{"code_worker_submission":record.model_dump(mode="json")}])[0] == saved
+
+
+def test_specific_web_result_can_be_cited_without_copying_entire_search():
+    from handoff_knowledge import check_handoff_knowledge
+    from test_evidence_refs import web_history
+    checked=check_handoff_knowledge([item(evidence_refs=["WA1"])],{"messages":web_history()})[0]
+    assert checked.evidence_check == "RESOLVED"
+    assert "Observed listing" in checked.resolved_evidence[0]["result"]
+    assert checked.resolved_evidence[0]["tool_name"] == "web_search"
+
+
+def test_all_invalid_refs_survive_report_collection_with_error_details():
+    from handoff_knowledge import check_handoff_knowledge
+    checked=check_handoff_knowledge([item(evidence_refs=["E99"])],evidence_state())[0]
+    restored=collect_handoff_knowledge([{"general_result":{"handoff_knowledge":[checked.model_dump(mode="json")]}}])[0]
+    assert restored.unresolved_evidence_refs == ["E99"]
+    assert "E99" in restored.evidence_errors
+
+
+def test_existing_archived_messages_can_support_knowledge_after_compaction():
+    from handoff_knowledge import check_handoff_knowledge
+    state=evidence_state()
+    state["worker_archived_messages"]=state.pop("messages")
+    checked=check_handoff_knowledge([item(evidence_refs=["E1"])],state)[0]
+    assert checked.evidence_check == "RESOLVED"

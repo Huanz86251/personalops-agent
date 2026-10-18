@@ -113,14 +113,15 @@ PLANNING_INTEGER_OPTIONS: dict[
         3,
     ),
 
-    # Hard节点保留的最近原始对话。
+    # Hard节点固定保留的完整用户/最终回复轮次（不按相关性筛选）。
     "hard_recent_dialogue_turns": (
         "PLANNING_HARD_RECENT_DIALOGUE_TURNS",
-        5,
+        3,
         1,
         20,
     ),
 
+    # Legacy: kept for configuration compatibility; user-visible history is not clipped.
     "hard_recent_dialogue_max_chars": (
         "PLANNING_HARD_RECENT_DIALOGUE_MAX_CHARS",
         6000,
@@ -129,6 +130,13 @@ PLANNING_INTEGER_OPTIONS: dict[
     ),
 
     # 较早Conversation的Rolling Summary配置。
+    "conversation_summary_trigger_tokens": (
+        "PLANNING_CONVERSATION_SUMMARY_TRIGGER_TOKENS",
+        10000,
+        1,
+        1000000,
+    ),
+    # Legacy environment keys remain loadable, but do not drive dialogue compaction.
     "conversation_summary_trigger_turns": (
         "PLANNING_CONVERSATION_SUMMARY_TRIGGER_TURNS",
         10,
@@ -174,7 +182,7 @@ PLANNING_INTEGER_OPTIONS: dict[
 WEB_SEARCH_HARD_MAX_PARALLELISM = 3
 PLAYWRIGHT_HARD_MAX_SESSIONS = 3
 CODE_HARD_MAX_WRITERS = 1
-CODE_REVIEW_DEFAULT_REPAIR_ROUNDS = 2
+CODE_REVIEW_DEFAULT_REPAIR_ROUNDS = 3
 CODE_REVIEW_HARD_MAX_REPAIR_ROUNDS = 3
 WORKER_PROGRESS_MIN_TOOL_CALLS = 2
 WORKER_PROGRESS_DEFAULT_TOOL_CALLS = 4
@@ -377,6 +385,9 @@ class PlanningSettings:
     executor_summary_trigger_messages: int
     executor_summary_keep_messages: int
 
+    scheduler_compaction_enabled: bool = False
+    conversation_compaction_enabled: bool = False
+    conversation_summary_trigger_tokens: int = 10000
     scheduler_summary_trigger_tokens: int = 20000
     max_final_worker_repair_rounds: int = 3
 
@@ -410,6 +421,7 @@ class WorkerRuntimeSettings:
     code_inactivity_timeout_seconds: int
     workspace_retention_minutes: int
     review_evidence_mode: str
+    plan_objection_enabled: bool = True
 
 
 @dataclass(
@@ -593,7 +605,7 @@ class Settings:
     scheduler_thinking_enabled: bool = True
     llm_thinking_enabled: bool = False
     summary_llm_provider: str = "qwen"
-    summary_llm_model: str = "qwen3.7-flash"
+    summary_llm_model: str = "qwen3.8-flash"
     extraction_llm_provider: str = "qwen"
     extraction_llm_model: str = "qwen3.7-flash"
 
@@ -646,6 +658,34 @@ def _read_bool_environment(
     if raw_value not in {"true", "false"}:
         raise RuntimeError(f"{name}只支持true或false。")
     return raw_value == "true"
+
+
+@dataclass(frozen=True)
+class WorkerCompactionSettings:
+    enabled: bool = False
+    trigger_tokens: int = 10000
+    keep_messages: int = 2
+    keep_tokens: int = 4000
+    max_chars: int = 6000
+    target_tokens: int = 20000
+    summary_ratio: float = 0.16
+    protected_ratio_limit: float = 0.70
+    safety_tokens: int = 512
+
+
+def load_worker_compaction_settings() -> WorkerCompactionSettings:
+    """Worker执行材料压缩配置，独立于Scheduler和跨轮对话摘要。"""
+    return WorkerCompactionSettings(
+        enabled=_read_bool_environment("WORKER_COMPACTION_ENABLED", default=False),
+        trigger_tokens=_read_int_environment("WORKER_SUMMARY_TRIGGER_TOKENS", default=10000, minimum=1, maximum=10000000),
+        keep_messages=_read_int_environment("WORKER_SUMMARY_KEEP_MESSAGES", default=2, minimum=1, maximum=100000),
+        keep_tokens=_read_int_environment("WORKER_SUMMARY_KEEP_TOKENS", default=4000, minimum=1, maximum=10000000),
+        max_chars=_read_int_environment("WORKER_SUMMARY_MAX_CHARS", default=6000, minimum=1, maximum=10000000),
+        target_tokens=_read_int_environment("WORKER_COMPACTION_TARGET_TOKENS", default=20000, minimum=1, maximum=10000000),
+        summary_ratio=_read_float_environment("WORKER_COMPACTION_SUMMARY_RATIO", default=0.16, minimum=0.001, maximum=1),
+        protected_ratio_limit=_read_float_environment("WORKER_COMPACTION_PROTECTED_RATIO_LIMIT", default=0.70, minimum=0.001, maximum=1),
+        safety_tokens=_read_int_environment("WORKER_COMPACTION_SAFETY_TOKENS", default=512, minimum=0, maximum=10000000),
+    )
 
 
 def _read_float_environment(
@@ -708,7 +748,9 @@ def _load_planning_settings(
     }
 
     planning = PlanningSettings(
-        **values
+        **values,
+        scheduler_compaction_enabled=_read_bool_environment("SCHEDULER_COMPACTION_ENABLED", default=False),
+        conversation_compaction_enabled=_read_bool_environment("CONVERSATION_COMPACTION_ENABLED", default=False),
     )
 
     if (
@@ -835,6 +877,7 @@ def _load_worker_runtime_settings(
     return WorkerRuntimeSettings(
         **values,
         review_evidence_mode=review_evidence_mode,
+        plan_objection_enabled=_read_bool_environment("RUNTIME_WORKER_PLAN_OBJECTION_ENABLED", default=True),
     )
 
 
@@ -1166,7 +1209,7 @@ def load_settings() -> Settings:
             "qwen3.8-flash",
         ).strip(),
         summary_llm_provider=os.getenv("SUMMARY_LLM_PROVIDER", "qwen").strip().lower(),
-        summary_llm_model=os.getenv("SUMMARY_LLM_MODEL", "qwen3.7-flash").strip(),
+        summary_llm_model=os.getenv("SUMMARY_LLM_MODEL", "qwen3.8-flash").strip(),
         extraction_llm_provider=os.getenv("EXTRACTION_LLM_PROVIDER", "qwen").strip().lower(),
         extraction_llm_model=os.getenv("EXTRACTION_LLM_MODEL", "qwen3.7-flash").strip(),
         scheduler_thinking_enabled=_read_bool_environment("SCHEDULER_THINKING_ENABLED", default=True),

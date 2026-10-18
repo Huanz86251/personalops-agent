@@ -12,7 +12,7 @@ ROLE_DEFAULTS = {
     "skill_selector": "regular", "capability_selector": "regular", "host_file_judge": "regular",
     "general": "regular", "web": "regular", "code": "hard",
     "code_reviewer": "hard", "reporter": "regular",
-    "scope_resolver": "hard", "scheduler": "hard", "code_scheduler": "hard", "replanner": "hard",
+    "scope_resolver": "hard", "scheduler": "hard", "replanner": "hard",
     "final_reviewer": "hard", "worker_leader": "hard", "title": "regular",
     "summary": "summary", "general_summary": "summary", "web_summary": "summary",
     "code_summary": "summary", "code_reviewer_summary": "summary",

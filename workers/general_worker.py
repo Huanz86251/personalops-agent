@@ -18,6 +18,7 @@ from config import (
 )
 from workers.compaction import WorkerCompactionMiddleware
 from workers.file_access import TaskFileAccessMiddleware
+from workers.plan_objection import objection_tools, WorkerObjectionMiddleware
 from knowledge_rag.runtime import with_knowledge_tool
 from prompt_loader import load_prompt
 from skill_runtime.middleware import RoleSkillsMiddleware
@@ -148,6 +149,7 @@ def create_general_worker(
     if any(
         _tool_name(current_tool)
         in {
+            "raise_plan_objection",
             PUBLISH_WORKER_PROGRESS_NAME,
             COMPLETE_WEB_STEP_NAME,
             GENERAL_REPORT_NAME,
@@ -183,6 +185,7 @@ def create_general_worker(
     graph = create_agent(
         model=model,
         tools=[
+            *objection_tools(),
             *business_tools,
             ask_user,
             request_additional_capabilities,
@@ -190,11 +193,11 @@ def create_general_worker(
         ],
         system_prompt=load_prompt("workers/general_worker"),
         middleware=[
+            WorkerObjectionMiddleware(),
             *policies,
             KnowledgeMiddleware('General Agent'),
             ExecutionHistoryMiddleware(),
             ExecutionStateMiddleware(),
-            WorkerCompactionMiddleware(summary_model if summary_model is not None else model),
             RoleSkillsMiddleware(model, "general", [*DEEP_AGENT_FILE_TOOLS, ASK_USER_NAME, *(_tool_name(t) for t in business_tools)],
                                  policies=middleware or (), backend=resolved_backend),
             WorkerRuntimeContextMiddleware(execution_reserve=1),
@@ -202,6 +205,7 @@ def create_general_worker(
             filesystem,
             completion,
             EvidenceReferenceMiddleware(),
+            WorkerCompactionMiddleware(summary_model if summary_model is not None else model, request_aware=True),
         ],
         state_schema=WorkerProgressState,
         checkpointer=checkpointer,

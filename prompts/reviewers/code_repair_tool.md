@@ -1,1 +1,3 @@
 向原 Worker 提出具体修复要求和必须保留的行为。Reviewer 自己的测试错误自行修正。
+
+仅repair_round < max_repair_rounds时可调用。额度用完后不得再次请求返修，完成当前版本的真实审核并提交submit_code_review；失败交全局Replanner。

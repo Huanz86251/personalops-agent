@@ -66,7 +66,7 @@ class RoleConfigurationTests(unittest.TestCase):
         with patch.dict(os.environ, {"DASHSCOPE_API_KEY": "offline-key",
                                     "DASHSCOPE_BASE_URL": "https://qwen.invalid/v1"}, clear=True):
             settings.role_models = load_role_models(settings)
-        strong = {"scope_resolver", "code", "code_reviewer", "scheduler", "code_scheduler", "replanner", "final_reviewer", "worker_leader"}
+        strong = {"scope_resolver", "code", "code_reviewer", "scheduler", "replanner", "final_reviewer", "worker_leader"}
         requests = []
         def handler(request):
             requests.append(json.loads(request.content))

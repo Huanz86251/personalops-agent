@@ -21,119 +21,37 @@ from retrieval_models import RerankResult
 
 
 class PromptContextContractTests(unittest.IsolatedAsyncioTestCase):
-    async def test_latest_pair_is_exact_and_only_high_relevance_older_pairs_return(self):
-        unrelated = "上周讨论晚餐菜单。"
-        related = "海报必须保留影院地址，并导出 PNG。"
-        low_score = "顺便提过一次天气。"
-        latest_user = "修改上一条：取消导出 PDF，保留其他要求。" + "精确原文" * 20
-        latest_assistant = "收到修改，下一步会保留 PNG。"
-        retrieval_models = SimpleNamespace(
-            arerank=AsyncMock(return_value=[
-                RerankResult(index=1, text=related + "\n相关回复", score=0.91),
-                RerankResult(index=0, text=unrelated + "\n无关回复", score=0.12),
-                RerankResult(index=2, text=low_score + "\n普通回复", score=0.64),
-            ])
-        )
-        runtime = SimpleNamespace(
-            settings=SimpleNamespace(planning=SimpleNamespace(
-                hard_recent_dialogue_turns=1,
-                hard_recent_dialogue_max_chars=220,
-                conversation_summary_trigger_turns=1,
-                conversation_summary_max_chars=40,
-            )),
-            toolset_catalog=[],
-            toolset_router=None,
-            retrieval_models=retrieval_models,
-            _build_config=lambda thread_id: {"configurable": {"thread_id": thread_id}},
-        )
-        agent = SimpleNamespace(aupdate_state=AsyncMock())
-        model = SimpleNamespace(ainvoke=AsyncMock(return_value=AIMessage(content="历史进展")))
-        state = {"messages": [
-            HumanMessage(content=unrelated), AIMessage(content="无关回复"),
-            HumanMessage(content=related), AIMessage(content="相关回复"),
-            HumanMessage(content=low_score), AIMessage(content="普通回复"),
-            HumanMessage(content=latest_user), AIMessage(content=latest_assistant),
-        ]}
-        context = await ConversationRuntime._prepare_planning_context(
-            runtime, agent=agent, hard_model=model,
-            conversation=SimpleNamespace(thread_id="offline-test"),
-            state_values=state, user_request="继续执行", memory_context="旧偏好",
-        )
-        self.assertEqual(context.user_request, "继续执行")
-        self.assertEqual(context.user_instruction_history, [unrelated, related, low_score, latest_user])
-        self.assertEqual(context.conversation_summary, "")
+    async def test_pending_and_latest_pairs_are_exact_without_history_reranking(self):
+        from tests.test_conversation_compaction import ConversationCompactionTests, messages
+        harness = ConversationCompactionTests()
+        runtime = harness.runtime(keep=3)
+        original = messages(6)
+        context, agent = await harness.prepare(runtime, {"messages": original})
+        self.assertEqual([m.content for m in context.recent_dialogue], [m.content for m in original])
+        self.assertEqual(context.user_instruction_history, [])
+        self.assertEqual(context.previous_run_summary, "")
         restored = PlanningContextPack.model_validate_json(context.model_dump_json())
         rendered = _format_hard_context(restored)
-        self.assertIn(related, rendered)
-        # Earlier user instructions stay exact; irrelevant assistant replies do not.
-        self.assertIn(unrelated, rendered)
-        self.assertNotIn("无关回复", rendered)
-        self.assertNotIn("普通回复", rendered)
-        self.assertIn(latest_user, rendered)
-        self.assertIn(latest_assistant, rendered)
-        self.assertLess(rendered.index(related), rendered.index(latest_user))
-        retrieval_models.arerank.assert_awaited_once()
-        rerank_call = retrieval_models.arerank.await_args.kwargs
-        self.assertEqual(rerank_call["query"], "继续执行")
-        self.assertEqual(rerank_call["top_k"], 3)
-        self.assertEqual(len(rerank_call["documents"]), 3)
-        self.assertIn(unrelated, rerank_call["documents"][0])
-        self.assertIn(related, rerank_call["documents"][1])
-        self.assertIn(low_score, rerank_call["documents"][2])
+        for message in original:
+            self.assertIn(message.content, rendered)
+        runtime.retrieval_models.arerank.assert_not_awaited()
         agent.aupdate_state.assert_not_awaited()
-        model.ainvoke.assert_not_awaited()
 
-    async def test_feishu_older_turns_are_summarized_once_without_rewriting_current_request(self):
-        messages = []
-        for index in range(6):
-            messages.extend([
-                HumanMessage(content=f"历史用户原话 {index}"),
-                AIMessage(content=f"历史任务结果 {index}"),
-            ])
-        summary_model = SimpleNamespace(
-            ainvoke=AsyncMock(return_value=AIMessage(content="较早两轮的已确认进展"))
-        )
-        runtime = SimpleNamespace(
-            settings=SimpleNamespace(planning=SimpleNamespace(
-                hard_recent_dialogue_max_chars=4000,
-                conversation_summary_trigger_turns=2,
-                conversation_summary_max_chars=1000,
-            )),
-            summary_model=summary_model,
-            toolset_catalog=[],
-            toolset_router=None,
-            retrieval_models=None,
-            _build_config=lambda thread_id: {"configurable": {"thread_id": thread_id}},
-        )
-        agent = SimpleNamespace(aupdate_state=AsyncMock())
-        original_request = "请继续处理本轮文件，保留这句原始命令。"
-        context = await ConversationRuntime._prepare_planning_context(
-            runtime, agent=agent, hard_model=SimpleNamespace(),
-            conversation=SimpleNamespace(thread_id="feishu-conversation"),
-            state_values={"messages": messages, "previous_run_summary": "上一轮内部审核未通过"}, user_request=original_request,
-            memory_context="",
-        )
-        self.assertEqual(context.user_request, original_request)
-        self.assertEqual(context.conversation_summary, "较早两轮的已确认进展")
-        self.assertEqual(context.previous_run_summary, "上一轮内部审核未通过")
-        self.assertEqual(context.recent_dialogue[-2].content, "历史用户原话 5")
-        self.assertEqual(context.recent_dialogue[-1].content, "历史任务结果 5")
-        self.assertIn("历史用户原话 0", _format_hard_context(context))
-        self.assertNotIn("历史任务结果 0", _format_hard_context(context))
-        self.assertIn(original_request, _format_hard_context(context))
-        self.assertEqual(summary_model.ainvoke.await_count, 1)
-        self.assertNotIn("历史用户原话 0", summary_model.ainvoke.call_args.args[0][1]["content"])
+    async def test_feishu_json_summary_is_reused_and_internal_summary_is_ignored(self):
+        from unittest.mock import patch
+        from tests.test_conversation_compaction import ConversationCompactionTests, messages
+        harness = ConversationCompactionTests()
+        runtime = harness.runtime(keep=3)
+        state = {"messages": messages(6), "previous_run_summary": "内部审核记录"}
+        with patch("conversation_runtime.dialogue_token_estimate", return_value=10000):
+            context, agent = await harness.prepare(runtime, state)
         saved = agent.aupdate_state.await_args.args[1]
-        self.assertEqual(saved["conversation_summary_message_count"], 2)
-
-        resumed = await ConversationRuntime._prepare_planning_context(
-            runtime, agent=agent, hard_model=SimpleNamespace(),
-            conversation=SimpleNamespace(thread_id="feishu-conversation"),
-            state_values={"messages": messages, **saved},
-            user_request=original_request, memory_context="",
-        )
+        self.assertEqual(saved["conversation_summary_turn_count"], 3)
+        self.assertEqual(context.previous_run_summary, "")
+        self.assertNotIn("内部审核记录", _format_hard_context(context))
+        resumed, _ = await harness.prepare(runtime, {**state, **saved})
         self.assertEqual(resumed.conversation_summary, context.conversation_summary)
-        self.assertEqual(summary_model.ainvoke.await_count, 1)
+        self.assertEqual(runtime.summary_model.ainvoke.await_count, 1)
 
     def test_previous_run_summary_is_separate_and_raw_trace_is_not_replayed(self):
         material = _planning_run_handoff_material({
@@ -416,7 +334,7 @@ class PromptContextContractTests(unittest.IsolatedAsyncioTestCase):
 
     def test_shared_rules_are_in_actual_fixed_role_prompts(self):
         self.assertIn("默认用中文", load_prompt("planning/scheduler"))
-        for role in ("supervisor", "replanner", "final_reviewer", "code_controller"):
+        for role in ("supervisor", "replanner", "final_reviewer", "worker_objection"):
             fixed, _ = split_prompt(load_prompt("planning/" + role))
             self.assertNotIn("你是", fixed)
             self.assertNotIn("历史用户原文", fixed)

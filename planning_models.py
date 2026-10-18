@@ -8,7 +8,6 @@ from typing import (
 from pathlib import PurePosixPath, PureWindowsPath
 
 from pydantic.json_schema import SkipJsonSchema
-from api_handoff import ApiHandoffList, ApiHandoffReceipt, api_field
 from handoff_knowledge import HandoffKnowledge, knowledge_field
 from pydantic import (
     BaseModel,
@@ -34,11 +33,7 @@ from schema_normalization import (
 SupervisorAction = Literal["PLAN"]
 
 
-ReplanAction = Literal[
-    "CONTINUE",
-    "RETURN_TO_WORKER",
-    "FINISH",
-]
+ReplanAction = Literal["CONTINUE", "FINISH"]
 
 
 FinalReviewAction = Literal[
@@ -245,19 +240,19 @@ class PlanningContextPack(
     scope_router: dict[str, Any] | None = None
     scope_contract: "ScopeContract | None" = None
 
-    # 较早Conversation的滚动摘要。
+    # 较早用户可见对话的滚动 JSON 摘要（Harness附带覆盖轮数）。
     conversation_summary: str = ""
 
     # 上一轮内部规划/执行/审核的有界摘要；不是用户原话或最终答复。
     previous_run_summary: str = ""
 
-    # 历史用户原始命令保持原文；较早助手答复与内部运行记录分开摘要。
+    # 兼容旧调用方；新Conversation链路不重复注入历史用户消息。
     user_instruction_history: list[str] = Field(default_factory=list)
 
     # Persisted Scheduler message stream; never an LLM-generated field.
     scheduler_session: dict[str, Any] = Field(default_factory=dict)
 
-    # 最近若干轮用户与最终助手原文。
+    # 所有尚未摘要的原文，包括固定保留的最近若干轮。
     recent_dialogue: list[
         DialogueMessage
     ] = Field(
@@ -476,13 +471,6 @@ class CodeTaskContract(
     )
 
     validation_expectations: list[
-        ConciseReportItem
-    ] = Field(
-        default_factory=list,
-        max_length=20,
-    )
-
-    implementation_guidance: list[
         ConciseReportItem
     ] = Field(
         default_factory=list,
@@ -935,9 +923,9 @@ class PlanStep(
     success_criteria: list[
         ReportItem
     ] = Field(
-        min_length=1,
+        default_factory=list,
         max_length=24,
-        description="最多24条可核验条件，每条最多2000字符；保留对象范围及原要求。",
+        description="CODE必须填[]，验收要求仅写code_task.requirements；WEB/GENERAL必须填写1到24条可核验条件，每条最多2000字符。",
     )
 
     tool_access: ToolAccessMode = Field(
@@ -949,6 +937,37 @@ class PlanStep(
             "省略、空值或无法识别时Harness按ENABLED处理。"
         ),
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_code_acceptance(cls, value: Any) -> Any:
+        """Keep CODE requirements authoritative; migrate legacy criteria only if absent."""
+        if not isinstance(value, dict) or value.get("worker_kind") != "CODE":
+            return value
+        normalized = dict(value)
+        criteria = coerce_text_sequence(normalized.get("success_criteria", []))
+        contract = normalized.get("code_task")
+        if isinstance(contract, CodeTaskContract):
+            has_requirements = bool(contract.requirements)
+        else:
+            contract = _normalize_optional_value(contract)
+            has_requirements = isinstance(contract, dict) and bool(contract.get("requirements"))
+        if not has_requirements and criteria and (contract is None or isinstance(contract, dict)):
+            contract = dict(contract or {})
+            contract["requirements"] = [
+                {"requirement_id": f"criterion_{index}", "priority": "MUST", "statement": text}
+                for index, text in enumerate(criteria, 1)
+            ]
+            normalized["code_task"] = contract
+        normalized["success_criteria"] = []
+        return normalized
+
+    @property
+    def acceptance_criteria(self) -> list[str]:
+        """Runtime view derived from the single CODE contract, never another stored list."""
+        if self.worker_kind == "CODE" and self.code_task is not None:
+            return [item.statement for item in self.code_task.requirements if item.priority == "MUST"]
+        return list(self.success_criteria)
 
     @field_validator("tool_access", mode="before")
     @classmethod
@@ -1070,6 +1089,8 @@ class PlanStep(
     ) -> "PlanStep":
         """Keep single execution cheap and parallel execution intentional."""
 
+        if self.worker_kind != "CODE" and not self.success_criteria:
+            raise ValueError("WEB/GENERAL Step必须提供非空success_criteria。")
         if self.worker_kind == "CODE":
             if self.code_task is None:
                 raise ValueError(
@@ -1282,11 +1303,6 @@ class StepReport(
 ):
     """Role-specific Step closure report consumed by Scheduler and Final Reviewer."""
 
-    handoff_apis: ApiHandoffList = api_field()
-    handoff_api_receipts: SkipJsonSchema[list[ApiHandoffReceipt]] = Field(
-        default_factory=list,
-        description="Harness-authored per-API validation receipts, including rejected leads and reasons.",
-    )
     handoff_knowledge: SkipJsonSchema[list[HandoffKnowledge]] = Field(default_factory=list, description="Worker-authored reusable knowledge preserved by the Harness; not a separate verification verdict.")
     recovery_proposal: SkipJsonSchema[dict[str, Any] | None] = Field(
         default=None,
@@ -1356,6 +1372,7 @@ class StepReport(
     )
 
     assessment_source: Literal[
+        "SCHEDULER_CONTROL",
         "INDEPENDENT_REVIEW",
         "GENERAL_SELF_REPORT",
         "WEB_SELF_REPORT",
@@ -1529,19 +1546,11 @@ class ReplanDecision(
 
     action: ReplanAction = Field(
         description=(
-            "CONTINUE提交新的remaining_steps；RETURN_TO_WORKER仅驳回计划异议并填写"
-            "worker_instruction；FINISH停止继续安排。"
+            "CONTINUE提交新的remaining_steps；"
+            "FINISH停止继续安排。"
         ),
     )
 
-    worker_instruction: str | None = Field(
-        default=None,
-        max_length=5000,
-        description=(
-            "仅RETURN_TO_WORKER填写：说明为什么驳回本次计划异议，以及原Worker"
-            "继续执行时必须保留的范围边界。不猜API。"
-        ),
-    )
 
     remaining_steps: list[
         PlanStep
@@ -1556,7 +1565,7 @@ class ReplanDecision(
             "完全一致、带明确披露的降级Step；DENIED或UNAVAILABLE时"
             "必须维持原合同。原始未满足项仍保留到最终验收，不能以较弱近似结果"
             "冒充完全满足。"
-            "RETURN_TO_WORKER或FINISH时留空。"
+            "FINISH时留空。"
         ),
     )
 
@@ -1580,24 +1589,12 @@ class ReplanDecision(
                     "remaining_steps。"
                 )
 
-            if self.worker_instruction is not None:
-                raise ValueError("CONTINUE不能提供worker_instruction。")
-            return self
-
-        if self.action == "RETURN_TO_WORKER":
-            if self.remaining_steps:
-                raise ValueError("RETURN_TO_WORKER不能提供remaining_steps。")
-            if not self.worker_instruction:
-                raise ValueError("RETURN_TO_WORKER必须提供worker_instruction。")
             return self
 
         if self.remaining_steps:
             raise ValueError(
                 "FINISH不能提供remaining_steps。"
             )
-        if self.worker_instruction is not None:
-            raise ValueError("FINISH不能提供worker_instruction。")
-
         return self
 
 

@@ -33,7 +33,7 @@ class CodeFinalizationTests(unittest.TestCase):
         self.assertEqual(model.invocation_count, 1)
         self.assertEqual(
             model.bound_tool_names,
-            ["ask_user", "submit_code_for_review"],
+            ["raise_plan_objection", "ask_user", "submit_code_for_review"],
         )
         self.assertEqual(result["executor_model_calls_used"], 1)
         self.assertEqual(result["code_worker_submission"]["submission"]["requirement_status"], {"feature_works": "NOT_MET"})
@@ -61,7 +61,7 @@ class CodeFinalizationTests(unittest.TestCase):
     def test_control_selection_follows_current_instruction(self):
         self.assertEqual(terminal_tool({"code_review_loop": {"scheduler_epoch": 1}}), "submit_code_for_review")
         self.assertEqual(terminal_tool({"code_review_loop": {"pending_instruction": {"round_no": 1}}}), "respond_to_code_review")
-        self.assertEqual(terminal_tool({"code_review_loop": {"pending_scheduler_directive": {"scheduler_epoch": 2}}}), "submit_continued_code_for_review")
+
 
     def test_no_repeated_summary_and_no_business_calls_in_summary(self):
         gate = CodeWorkerBudgetMiddleware()

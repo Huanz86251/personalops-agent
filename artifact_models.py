@@ -19,6 +19,7 @@ WorkerArtifactKind = Literal[
 
 class DownloadedArtifactRecord(BaseModel):
     """Harness-authored facts for one bounded Web download."""
+    sandbox_path: str | None = None
 
     candidate_id: str = Field(min_length=1, max_length=120)
     source_url: str

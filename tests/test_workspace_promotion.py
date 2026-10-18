@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 import hashlib
+import inspect
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -113,7 +114,6 @@ class WorkspacePromotionServiceTests(unittest.IsolatedAsyncioTestCase):
         promotion = await service.prepare_from_run(
             layout=layout,
             conversation_id="conv-one",
-            final_status="COMPLETED",
         )
         self.assertIsNotNone(promotion)
         assert promotion is not None
@@ -143,7 +143,6 @@ class WorkspacePromotionServiceTests(unittest.IsolatedAsyncioTestCase):
         promotion = await service.prepare_from_run(
             layout=layout,
             conversation_id="conv-reject",
-            final_status="COMPLETED",
         )
         assert promotion is not None
         rejected = await service.reject(
@@ -160,7 +159,6 @@ class WorkspacePromotionServiceTests(unittest.IsolatedAsyncioTestCase):
         promotion = await service.prepare_from_run(
             layout=layout,
             conversation_id="conv-auto",
-            final_status="COMPLETED",
         )
         assert promotion is not None
         delivered = await service.apply_auto_policy(promotion)
@@ -173,12 +171,10 @@ class WorkspacePromotionServiceTests(unittest.IsolatedAsyncioTestCase):
         first = await service.prepare_from_run(
             layout=layout,
             conversation_id="conv-idempotent",
-            final_status="COMPLETED",
         )
         second = await service.prepare_from_run(
             layout=layout,
             conversation_id="conv-idempotent",
-            final_status="COMPLETED",
         )
         self.assertEqual(first, second)
 
@@ -188,7 +184,6 @@ class WorkspacePromotionServiceTests(unittest.IsolatedAsyncioTestCase):
         promotion = await service.prepare_from_run(
             layout=layout,
             conversation_id="conv-recovery",
-            final_status="COMPLETED",
         )
         assert promotion is not None
         approved = transition_workspace_promotion(
@@ -223,14 +218,51 @@ class WorkspacePromotionServiceTests(unittest.IsolatedAsyncioTestCase):
             "print('reviewed')\n",
         )
 
-    async def test_incomplete_final_review_creates_no_request(self) -> None:
-        layout = self.accepted_layout("evt-partial")
-        service = self.service(DeliveryApprovalMode.HUMAN)
+    async def test_all_final_outcomes_deliver_available_files(self) -> None:
+        # Runtime now passes only the run identity and conversation to delivery.
+        # The overall outcome is recorded elsewhere and cannot gate this service.
+        self.assertNotIn(
+            "final_status",
+            inspect.signature(WorkspacePromotionService.prepare_from_run).parameters,
+        )
+        service = self.service(DeliveryApprovalMode.AUTO)
+        for final_status in ("COMPLETED", "PARTIAL", "FAILED"):
+            with self.subTest(final_status=final_status):
+                run_id = f"evt-{final_status.lower()}"
+                layout = self.accepted_layout(run_id)
+                self.add_web_artifact(layout)
+                promotion = await service.prepare_from_run(
+                    layout=layout,
+                    conversation_id=f"conv-{final_status.lower()}",
+                )
+                self.assertIsNotNone(promotion)
+                assert promotion is not None
+                delivered = await service.apply_auto_policy(promotion)
+                self.assertEqual(delivered.status, PromotionStatus.DELIVERED)
+                target = Path(delivered.target_root)
+                self.assertEqual(
+                    (target / "app.py").read_text(encoding="utf-8"),
+                    "print('reviewed')\n",
+                )
+                self.assertEqual(
+                    (target / "downloads" / "template.html").read_text(encoding="utf-8"),
+                    "<main>reviewed web artifact</main>",
+                )
+                self.assertEqual(
+                    await service.prepare_from_run(
+                        layout=layout, conversation_id=delivered.conversation_id,
+                    ),
+                    delivered,
+                )
+
+    async def test_no_available_deliverable_creates_no_request(self) -> None:
+        layout = initialize_run_workspace(
+            "evt-no-files", storage_root=self.root / "runs",
+            canonical_root=self.root / "legacy-workspace",
+        )
         self.assertIsNone(
-            await service.prepare_from_run(
-                layout=layout,
-                conversation_id="conv-partial",
-                final_status="PARTIAL",
+            await self.service(DeliveryApprovalMode.AUTO).prepare_from_run(
+                layout=layout, conversation_id="conv-no-files",
             )
         )
 
@@ -246,7 +278,6 @@ class WorkspacePromotionServiceTests(unittest.IsolatedAsyncioTestCase):
         promotion = await service.prepare_from_run(
             layout=layout,
             conversation_id="conv-web-only",
-            final_status="COMPLETED",
         )
         assert promotion is not None
         self.assertEqual(promotion.status, PromotionStatus.AWAITING_APPROVAL)
@@ -276,7 +307,6 @@ class WorkspacePromotionServiceTests(unittest.IsolatedAsyncioTestCase):
             await service.prepare_from_run(
                 layout=layout,
                 conversation_id="conv-web-internal",
-                final_status="COMPLETED",
             )
         )
 
@@ -288,7 +318,6 @@ class WorkspacePromotionServiceTests(unittest.IsolatedAsyncioTestCase):
         promotion = await service.prepare_from_run(
             layout=layout,
             conversation_id="conv-mixed-delivery",
-            final_status="COMPLETED",
         )
         assert promotion is not None
         self.assertEqual(

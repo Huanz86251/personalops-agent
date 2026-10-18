@@ -2,9 +2,6 @@
 def general_review_reasons(step, trace, packet, stop_reason=''):
     result=trace.get('general_result') or {}
     reasons=[]
-    submission = trace.get('worker_submission') or {}
-    if result.get('plan_challenge') or (submission.get('submission') or {}).get('plan_challenge'):
-        reasons.append('plan_challenge')
     if result.get('status')!='COMPLETED' or result.get('unresolved_items'):
         reasons.append('not_completed')
     schema_repair_only = trace.get('worker_finalize_reason') == 'SCHEMA_REPAIR'

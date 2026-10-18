@@ -15,7 +15,6 @@ from langchain.messages import ToolMessage
 from langchain.tools import ToolRuntime, tool
 from langgraph.types import Command
 from pydantic.json_schema import SkipJsonSchema
-from api_handoff import ApiHandoffList, api_field
 from handoff_knowledge import HandoffKnowledge, knowledge_field
 from pydantic import BaseModel, Field, field_validator, model_validator
 from prompt_loader import load_prompt
@@ -24,7 +23,6 @@ from artifact_models import (
     ResolvedArtifactCandidate,
     WorkerArtifactCandidate,
 )
-from workers.plan_challenge import PlanChallenge
 from workers.control_protocol import defer_terminal_call_if_mixed
 from schema_normalization import (
     ConciseReportItem,
@@ -51,6 +49,7 @@ CONTROL_TOOL_NAMES = frozenset(
         COMPLETE_WEB_STEP_NAME,
         "report_general_result",
         "request_additional_capabilities",
+        "raise_plan_objection",
     }
 )
 
@@ -115,16 +114,8 @@ class WorkerCriterionClaim(BaseModel):
 class WorkerSubmission(BaseModel):
     """The Web Worker's single terminal submission and Step closure."""
 
-    handoff_apis: ApiHandoffList = api_field()
-    handoff_knowledge: SkipJsonSchema[list[HandoffKnowledge]] = knowledge_field()
+    handoff_knowledge: list[HandoffKnowledge] = knowledge_field()
 
-    plan_challenge: PlanChallenge | None = Field(
-        default=None,
-        description=(
-            "仅当当前Step或范围关系与用户原话或真实只读事实发生实质冲突时填写；"
-            "提交后停止业务工具执行，Harness会直接生成StepReport并请求Scheduler重规划。"
-        ),
-    )
 
     summary: str = Field(
         min_length=1,
@@ -612,21 +603,6 @@ def complete_web_step(
         return deferred
 
     state = runtime.state
-    if submission.plan_challenge is not None and int(
-        state.get("worker_plan_challenges_remaining", 0) or 0
-    ) <= 0:
-        return Command(update={
-            "messages": [ToolMessage(
-                content=(
-                    "Plan challenge rejected by Harness: the global challenge budget is exhausted. "
-                    "Continue within the current Step when possible; otherwise submit the actual "
-                    "unresolved result with plan_challenge=null. No Reviewer or Scheduler was called."
-                ),
-                tool_call_id=runtime.tool_call_id or COMPLETE_WEB_STEP_NAME,
-                name=COMPLETE_WEB_STEP_NAME,
-                status="error",
-            )]
-        })
     requested_ids = [
         evidence_id
         for claim in submission.criterion_claims
@@ -637,8 +613,6 @@ def complete_web_step(
         for candidate in submission.artifact_candidates
         for evidence_id in candidate.evidence_tool_call_ids
     )
-    if submission.plan_challenge is not None:
-        requested_ids.extend(submission.plan_challenge.evidence_tool_call_ids)
     from reporting.criteria import (
         complete_missing_worker_claims,
         criterion_claim_repair_feedback,

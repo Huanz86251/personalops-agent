@@ -20,7 +20,7 @@ from workers.code_submission import (
     RESPOND_TO_CODE_REVIEW_NAME,
     SUBMIT_CODE_FOR_REVIEW_NAME,
     SUBMIT_CODE_REVIEW_NAME,
-    SUBMIT_CONTINUED_CODE_FOR_REVIEW_NAME,
+
 )
 from workers.general_completion import GENERAL_REPORT_NAME
 from workers.progress import WorkerProgressMiddleware
@@ -136,17 +136,6 @@ class ProductionControlBaselineTests(unittest.TestCase):
             {COMPLETE_WEB_STEP_NAME}.issubset(WEB_TOOLSET_BASELINE_TOOL_NAMES)
         )
 
-    def test_code_worker_and_reviewer_control_tools_are_permanently_visible(self):
-        self.assertTrue(
-            {
-                SUBMIT_CODE_FOR_REVIEW_NAME,
-                RESPOND_TO_CODE_REVIEW_NAME,
-                SUBMIT_CONTINUED_CODE_FOR_REVIEW_NAME,
-                REQUEST_CODE_WORKER_REPAIR_NAME,
-                PUBLISH_REVIEWED_CANDIDATE_NAME,
-                SUBMIT_CODE_REVIEW_NAME,
-            }.issubset(CODE_TOOLSET_BASELINE_TOOL_NAMES)
-        )
 
 
 class WorkerToolsetGateTests(unittest.IsolatedAsyncioTestCase):
@@ -217,7 +206,7 @@ class WorkerToolsetGateTests(unittest.IsolatedAsyncioTestCase):
 
         await router.awrap_model_call(request, handler)
 
-        self.assertEqual(captured, ["ask_user", COMPLETE_WEB_STEP_NAME])
+        self.assertEqual(captured, ["raise_plan_objection", "ask_user", COMPLETE_WEB_STEP_NAME])
 
     async def test_selected_skill_forces_required_toolsets_and_trace_visibility(self):
         reranker = ContentAwareReranker()

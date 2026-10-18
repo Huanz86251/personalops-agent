@@ -9,8 +9,6 @@ from workers.progress import WorkerProgressMiddleware
 
 def terminal_tool(state):
     loop = state.get("code_review_loop") or {}
-    if loop.get("pending_scheduler_directive"):
-        return "submit_continued_code_for_review"
     if loop.get("pending_instruction"):
         return "respond_to_code_review"
     return "submit_code_for_review"
@@ -49,7 +47,7 @@ class CodeWorkerBudgetMiddleware(DynamicExecutionBudgetMiddleware):
         if limit is None:
             return None
         used = sum(int(state.get(k, 0) or 0) for k in (
-            "executor_model_calls_used", "skill_preparation_calls_used", "worker_compaction_calls_used"))
+            "executor_model_calls_used", "skill_preparation_calls_used", "worker_compaction_calls_used", "worker_leadership_model_rounds_used"))
         if used >= limit:
             return {"jump_to": "end"}
         tool_limit = state.get("executor_tool_run_limit")
@@ -73,7 +71,7 @@ class CodeWorkerBudgetMiddleware(DynamicExecutionBudgetMiddleware):
         allowed = (
             ask_calls[:1]
             if ask_calls
-            else [c for c in calls if c.get("name") == self.terminal_name(state)][:1]
+            else [c for c in calls if c.get("name") in {self.terminal_name(state), "raise_plan_objection"}][:1]
         )
         # WorkerProgressMiddleware counts all finalization calls. Schema
         # repairs have their own reserve and must not consume business rounds.
@@ -110,7 +108,7 @@ class CodeWorkerProgressMiddleware(WorkerProgressMiddleware):
             name = self.terminal_name(request.state)
             tools = [
                 t for t in request.tools
-                if self._tool_name(t) in {name, ASK_USER_NAME}
+                if self._tool_name(t) in {name, ASK_USER_NAME, "raise_plan_objection"}
             ]
             if name not in {self._tool_name(tool) for tool in tools}:
                 raise RuntimeError(f"Code finalization requires {name}")
@@ -147,6 +145,15 @@ class CodeReviewerBudgetMiddleware(CodeWorkerBudgetMiddleware):
 
 
 class CodeReviewerProgressMiddleware(CodeWorkerProgressMiddleware):
+    def _require_control_request(self, request):
+        loop = request.state.get("code_review_loop") or {}
+        if int(loop.get("repair_round", 0)) >= int(loop.get("max_repair_rounds", 3)):
+            request = request.override(tools=[
+                tool for tool in request.tools
+                if self._tool_name(tool) != "request_code_worker_repair"
+            ])
+        return super()._require_control_request(request)
+
     def _progress_is_due(self, state):
         return False
 

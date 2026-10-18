@@ -365,7 +365,7 @@ def _curated_span_name(name: str) -> str:
         "main_agent.run": "General Agent",
         "hard_replanner": "Scheduler / Replan Decision",
         "hard_final_reviewer": "Scheduler / Final Decision",
-        "hard_code_scheduler": "Scheduler / Code Recovery Decision",
+
         "hard_worker_leader": "Scheduler / Worker Guidance",
         "conversation_turn": "Conversation / Turn",
         "conversation_title_generation": "Conversation / Title",

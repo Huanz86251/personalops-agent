@@ -21,9 +21,9 @@ SOURCE_FIELD = "source_refs"
 MODEL_REF = "MODEL"
 WEB_RESULT_REF_PATTERN = re.compile(r"^W[A-Z]+[1-9][0-9]*$")
 CONTROL_TOOLS = {
-    "report_general_result", "complete_web_step", "publish_worker_progress",
+    "report_general_result", "complete_web_step", "publish_worker_progress", "raise_plan_objection",
     "submit_code_for_review", "respond_to_code_review",
-    "submit_continued_code_for_review", "request_code_worker_repair",
+     "request_code_worker_repair",
     "publish_reviewed_candidate", "submit_code_review",
 }
 APPWORLD_DISCOVER = "appworld_discover"

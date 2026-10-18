@@ -8,6 +8,5 @@
   ],
   "interfaces": [{"interface_id": "cli", "kind": "CLI", "description": "Offline CSV filter", "details": {"script": "/workspace/filter_report.py", "arguments": ["--input", "--config", "--output"], "config_format": "JSON file", "input_format": "UTF-8 CSV"}}],
   "validation_expectations": ["Derive independent cases from the four requirements; exercise the real CLI and reopen the output.", "Exercise equality and zero, Unicode/quoted fields, invalid configs and failure preservation. Separate collection/import errors from behavioral failures."],
-  "implementation_guidance": ["Use the standard library; no network or package installation. Candidate is under /workspace; reviewer tests and output under /review or temporary fixtures."],
-  "non_goals": ["No UI, email, network, real user files, or performance benchmark."]
+  "non_goals": ["No UI, email, network, real user files, or performance benchmark.", "No package installation; use the standard library. Candidate is under /workspace; reviewer tests and output under /review or temporary fixtures."]
 }

@@ -61,7 +61,6 @@ class CodeRuntimeContextMiddleware(AgentMiddleware[CodeAgentState]):
             return None
         raw_loop = state.get("code_review_loop")
         loop_context = raw_loop
-        role_guidance = None
         current_repair_instruction = state.get("code_repair_instruction")
         if raw_loop:
             loop = CodeReviewLoopState.model_validate(raw_loop)
@@ -71,31 +70,8 @@ class CodeRuntimeContextMiddleware(AgentMiddleware[CodeAgentState]):
                 else None
             )
             loop_context = loop.model_dump(mode="json")
-            loop_context.pop("pending_scheduler_directive", None)
-            loop_context.pop("scheduler_continuations", None)
             for key in ("exchanges", "worker_checkpoint_id", "reviewer_checkpoint_id", "candidate", "pending_instruction"):
                 loop_context.pop(key, None)
-            directive = loop.pending_scheduler_directive
-            response = None
-            if directive is None and loop.scheduler_continuations:
-                latest = loop.scheduler_continuations[-1]
-                if latest.directive.scheduler_epoch == loop.scheduler_epoch:
-                    directive = latest.directive
-                    response = latest.submission
-            if directive is not None:
-                role_guidance = {
-                    "scheduler_epoch": directive.scheduler_epoch,
-                    "reason": directive.reason,
-                    "instruction": (
-                        directive.worker_instruction
-                        if self.role == "WORKER"
-                        else directive.reviewer_instruction
-                    ),
-                }
-                if self.role == "REVIEWER" and response is not None:
-                    role_guidance["worker_submission"] = response.model_dump(
-                        mode="json"
-                    )
         blocks = [
             _json_block("代码任务", state.get("code_task")),
             _json_block(
@@ -104,7 +80,6 @@ class CodeRuntimeContextMiddleware(AgentMiddleware[CodeAgentState]):
             ),
             _json_block("当前候选", state.get("code_candidate")),
             _json_block("审核进度", loop_context),
-            _json_block("继续执行要求", role_guidance),
             _json_block(
                 "返修要求",
                 current_repair_instruction,

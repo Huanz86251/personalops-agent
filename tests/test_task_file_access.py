@@ -257,7 +257,7 @@ class TaskFileAccessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(value, TASK_FILE_MAX_BYTES)
 
     def test_code_sandbox_receives_verified_registered_download_before_reading(self):
-        _record, virtual_path = self.register()
+        record, virtual_path = self.register()
 
         class Sandbox:
             def __init__(self):
@@ -276,6 +276,10 @@ class TaskFileAccessTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         sandbox = Sandbox()
+        from task_file_imports import materialize_import
+        record = materialize_import(record, sandbox)
+        self.state["worker_downloaded_artifacts"] = [record.model_dump(mode="json")]
+        self.assertEqual(len(sandbox.uploaded), 1)
         middleware = TaskFileAccessMiddleware(sandbox=sandbox)
         request = SimpleNamespace(
             tool_call={
@@ -294,3 +298,61 @@ class TaskFileAccessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(uploaded_payload, b"task-local text")
         self.assertIn(uploaded_path, sandbox.commands[0])
         self.assertNotIn(str(self.root), sandbox.commands[0])
+
+    async def test_host_import_can_execute_without_read_and_copy_failure_is_explicit(self):
+        import subprocess
+        import sys
+        from host_file_access import HOST_FILE_ACCESS, HostFilePolicy, configure_host_file_policy
+        from tools.host_file_tools import host_import_file
+
+        class LocalSandbox:
+            def __init__(inner, root, fail=False):
+                inner.root, inner.fail, inner.uploaded = root, fail, []
+
+            def upload_files(inner, files):
+                if inner.fail:
+                    return [SimpleNamespace(path=files[0][0], error="permission_denied")]
+                for path, payload in files:
+                    destination = inner.root / path.lstrip("/")
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_bytes(payload)
+                    inner.uploaded.append(path)
+                return [SimpleNamespace(path=p, error=None) for p, _ in files]
+
+            def execute(inner, command):
+                assert command.startswith("python ")
+                path = inner.root / command.removeprefix("python ").lstrip("/")
+                return subprocess.run([sys.executable, str(path)], capture_output=True, text=True, timeout=10)
+
+        source = self.root / "run_me.py"
+        source.write_text("print('imported-script-ran')\n", encoding="utf-8")
+        original_policy = HOST_FILE_ACCESS.policy
+        try:
+            configure_host_file_policy(HostFilePolicy((self.root,)))
+            for import_root in ("/workspace/.private-downloads", "/review/.private-downloads"):
+                sandbox = LocalSandbox(self.root / ("worker" if import_root.startswith("/workspace") else "reviewer"))
+                middleware = TaskFileAccessMiddleware(sandbox=sandbox, import_root=import_root)
+                runtime = SimpleNamespace(state=self.state, tool_call_id="import-run")
+                request = SimpleNamespace(tool=host_import_file, state=self.state, runtime=runtime,
+                    tool_call={"id": "import-run", "name": "host_import_file", "args": {"path": str(source), "reason": "Run the user script."}})
+
+                async def handler(req):
+                    return await host_import_file.coroutine(runtime=runtime, **req.tool_call["args"])
+
+                result = await middleware.awrap_tool_call(request, handler)
+                reply = json.loads(result.update["messages"][0].content)
+                assert reply["status"] == "IMPORTED"
+                assert reply["execution_path"].startswith(import_root)
+                executed = sandbox.execute("python " + reply["execution_path"])
+                assert executed.returncode == 0
+                assert executed.stdout.strip() == "imported-script-ran"
+                assert len(sandbox.uploaded) == 1
+
+            failure = TaskFileAccessMiddleware(sandbox=LocalSandbox(self.root / "broken", fail=True))
+            result = await failure.awrap_tool_call(request, handler)
+            assert "worker_downloaded_artifacts" not in result.update
+            reply = json.loads(result.update["messages"][0].content)
+            assert reply["status"] == "IMPORT_FAILED"
+            assert "permission_denied" in reply["message"]
+        finally:
+            configure_host_file_policy(original_policy)

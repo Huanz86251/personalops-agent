@@ -156,12 +156,8 @@ def compile_web_step_report(
     if notes:
         errors.append("Harness Web report normalization: " + "; ".join(notes))
 
-    request_replan = bool(
-        submission.request_replan or submission.plan_challenge is not None
-    )
+    request_replan = bool(submission.request_replan)
     replan_reason = submission.replan_reason
-    if replan_reason is None and submission.plan_challenge is not None:
-        replan_reason = submission.plan_challenge.reason
 
     if submission.stop_reason:
         stop_reason = submission.stop_reason
@@ -191,6 +187,7 @@ def compile_web_step_report(
         criterion_results=criterion_results,
         confirmed_results=confirmed_results,
         assessment_source="WEB_SELF_REPORT",
+        handoff_knowledge=submission.handoff_knowledge,
         completed_work=_unique(submission.completed_work),
         evidence=report_evidence,
         source_links=[

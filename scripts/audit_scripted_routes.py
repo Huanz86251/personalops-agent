@@ -23,7 +23,7 @@ if (OUT / "STARTED").exists():
 
 MODULES = ["test_planning_web_to_code_pipeline", "test_planning_code_execution",
            "test_code_agents", "test_code_review_models", "test_code_runtime",
-           "test_skill_preparation", "test_web_runtime"]
+           "test_skill_preparation", "test_web_runtime", "test_code_global_replan"]
 modules = [importlib.import_module(name) for name in MODULES]
 from trace_presentation import run_name
 project_name = run_name("Scripted Routes")
@@ -141,63 +141,23 @@ class ReplanRoutes(unittest.IsolatedAsyncioTestCase):
         await self._replan(True)
 
     async def _replan(self, continue_plan):
-        m = modules[1]
-        from tempfile import TemporaryDirectory
-        from planning_models import PlanningContextPack
-        class Model(m.ScriptedCodePlanningModel):
-            finals = 0
-            replans = 0
-            def with_structured_output(self, schema, **kwargs):
-                if schema.__name__ not in {"FinalReviewDecision", "ReplanDecision"}:
-                    return super().with_structured_output(schema, **kwargs)
-                async def run(messages):
-                    if schema.__name__ == "ReplanDecision":
-                        self.replans += 1
-                        payload = ({"action": "CONTINUE", "reason": "Try a narrower code contract.", "remaining_steps": [{
-                            "step_id": 2, "objective": "Publish a narrowly scoped app.py", "success_criteria": ["The file is published."],
-                            "worker_kind": "CODE", "execution_mode": "SINGLE", "code_task": {"requirements": [{"requirement_id": "publish_file", "statement": "Publish app.py."}], "validation_expectations": ["Focused check"]}}]}
-                            if continue_plan else {"action": "FINISH", "reason": "No safe remaining implementation within scope."})
-                    else:
-                        self.finals += 1
-                        payload = ({"action": "REPLAN", "replan_reason": "Code was stopped; assess a safe alternative."}
-                                   if self.finals == 1 else {"action": "FINAL", "status": "COMPLETED" if continue_plan else "FAILED",
-                                    "final_answer": "Narrower plan completed." if continue_plan else "Code stopped; no safe alternative.", "unmet_success_criteria": [] if continue_plan else ["File publication"]})
-                    result = {"parsed": schema.model_validate(payload), "raw": AIMessage(content=json.dumps(payload)), "parsing_error": None}
-                    observe(schema.__name__, messages, result, schema.model_json_schema())
-                    return result
-                return RunnableLambda(run)
-        with TemporaryDirectory() as temporary:
-            store = m.AsyncEventStore(Path(temporary) / "events.sqlite3")
-            await store.start()
-            try:
-                model = Model(code_action="STOP")
-                class Runtime(m.EscalateThenApplyCodeRuntime):
-                    async def ainvoke(self, input_state, config=None):
-                        if len(self.calls) >= 2 and "code_scheduler_decision" not in input_state:
-                            return await m.AppliedCodeRuntime().ainvoke(input_state, config=config)
-                        return await super().ainvoke(input_state, config=config)
-                runtime = Runtime(expected_action="STOP")
-                graph = m.build_planning_graph(simple_model=model, hard_model=model,
-                    worker_registry=m.WorkerAgentRegistry.with_code_worker(m.FailingGeneralRuntime(), runtime),
-                    worker_group_coordinator=m.WorkerGroupCoordinator(store), planning=m.planning_settings(), model_output_max_tokens=2048)
-                result = await graph.ainvoke({"context": PlanningContextPack(current_time="now", user_request="Implement app.py; if code stops, assess a safe alternative."),
-                    "event_id": "audit-replan", "conversation_thread_id": "audit-replan", "planning_run_id": "audit-replan"},
-                    config={"configurable": {"progress_callback": lambda event: m._ignore_progress(event)}})
-                (OUT / ("replan-continue-result.json" if continue_plan else "replan-result.json")).write_text(json.dumps(safe(result), ensure_ascii=False, indent=2), encoding="utf-8")
-                self.assertEqual(model.replans, 1)
-                self.assertEqual(model.finals, 2)
-                self.assertEqual(result["final_status"], "COMPLETED" if continue_plan else "FAILED")
-            finally:
-                await store.close()
+        m = modules[-1]
+        model = m.ReplanModel(finish=not continue_plan)
+        runtime = m.FailedThenAppliedRuntime()
+        result = await m.CodeGlobalReplanTests().run_graph(model, runtime)
+        (OUT / ("replan-continue-result.json" if continue_plan else "replan-result.json")).write_text(
+            json.dumps(safe(result), ensure_ascii=False, indent=2), encoding="utf-8")
+        self.assertEqual(result["replans_used"], 1)
+        self.assertEqual(len(runtime.inputs), 2 if continue_plan else 1)
 
 families = {
     "01_web_code": ["test_planning_web_to_code_pipeline", "test_planning_code_execution.PlanningCodeExecutionTests.test_applied_report_returns_to_scheduler_without_second_reporter"],
     "02_repair_disagreement": ["test_code_agents", "test_code_review_models"],
-    "03_continue": ["test_planning_code_execution.PlanningCodeExecutionTests.test_reviewer_escalation_runs_controller_then_continues_same_step", "test_code_runtime.CodeRuntimeTests.test_continue_reuses_frozen_pair_and_applies_revision"],
-    "04_restart": ["test_planning_code_execution.PlanningCodeExecutionTests.test_controller_restart_creates_a_new_planning_attempt", "test_code_runtime.CodeRuntimeTests.test_restart_supersedes_old_attempt_and_starts_fresh_pair"],
-    "05_stop": ["test_planning_code_execution.PlanningCodeExecutionTests.test_controller_stop_finalizes_without_generic_retry", "test_code_runtime.CodeRuntimeTests.test_stop_archives_and_releases_frozen_pair"],
+    "03_replan_new_step": ["test_code_global_replan.CodeGlobalReplanTests.test_failed_report_replans_to_fresh_step_without_controller"],
+    "04_local_repairs": ["test_code_global_replan.CodeGlobalReplanTests.test_three_failed_repairs_archive_before_replan", "test_code_global_replan.CodeGlobalReplanTests.test_last_repaired_candidate_can_still_pass"],
+    "05_finish": ["test_code_global_replan.CodeGlobalReplanTests.test_replanner_can_finish_without_new_worker", "test_code_global_replan.CodeGlobalReplanTests.test_no_replan_quota_goes_to_final_review"],
     "06_replan": [],
-    "07_skills_web_boundaries": ["test_skill_preparation", "test_web_runtime"],
+    "07_skills_web_boundaries": ["test_skill_preparation", "test_web_runtime", "test_code_global_replan"],
 }
 summary = {"paid_requests": 0, "usage": "unknown; synthetic responses do not report billable tokens", "families": []}
 class Result(unittest.TextTestResult):

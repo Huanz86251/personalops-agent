@@ -23,10 +23,10 @@ from workers import (
     CodeCheckResult,
     CodeChangedFile,
     CodeReviewReport,
-    SchedulerCodeDecision,
+
     WorkerAgentRegistry,
     WorkerGroupCoordinator,
-    apply_scheduler_code_decision,
+
     create_code_review_loop,
     finish_code_review,
     record_code_publication,
@@ -82,6 +82,7 @@ class ScriptedCodePlanningModel:
                             "objective": "Implement the requested file.",
                             "success_criteria": ["The file is published."],
                             "worker_kind": "CODE",
+                            "target_selection": {"target_entity": "file", "sets": [{"set_id": "A", "definition": "Requested app.py", "condition_owner": "file", "result_entity": "file"}], "operation": "DIRECT", "operands": ["A"]},
                             "execution_mode": "SINGLE",
                             "code_task": {
                                 "delivery_mode": "PATCH",
@@ -104,24 +105,6 @@ class ScriptedCodePlanningModel:
                 raise AssertionError(
                     "APPLIED CODE results must bypass generic Step Reporter"
                 )
-            elif schema.__name__ == "SchedulerCodeDecision":
-                self.code_control_calls += 1
-                payload = {
-                    "action": self.code_action,
-                    "reason": "Apply the bounded Scheduler recovery policy.",
-                }
-                if self.code_action == "CONTINUE":
-                    payload.update(
-                        {
-                            "worker_instruction": (
-                                "Repair only the focused behavior."
-                            ),
-                            "reviewer_instruction": (
-                                "Re-run the focused behavior check."
-                            ),
-                            "repair_rounds": 1,
-                        }
-                    )
             else:
                 payload = {
                     "action": "FINAL",
@@ -218,138 +201,6 @@ class AppliedCodeRuntime:
         }
 
 
-class EscalateThenApplyCodeRuntime:
-    def __init__(self, expected_action: str = "CONTINUE") -> None:
-        self.calls: list[dict] = []
-        self.loop = None
-        self.failed_report = None
-        self.expected_action = expected_action
-
-    async def ainvoke(self, input_state, config=None):
-        self.calls.append(
-            {
-                "input": dict(input_state),
-                "thread_id": config["configurable"]["thread_id"],
-            }
-        )
-        if len(self.calls) == 1:
-            thread_id = config["configurable"]["thread_id"]
-            candidate = CodeCandidateRef(
-                event_id=input_state["event_id"],
-                step_id=int(input_state["step_id"]),
-                attempt_id=thread_id,
-                workspace_id=input_state["worker_id"],
-                candidate_revision=1,
-            )
-            loop = create_code_review_loop(
-                candidate=candidate,
-                worker_checkpoint_id=f"{thread_id}:worker",
-                reviewer_checkpoint_id=f"{thread_id}:reviewer",
-            )
-            report = CodeReviewReport(
-                candidate=candidate,
-                verdict="FAILED",
-                summary="The focused behavior still needs repair.",
-                verification_summary="The focused check failed.",
-                check_results=(
-                    CodeCheckResult(
-                        check_id="behavior",
-                        description="Run the focused behavior check.",
-                        status="FAILED",
-                        summary="Observed the old behavior.",
-                    ),
-                ),
-                failed_test_summaries=("behavior: old behavior",),
-                recommended_action="CONTINUE",
-            )
-            self.loop = finish_code_review(loop, report)
-            self.failed_report = report
-            return {
-                "messages": [AIMessage(content=report.summary)],
-                "executor_model_calls_used": 2,
-                "executor_tool_calls_used": 2,
-                "code_review_loop": self.loop.model_dump(mode="json"),
-                "code_review_report": report.model_dump(mode="json"),
-                "code_runtime_session_id": "live-code-session",
-            }
-
-        decision = SchedulerCodeDecision.model_validate(
-            input_state["code_scheduler_decision"]
-        )
-        assert decision.action == self.expected_action
-        assert input_state["code_runtime_session_id"] == "live-code-session"
-        if decision.action == "STOP":
-            loop = apply_scheduler_code_decision(self.loop, decision)
-            return {
-                "messages": [AIMessage(content=self.failed_report.summary)],
-                "executor_model_calls_used": 0,
-                "executor_tool_calls_used": 0,
-                "code_review_loop": loop.model_dump(mode="json"),
-                "code_review_report": self.failed_report.model_dump(mode="json"),
-                "code_runtime_session_id": None,
-                "code_scheduler_decision_applied": decision.model_dump(
-                    mode="json"
-                ),
-            }
-
-        candidate = (
-            self.loop.candidate.model_copy(
-                update={"candidate_revision": 2}
-            )
-            if decision.action == "CONTINUE"
-            else CodeCandidateRef(
-                event_id=input_state["event_id"],
-                step_id=int(input_state["step_id"]),
-                attempt_id=config["configurable"]["thread_id"],
-                workspace_id=input_state["worker_id"],
-                candidate_revision=1,
-            )
-        )
-        loop = create_code_review_loop(
-            candidate=candidate,
-            worker_checkpoint_id=self.loop.worker_checkpoint_id,
-            reviewer_checkpoint_id=self.loop.reviewer_checkpoint_id,
-        )
-        loop = record_code_publication(loop, candidate=candidate)
-        report = CodeReviewReport(
-            candidate=candidate,
-            verdict="PASSED",
-            summary="Reviewer approved and published the repaired app.py.",
-            verification_summary="The focused behavior check now passes.",
-            verified_requirement_ids=("publish_file",),
-            check_results=(
-                CodeCheckResult(
-                    check_id="behavior",
-                    description="Run the focused behavior check.",
-                    status="PASSED",
-                    summary="Observed the repaired behavior.",
-                ),
-            ),
-            changed_files=(
-                CodeChangedFile(
-                    path="app.py",
-                    change_summary="Repaired the requested behavior.",
-                ),
-            ),
-            approved_artifact_paths=("app.py",),
-            published_artifact_paths=("app.py",),
-            delivery_location="D:/workspace",
-            publication_id="publication-continued",
-            applied_revision="sha256:continued",
-        )
-        loop = finish_code_review(loop, report)
-        return {
-            "messages": [AIMessage(content=report.summary)],
-            "executor_model_calls_used": 2,
-            "executor_tool_calls_used": 2,
-            "code_review_loop": loop.model_dump(mode="json"),
-            "code_review_report": report.model_dump(mode="json"),
-            "code_handoff_publication_receipts": [],
-            "code_runtime_session_id": None,
-            "code_scheduler_decision_applied": decision.model_dump(mode="json"),
-        }
-
-
 class PlanningCodeExecutionTests(unittest.IsolatedAsyncioTestCase):
     async def test_unhandled_code_failure_stops_without_generic_reporter(self):
         class BrokenCode:
@@ -359,7 +210,7 @@ class PlanningCodeExecutionTests(unittest.IsolatedAsyncioTestCase):
             schemas = []
             def with_structured_output(self, schema, **kwargs):
                 self.schemas.append(schema.__name__)
-                if schema.__name__ not in {"SupervisorDecision", "SkillChoice"}:
+                if schema.__name__ not in {"ScopeContract", "SupervisorDecision", "SkillChoice"}:
                     raise AssertionError("Unexpected post-failure model: " + schema.__name__)
                 return super().with_structured_output(schema, **kwargs)
         with TemporaryDirectory() as temporary:
@@ -436,192 +287,6 @@ class PlanningCodeExecutionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     result["current_step_trace"]["finish_reason"],
                     "CODE_APPLIED",
-                )
-            finally:
-                await store.close()
-
-    async def test_reviewer_escalation_runs_controller_then_continues_same_step(self):
-        with TemporaryDirectory() as temporary:
-            store = AsyncEventStore(Path(temporary) / "events.sqlite3")
-            await store.start()
-            try:
-                model = ScriptedCodePlanningModel()
-                code_runtime = EscalateThenApplyCodeRuntime()
-                controller = ScriptedCodePlanningModel()
-                graph = build_planning_graph(
-                    role_models={"code_scheduler": controller},
-                    simple_model=model,
-                    hard_model=model,
-                    worker_registry=WorkerAgentRegistry.with_code_worker(
-                        FailingGeneralRuntime(),
-                        code_runtime,
-                    ),
-                    worker_group_coordinator=WorkerGroupCoordinator(store),
-                    planning=planning_settings(),
-                    model_output_max_tokens=2048,
-                )
-
-                async def ignore_progress(event):
-                    return None
-
-                result = await graph.ainvoke(
-                    {
-                        "context": PlanningContextPack(
-                            current_time="now",
-                            user_request="Implement app.py and repair it if needed.",
-                        ),
-                        "event_id": "event-code-control",
-                        "conversation_thread_id": "conversation-code-control",
-                        "planning_run_id": "planning-code-control",
-                    },
-                    config={
-                        "configurable": {"progress_callback": ignore_progress}
-                    },
-                )
-
-                self.assertEqual(result["final_status"], "COMPLETED")
-                self.assertEqual(controller.code_control_calls, 1)
-                self.assertEqual(model.code_control_calls, 0)
-                self.assertEqual(model.step_report_calls, 0)
-                self.assertEqual(len(code_runtime.calls), 2)
-                self.assertEqual(
-                    code_runtime.calls[0]["thread_id"],
-                    code_runtime.calls[1]["thread_id"],
-                )
-                self.assertEqual(
-                    code_runtime.calls[1]["input"]["code_scheduler_decision"][
-                        "action"
-                    ],
-                    "CONTINUE",
-                )
-                self.assertEqual(
-                    code_runtime.calls[1]["input"]["code_runtime_session_id"],
-                    "live-code-session",
-                )
-                self.assertEqual(
-                    result["code_control_history"][0]["scheduler_decision"][
-                        "action"
-                    ],
-                    "CONTINUE",
-                )
-                self.assertEqual(
-                    result["current_step_trace"][
-                        "code_scheduler_decision_applied"
-                    ]["action"],
-                    "CONTINUE",
-                )
-                self.assertEqual(
-                    result["completed_step_reports"][0].status,
-                    "COMPLETED",
-                )
-            finally:
-                await store.close()
-
-    async def test_controller_restart_creates_a_new_planning_attempt(self):
-        with TemporaryDirectory() as temporary:
-            store = AsyncEventStore(Path(temporary) / "events.sqlite3")
-            await store.start()
-            try:
-                model = ScriptedCodePlanningModel(code_action="RESTART")
-                code_runtime = EscalateThenApplyCodeRuntime(
-                    expected_action="RESTART"
-                )
-                graph = build_planning_graph(
-                    simple_model=model,
-                    hard_model=model,
-                    worker_registry=WorkerAgentRegistry.with_code_worker(
-                        FailingGeneralRuntime(), code_runtime
-                    ),
-                    worker_group_coordinator=WorkerGroupCoordinator(store),
-                    planning=planning_settings(),
-                    model_output_max_tokens=2048,
-                )
-                result = await graph.ainvoke(
-                    {
-                        "context": PlanningContextPack(
-                            current_time="now",
-                            user_request="Implement app.py from a fresh direction.",
-                        ),
-                        "event_id": "event-code-restart",
-                        "conversation_thread_id": "conversation-code-restart",
-                        "planning_run_id": "planning-code-restart",
-                    },
-                    config={
-                        "configurable": {
-                            "progress_callback": lambda event: _ignore_progress(
-                                event
-                            )
-                        }
-                    },
-                )
-
-                self.assertEqual(result["final_status"], "COMPLETED")
-                self.assertEqual(model.code_control_calls, 1)
-                self.assertEqual(len(code_runtime.calls), 2)
-                self.assertNotEqual(
-                    code_runtime.calls[0]["thread_id"],
-                    code_runtime.calls[1]["thread_id"],
-                )
-                self.assertEqual(result["current_step_attempt"], 2)
-                self.assertEqual(
-                    result["code_control_history"][0]["scheduler_decision"][
-                        "action"
-                    ],
-                    "RESTART",
-                )
-            finally:
-                await store.close()
-
-    async def test_controller_stop_finalizes_without_generic_retry(self):
-        with TemporaryDirectory() as temporary:
-            store = AsyncEventStore(Path(temporary) / "events.sqlite3")
-            await store.start()
-            try:
-                model = ScriptedCodePlanningModel(code_action="STOP")
-                code_runtime = EscalateThenApplyCodeRuntime(
-                    expected_action="STOP"
-                )
-                graph = build_planning_graph(
-                    simple_model=model,
-                    hard_model=model,
-                    worker_registry=WorkerAgentRegistry.with_code_worker(
-                        FailingGeneralRuntime(), code_runtime
-                    ),
-                    worker_group_coordinator=WorkerGroupCoordinator(store),
-                    planning=planning_settings(),
-                    model_output_max_tokens=2048,
-                )
-                result = await graph.ainvoke(
-                    {
-                        "context": PlanningContextPack(
-                            current_time="now",
-                            user_request="Stop if the code is outside scope.",
-                        ),
-                        "event_id": "event-code-stop",
-                        "conversation_thread_id": "conversation-code-stop",
-                        "planning_run_id": "planning-code-stop",
-                    },
-                    config={
-                        "configurable": {
-                            "progress_callback": lambda event: _ignore_progress(
-                                event
-                            )
-                        }
-                    },
-                )
-
-                self.assertEqual(result["final_status"], "FAILED")
-                self.assertEqual(model.code_control_calls, 1)
-                self.assertEqual(model.step_report_calls, 0)
-                self.assertEqual(len(code_runtime.calls), 2)
-                self.assertEqual(result["current_step_attempt"], 1)
-                self.assertEqual(
-                    result["current_step_trace"]["code_review_loop"]["status"],
-                    "STOPPED",
-                )
-                self.assertEqual(
-                    result["completed_step_reports"][0].next_action,
-                    "Scheduler action: STOP.",
                 )
             finally:
                 await store.close()

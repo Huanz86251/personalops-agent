@@ -76,7 +76,7 @@ from .progress import (
 )
 from .code_review_models import (
     CodeCandidateRef,
-    CodeContinuationSubmission,
+
     CodeChangedFile,
     CodeCheckResult,
     CodeImplementedInterface,
@@ -88,15 +88,12 @@ from .code_review_models import (
     CodeSelfCheck,
     CodeWorkerRepairResponse,
     CodeWorkerSubmission,
-    SchedulerCodeDecision,
-    SchedulerContinueDirective,
-    SchedulerContinuationRecord,
-    apply_scheduler_code_decision,
+
     create_code_review_loop,
     finish_code_review,
     record_code_publication,
     receive_code_worker_response,
-    receive_code_continuation_submission,
+
     request_code_repair,
 )
 from .code_attempt_models import (
@@ -130,13 +127,13 @@ from .code_state import CodeAgentState, CodeRuntimeContextMiddleware
 from .code_submission import (
     REQUEST_CODE_WORKER_REPAIR_NAME,
     RESPOND_TO_CODE_REVIEW_NAME,
-    SUBMIT_CONTINUED_CODE_FOR_REVIEW_NAME,
+
     SUBMIT_CODE_FOR_REVIEW_NAME,
     SUBMIT_CODE_REVIEW_NAME,
     CodeWorkerSubmissionRecord,
     request_code_worker_repair,
     respond_to_code_review,
-    submit_continued_code_for_review,
+
     submit_code_for_review,
     submit_code_review,
 )
@@ -164,7 +161,7 @@ __all__ = [
     "CODE_WORKER_NAME",
     "REQUEST_CODE_WORKER_REPAIR_NAME",
     "RESPOND_TO_CODE_REVIEW_NAME",
-    "SUBMIT_CONTINUED_CODE_FOR_REVIEW_NAME",
+
     "SUBMIT_CODE_FOR_REVIEW_NAME",
     "SUBMIT_CODE_REVIEW_NAME",
     "CodeAgentState",
@@ -175,7 +172,7 @@ __all__ = [
     "CodeAttemptFailureStage",
     "CodeAttemptFinalRecord",
     "CodeAttemptOutcome",
-    "CodeContinuationSubmission",
+
     "CODE_SANDBOX_IMAGE",
     "CodeSandboxError",
     "CodeSandboxManager",
@@ -206,9 +203,7 @@ __all__ = [
     "CodeWorkerRepairResponse",
     "CodeWorkerSubmission",
     "CodeWorkerSubmissionRecord",
-    "SchedulerCodeDecision",
-    "SchedulerContinueDirective",
-    "SchedulerContinuationRecord",
+
     "LeadershipCoordinationState",
     "LeadershipProgressBatch",
     "LeadershipDecision",
@@ -263,14 +258,14 @@ __all__ = [
     "resolve_tool_evidence",
     "replace_worker_attempt",
     "receive_code_worker_response",
-    "receive_code_continuation_submission",
+
     "request_code_repair",
     "request_code_worker_repair",
     "respond_to_code_review",
-    "submit_continued_code_for_review",
+
     "start_worker_attempt",
     "complete_web_step",
     "submit_code_for_review",
     "submit_code_review",
-    "apply_scheduler_code_decision",
+
 ]

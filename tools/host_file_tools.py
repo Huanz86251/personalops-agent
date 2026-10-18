@@ -18,6 +18,7 @@ from host_file_access import (
     HostFileAccessDenied,
 )
 from task_files import register_file
+from task_file_imports import materialize_import
 
 
 def _configured_root_lines() -> str:
@@ -49,7 +50,9 @@ def refresh_host_file_tool_descriptions() -> None:
         + roots
     )
     host_import_file.description = (
-        "把一个本机普通文件只读复制到当前Worker隔离工作区，返回稳定的/downloads候选。"
+        "把一个本机普通文件只读复制到当前Worker隔离工作区，返回稳定的/downloads引用。"
+        "Code成功导入后文件已在沙盒，execution_path可直接用于execute或程序输入；无需先read_file。"
+        "其他Worker保留私有副本，execution_path为空；导入失败返回明确错误。"
         "读取和复制到隔离工作区默认允许，不触发外发审批；这不等于允许发送、修改或删除原文件。"
         + roots
     )
@@ -260,6 +263,7 @@ async def host_import_file(path: str, reason: str, runtime: ToolRuntime) -> Comm
             # /downloads reference is the isolated copy of this exact source.
             source_ref="host:" + str(resolved),
         )
+        record = await asyncio.to_thread(materialize_import, record)
         result = {
             "status": "IMPORTED",
             "candidate_id": record.candidate_id,
@@ -267,7 +271,11 @@ async def host_import_file(path: str, reason: str, runtime: ToolRuntime) -> Comm
             "size_bytes": record.size_bytes,
             "sha256": record.sha256,
             "reading_path": "/downloads/" + record.candidate_id,
-            "next_step": "使用 read_file(reading_path) 在隔离工作区内读取；不要再使用主机绝对路径。",
+            "execution_path": record.sandbox_path,
+            "next_step": (
+                "文件已复制到沙盒；可直接用execution_path运行或作为程序输入，read_file仅在需要查看内容时使用。"
+                if record.sandbox_path else "文件已复制到当前Worker私有存储；可用read_file(reading_path)查看，不要再使用主机绝对路径。"
+            ),
         }
         return Command(
             update={
@@ -282,8 +290,8 @@ async def host_import_file(path: str, reason: str, runtime: ToolRuntime) -> Comm
         )
     except (HostFileAccessDenied, OSError, ValueError) as error:
         result = {
-            "status": "POLICY_DENIED",
-            "code": getattr(error, "code", "POLICY_DENIED"),
+            "status": "POLICY_DENIED" if isinstance(error, HostFileAccessDenied) else "IMPORT_FAILED",
+            "code": getattr(error, "code", "IMPORT_FAILED"),
             "message": str(error),
             "path": path,
             "retryable": False,

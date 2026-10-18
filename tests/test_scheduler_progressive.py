@@ -175,11 +175,12 @@ class ProgressiveSchedulerTests(unittest.IsolatedAsyncioTestCase):
         token = CURRENT_SCHEDULER.set(session)
         try:
             request = LeadershipWakeRequest(wake_id="wake1", event_id="event1", reason="WORKER_BLOCKED", created_at=datetime.now(timezone.utc),
-                workers=[LeadershipWorkerView(worker_id="web1", assignment="查地址", cursor_before=0, reports=[{"summary": "缺来源"}])])
+                workers=[LeadershipWorkerView(worker_id="web1", step_id="2", assignment="查地址", cursor_before=0, reports=[{"summary": "缺来源"}])])
             await run_hard_worker_leader(model, request=request)
         finally:
             CURRENT_SCHEDULER.reset(token)
         self.assertEqual(model.requests[0][0], model.requests[1][0])
+        self.assertEqual(session.active_records["当前Worker控制"]["owner"]["step_ids"], ["2"])
         self.assertIn(
             "核对地址",
             context.scheduler_session["active_records"]["当前Worker控制"]["content"],
@@ -188,6 +189,23 @@ class ProgressiveSchedulerTests(unittest.IsolatedAsyncioTestCase):
             str(record.get("key", "")).startswith("transient:")
             for record in context.scheduler_session["records"]
         ))
+
+    async def test_replan_receives_completed_and_failed_report_projections(self):
+        model = ScriptedModel()
+        context = PlanningContextPack(current_time="now", user_request="查价格并生成表格")
+        reports = [
+            StepReport(step_id=1, status="COMPLETED", summary="A价格100元已核对",
+                       stop_reason="验收通过"),
+            StepReport(step_id=2, status="BLOCKED", summary="价格表未生成",
+                       stop_reason="写入失败", unresolved_items=["缺CSV文件"]),
+        ]
+        await run_hard_replanner(model, context=context, plan_objective="生成价格表",
+            plan_success_criteria=["交付CSV"], completed_step_reports=reports,
+            replan_context="更换文件生成办法", remaining_steps=[],
+            remaining_budget={"model": 3}, next_step_id=3, max_remaining_steps=1)
+        prompt = json.dumps(model.requests[-1], ensure_ascii=False, default=str)
+        self.assertIn("A价格100元已核对", prompt)
+        self.assertIn("缺CSV文件", prompt)
 
     def test_active_plan_is_replaced_in_place_and_is_prompt_tail(self):
         context = PlanningContextPack(current_time="now", user_request="查影院")
@@ -207,7 +225,7 @@ class ProgressiveSchedulerTests(unittest.IsolatedAsyncioTestCase):
 
     def test_reviewed_step_contract_and_delivery_interfaces_survive_compaction(self):
         context = PlanningContextPack(current_time="now", user_request="交付文件")
-        session = SchedulerConversation(context.scheduler_session, context, threshold=1)
+        session = SchedulerConversation(context.scheduler_session, context, threshold=1, enabled=True)
         session.initialize()
         step = PlanStep(
             step_id=1,
@@ -256,9 +274,59 @@ class ProgressiveSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"step_id":1,"status":"COMPLETED"', active_plan)
         self.assertIn('"remaining_steps":[]', active_plan)
 
+    def test_worker_control_waits_for_its_own_new_report_after_restore(self):
+        context = PlanningContextPack(current_time="now", user_request="查价格")
+        session = SchedulerConversation(context.scheduler_session, context)
+        old_report = {"step_id": 1, "status": "COMPLETED", "summary": "A价格100元"}
+        record_graph_facts(session, {"completed_step_reports": [old_report]})
+        session.set_worker_control({"action": "GUIDE", "target_worker_ids": [],
+                                    "guidance": "核对B价格"}, {
+            "triggering_worker_id": "web2",
+            "workers": [{"worker_id": "web2", "step_id": "2"}],
+        })
+        # Checkpoint round-trip keeps ownership; the metadata is not prompt text.
+        session = SchedulerConversation(json.loads(json.dumps(session.data)), context)
+        self.assertNotIn("prior_report_keys", json.dumps(session.wire()))
+        record_graph_facts(session, {"completed_step_reports": [old_report]})
+        self.assertIn("当前Worker控制", session.active_records)
+        record_graph_facts(session, {"current_step": None, "completed_step_reports": [
+            old_report, {"step_id": 2, "status": "BLOCKED", "summary": "B网站不可访问"},
+        ]})
+        self.assertNotIn("当前Worker控制", session.active_records)
+
+    def test_worker_control_ignores_old_same_step_and_waits_for_all_targets(self):
+        context = PlanningContextPack(current_time="now", user_request="核对价格")
+        session = SchedulerConversation(context.scheduler_session, context)
+        old = {"step_id": 2, "status": "BLOCKED", "summary": "缺来源"}
+        record_graph_facts(session, {"completed_step_reports": [old]})
+        session.set_worker_control({"action": "GUIDE", "target_worker_ids": ["w2", "w3"]}, {
+            "workers": [{"worker_id": "w2", "step_id": "2"},
+                        {"worker_id": "w3", "step_id": "3"}],
+        })
+        record_graph_facts(session, {"completed_step_reports": [old]})
+        self.assertIn("当前Worker控制", session.active_records)
+        fresh = {"step_id": 2, "status": "COMPLETED", "summary": "找到来源"}
+        record_graph_facts(session, {"completed_step_reports": [old, fresh]})
+        self.assertIn("当前Worker控制", session.active_records)
+        record_graph_facts(session, {"completed_step_reports": [old, fresh,
+            {"step_id": 3, "status": "COMPLETED", "summary": "核对完毕"}]})
+        self.assertNotIn("当前Worker控制", session.active_records)
+
+    def test_worker_control_default_target_and_invalid_target(self):
+        context = PlanningContextPack(current_time="now", user_request="查价格")
+        session = SchedulerConversation(context.scheduler_session, context)
+        event = {"triggering_worker_id": "w2", "workers": [
+            {"worker_id": "w1", "step_id": "1"}, {"worker_id": "w2", "step_id": "2"}]}
+        session.set_worker_control({"action": "GUIDE", "target_worker_ids": []}, event)
+        self.assertEqual(session.active_records["当前Worker控制"]["owner"]["worker_ids"], ["w2"])
+        session.set_worker_control({"action": "GUIDE", "target_worker_ids": ["unknown"]}, event)
+        self.assertEqual(session.active_records["当前Worker控制"]["owner"]["worker_ids"], ["w2"])
+        session.set_worker_control({"action": "CANCEL", "target_worker_ids": []}, event)
+        self.assertEqual(session.active_records["当前Worker控制"]["owner"]["step_ids"], ["1", "2"])
+
     def test_compaction_never_changes_plan_report_or_instruction(self):
         context = PlanningContextPack(current_time="now", user_request="原文不改")
-        session = SchedulerConversation(context.scheduler_session, context, threshold=1)
+        session = SchedulerConversation(context.scheduler_session, context, threshold=1, enabled=True)
         session.initialize()
         session.add("protocol", "旧协议", protected=False, key="old")
         session.fact("计划", {"path": "海报/最终.png", "steps": ["搜索", "制作"]})
@@ -311,7 +379,11 @@ class ProgressiveSchedulerTests(unittest.IsolatedAsyncioTestCase):
         original = HumanMessage(content="原始任务原文")
         call = AIMessage(content="", tool_calls=[{"id": "search1", "name": "web_search", "args": {}}])
         result = ToolMessage(content="真实结果" * 1000, tool_call_id="search1", name="web_search")
-        model = SimpleNamespace(ainvoke=AsyncMock(return_value=AIMessage(content="已经搜索，需核对地址")))
+        from tests.test_conversation_compaction import RecordingSummaryModel
+        from schemas.compaction import WorkerExecutionSummary
+        payload = WorkerExecutionSummary(observed_results=["已经搜索"], errors_and_failures=[],
+            pending_work=["核对地址"], files_and_artifacts=[], evidence_refs=[], next_steps=[])
+        model = RecordingSummaryModel(AIMessage(content=payload.model_dump_json()))
         middleware = WorkerCompactionMiddleware(
             model, threshold=1, keep_messages=2, keep_tokens=10, enabled=True
         )

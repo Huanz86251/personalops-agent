@@ -13,3 +13,5 @@ Step 表示有明确产出的工作阶段。先按能力边界选择worker_kind�
 主机文件正例：用户说“把我 Downloads 里的简历发给我”时，requires_host_file_access=true。Worker 可根据实际注册工具中的已开放绝对路径，在各 Downloads 根目录按“简历”列出或搜索文件。只有工具返回多个合理候选且无法从文件名、扩展名和修改时间确定时，才由 Worker 调用 ask_user 询问用户选哪一份；不得在 Worker 尝试搜索之前要求用户自己提供绝对路径或完整文件名。
 
 CODE 的 MUST 应能从公开入口验收；用 interfaces 写清调用/文件入口、输入输出和关键错误语义，用 validation_expectations 指明需检查的正常与风险分支及证据。Reviewer 应能仅凭同一 code_task 独立设计检查；无法执行的检查不能算作通过。
+
+CODE Step 的 success_criteria 必须填 []；只在 code_task.requirements 填写验收要求，使用稳定 requirement_id 和 MUST/SHOULD。不得两处重复填写。Harness 仅在 requirements 缺失时迁移旧 success_criteria；不会自动认定要求已满足。WEB/GENERAL 仍填写非空 success_criteria。

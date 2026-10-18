@@ -14,6 +14,7 @@ from langchain_core.tools import ToolException
 from langgraph.types import Command
 
 from task_files import register_file
+from task_file_imports import import_destination, materialize_import
 
 DOCUMENTS = {".pdf", ".docx", ".pptx", ".xlsx"}
 
@@ -38,9 +39,10 @@ def _snapshot(root):
 class TaskFileAccessMiddleware(AgentMiddleware):
     """Only registered adapters can introduce files; read_file never emits raw PDF."""
 
-    def __init__(self, *, sandbox=None):
+    def __init__(self, *, sandbox=None, import_root="/workspace/.private-downloads"):
         super().__init__()
         self.sandbox = sandbox
+        self.import_root = import_root
 
     def _is_document(self, request):
         if request.tool_call["name"] != "read_file":
@@ -62,13 +64,10 @@ class TaskFileAccessMiddleware(AgentMiddleware):
         if self.sandbox is not None:
             sandbox_path = path
             if path.startswith("/downloads/"):
-                # `/downloads` is a run/Worker-scoped host registry, not a
-                # directory mounted into the offline Code container.  Verify
-                # ownership, size and digest on every read, then copy only the
-                # requested immutable candidate into the sandbox.
+                # Read verifies the registered source but never imports files.
                 from task_files import read_download
 
-                payload = read_download(path, request.state)
+                read_download(path, request.state)
                 candidate_id = path.removeprefix("/downloads/")
                 raw_record = next(
                     (
@@ -85,13 +84,10 @@ class TaskFileAccessMiddleware(AgentMiddleware):
                 filename = str(raw_record.get("filename") or "artifact.bin")
                 if not filename or Path(filename).name != filename:
                     raise ValueError("Registered download filename is invalid")
-                sandbox_path = (
-                    f"/workspace/.private-downloads/{candidate_id}/{filename}"
-                )
-                uploaded = self.sandbox.upload_files([(sandbox_path, payload)])
-                if len(uploaded) != 1 or uploaded[0].error:
-                    detail = uploaded[0].error if uploaded else "missing upload receipt"
-                    raise ValueError(f"Cannot copy registered download into Code sandbox: {detail}")
+                sandbox_path = raw_record.get("sandbox_path")
+                expected_path = f"{self.import_root}/{candidate_id}/{filename}"
+                if sandbox_path != expected_path:
+                    raise ValueError("File has not been imported into this sandbox; import it again before reading or executing")
             result = self.sandbox.execute(
                 "python /opt/personalops/read_document.py "
                 + shlex.quote(sandbox_path)
@@ -168,6 +164,7 @@ class TaskFileAccessMiddleware(AgentMiddleware):
                 raise ValueError("Attachment digest does not match download response")
             if expected_size is not None and record.size_bytes != expected_size:
                 raise ValueError("Attachment size does not match download response")
+            record = materialize_import(record, self.sandbox, self.import_root)
             records.append(record)
         if not records:
             return result
@@ -175,6 +172,7 @@ class TaskFileAccessMiddleware(AgentMiddleware):
             {
                 "candidate_id": r.candidate_id,
                 "reading_path": "/downloads/" + r.candidate_id,
+                "execution_path": r.sandbox_path,
                 "filename": r.filename,
                 "size_bytes": r.size_bytes,
                 "sha256": r.sha256,
@@ -214,7 +212,8 @@ class TaskFileAccessMiddleware(AgentMiddleware):
                 if root and metadata.get("task_file_origin") == "BROWSER"
                 else {}
             )
-            result = await handler(request)
+            with import_destination(self.sandbox, self.import_root):
+                result = await handler(request)
             if root:
                 return await asyncio.to_thread(
                     self._register, request, result, metadata, before
@@ -237,4 +236,5 @@ class TaskFileAccessMiddleware(AgentMiddleware):
                     status="error",
                     tool_call_id=request.tool_call["id"],
                 )
-        return handler(request)
+        with import_destination(self.sandbox, self.import_root):
+            return handler(request)

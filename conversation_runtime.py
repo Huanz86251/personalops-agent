@@ -99,6 +99,7 @@ from planning_graph import (
 from hard_planning import run_hard_worker_leader
 from eventing.models import (
     EventAction,
+    EventRun,
     EventStatus,
     RunStatus,
     build_planning_thread_id_from_parts,
@@ -120,8 +121,8 @@ from toolsets import (
     NO_TOOL_ROUTE,
 )
 from toolset_router import ToolsetRouter
-from context_middlewares import (
-    summarize_conversation_history,
+from conversation_compaction import (
+    SummaryCheckpoint, compress_dialogue, dialogue_token_estimate, read_summary_checkpoint,
 )
 
 from planning_models import (
@@ -147,7 +148,7 @@ from workers.code_submission import (
     RESPOND_TO_CODE_REVIEW_NAME,
     SUBMIT_CODE_FOR_REVIEW_NAME,
     SUBMIT_CODE_REVIEW_NAME,
-    SUBMIT_CONTINUED_CODE_FOR_REVIEW_NAME,
+
 )
 from workers.code_publisher import PUBLISH_REVIEWED_CANDIDATE_NAME
 from workers.general_completion import GENERAL_REPORT_NAME
@@ -163,6 +164,7 @@ logger = logging.getLogger(
 # constants so production composition and regression tests cannot silently
 # drift apart.
 GENERAL_TOOLSET_BASELINE_TOOL_NAMES = (
+    "raise_plan_objection",
     "ask_user",
     "search_knowledge",
     "read_knowledge",
@@ -172,6 +174,7 @@ GENERAL_TOOLSET_BASELINE_TOOL_NAMES = (
 )
 
 WEB_TOOLSET_BASELINE_TOOL_NAMES = (
+    "raise_plan_objection",
     "ask_user",
     "search_knowledge",
     "read_knowledge",
@@ -183,6 +186,7 @@ WEB_TOOLSET_BASELINE_TOOL_NAMES = (
 )
 
 CODE_TOOLSET_BASELINE_TOOL_NAMES = (
+    "raise_plan_objection",
     "ask_user",
     "search_knowledge",
     "read_knowledge",
@@ -190,7 +194,7 @@ CODE_TOOLSET_BASELINE_TOOL_NAMES = (
     "publish_worker_progress",
     SUBMIT_CODE_FOR_REVIEW_NAME,
     RESPOND_TO_CODE_REVIEW_NAME,
-    SUBMIT_CONTINUED_CODE_FOR_REVIEW_NAME,
+
     REQUEST_CODE_WORKER_REPAIR_NAME,
     PUBLISH_REVIEWED_CANDIDATE_NAME,
     SUBMIT_CODE_REVIEW_NAME,
@@ -460,11 +464,7 @@ def _extract_dialogue_turns(
                 "",
             )
 
-        message_text = (
-            _message_content_to_text(
-                content
-            )
-        )
+        message_text = content if isinstance(content, str) else _message_content_to_text(content)
 
         if not message_text:
             continue
@@ -511,110 +511,6 @@ def _extract_dialogue_turns(
         )
 
     return turns
-
-
-def _trim_recent_dialogue(
-    messages: list[
-        DialogueMessage
-    ],
-    *,
-    max_chars: int,
-) -> list[
-    DialogueMessage
-]:
-    """保留近期Turn结构，同时限制提供给Hard节点的字符数。"""
-
-    if not messages or max_chars < 1:
-        return []
-
-    total_chars = sum(
-        len(
-            message.content
-        )
-        for message in messages
-    )
-
-    if total_chars <= max_chars:
-        return list(
-            messages
-        )
-
-    message_count = len(
-        messages
-    )
-
-    base_limit, extra_chars = divmod(
-        max_chars,
-        message_count,
-    )
-
-    trimmed_messages: list[
-        DialogueMessage
-    ] = []
-
-    for index, message in enumerate(
-        messages
-    ):
-        message_limit = (
-            base_limit
-            + (
-                1
-                if index < extra_chars
-                else 0
-            )
-        )
-
-        content = message.content
-
-        if len(
-            content
-        ) > message_limit:
-            marker = "……"
-
-            if message_limit <= len(
-                marker
-            ):
-                content = content[
-                    :message_limit
-                ]
-
-            else:
-                available_chars = (
-                    message_limit
-                    - len(
-                        marker
-                    )
-                )
-
-                head_chars = (
-                    available_chars
-                    // 2
-                )
-
-                tail_chars = (
-                    available_chars
-                    - head_chars
-                )
-
-                content = (
-                    content[
-                        :head_chars
-                    ]
-                    + marker
-                    + content[
-                        -tail_chars:
-                    ]
-                )
-
-        trimmed_messages.append(
-            message.model_copy(
-                update={
-                    "content": content,
-                }
-            )
-        )
-
-    return trimmed_messages
 
 
 def _format_dialogue_messages(
@@ -894,6 +790,113 @@ class ConversationRuntime:
         if not reply_target_id:
             raise RuntimeError("当前Event没有飞书回复地址，不能创建飞书日程。")
         return event.conversation_id, reply_target_id
+
+    async def _recover_code_startup(
+        self,
+        code_runtime: CodeStepRuntime,
+    ) -> list[EventRun]:
+        """Recover live CODE ownership without reviving historical Event runs."""
+
+        terminal_runs = await self.event_store.list_runs(
+            statuses=[
+                RunStatus.COMPLETED,
+                RunStatus.CANCELLED,
+                RunStatus.SUPERSEDED,
+                RunStatus.FAILED,
+            ]
+        )
+        code_recovery = await asyncio.to_thread(
+            code_runtime.recover_startup_sessions,
+            excluded_run_ids={run.event_id for run in terminal_runs},
+        )
+        if code_recovery:
+            logger.info("CODE启动恢复扫描完成 | outcomes=%s", code_recovery)
+
+        # CANCEL/REPLACE may have committed before their resource callback.
+        # Reconcile only that run's resources, never execute its old task again.
+        applied_events = await self.event_store.list_events(
+            statuses=[EventStatus.APPLIED]
+        )
+        cancel_by_target = {
+            event.target_event_id: event
+            for event in applied_events
+            if event.action is EventAction.CANCEL and event.target_event_id
+        }
+        for cancelled_run in terminal_runs:
+            if cancelled_run.status is not RunStatus.CANCELLED:
+                continue
+            cancel_event = cancel_by_target.get(cancelled_run.event_id)
+            if cancel_event is None:
+                continue
+            try:
+                code_records = await asyncio.to_thread(
+                    code_runtime.cancel_run,
+                    cancelled_run.event_id,
+                    reason=(
+                        "Startup reconciled a user-cancelled Event before "
+                        "accepting new work."
+                    ),
+                )
+            except Exception as error:
+                logger.warning(
+                    "CODE取消启动归档未完成，记录已保留 | run_id=%s | error_type=%s",
+                    cancelled_run.event_id,
+                    type(error).__name__,
+                )
+                continue
+            layout = initialize_run_workspace(cancelled_run.event_id)
+            await asyncio.to_thread(
+                write_run_cancellation_receipt,
+                layout=layout,
+                cancel_event_id=cancel_event.event_id,
+                target_event_id=cancelled_run.event_id,
+                code_final_records=code_records,
+            )
+
+        all_events = await self.event_store.list_events()
+        replace_by_target = {
+            event.target_event_id: event
+            for event in all_events
+            if event.action is EventAction.REPLACE and event.target_event_id
+        }
+        for superseded_run in terminal_runs:
+            if superseded_run.status is not RunStatus.SUPERSEDED:
+                continue
+            replacement_event = replace_by_target.get(superseded_run.event_id)
+            if replacement_event is None:
+                continue
+            try:
+                code_records = await asyncio.to_thread(
+                    code_runtime.supersede_run,
+                    superseded_run.event_id,
+                    reason=(
+                        "Startup reconciled a user-superseded Event before "
+                        "accepting new work."
+                    ),
+                )
+            except Exception as error:
+                logger.warning(
+                    "CODE替换启动归档未完成，记录已保留 | run_id=%s | error_type=%s",
+                    superseded_run.event_id,
+                    type(error).__name__,
+                )
+                continue
+            source_layout = initialize_run_workspace(superseded_run.event_id)
+            replacement_layout = initialize_run_workspace(replacement_event.event_id)
+            await asyncio.to_thread(
+                write_run_supersession_receipt,
+                layout=source_layout,
+                replacement_event_id=replacement_event.event_id,
+                target_event_id=superseded_run.event_id,
+                code_final_records=code_records,
+            )
+            await asyncio.to_thread(
+                inherit_replacement_workspace,
+                source_layout=source_layout,
+                replacement_layout=replacement_layout,
+                replacement_event_id=replacement_event.event_id,
+            )
+        return terminal_runs
 
     async def start(self) -> None:
         """启动Checkpoint、长期Store、本地模型和Agent。"""
@@ -1373,102 +1376,7 @@ class ConversationRuntime:
                 checkpointer=checkpointer,
                 store=memory_store,
             )
-            code_recovery = await asyncio.to_thread(
-                code_runtime.recover_startup_sessions
-            )
-            if code_recovery:
-                logger.info(
-                    "CODE启动恢复扫描完成 | outcomes=%s",
-                    code_recovery,
-                )
-
-            # A crash can happen after EventStore commits CANCELLED but before
-            # the cancellation callback archives and removes a frozen Docker
-            # pair. Reconcile that durable control state before accepting new
-            # work; a cancelled run must never be revived as resumable CODE.
-            cancelled_runs = await self.event_store.list_runs(
-                statuses=[RunStatus.CANCELLED]
-            )
-            applied_events = await self.event_store.list_events(
-                statuses=[EventStatus.APPLIED]
-            )
-            cancel_by_target = {
-                event.target_event_id: event
-                for event in applied_events
-                if (
-                    event.action is EventAction.CANCEL
-                    and event.target_event_id
-                )
-            }
-            for cancelled_run in cancelled_runs:
-                cancel_event = cancel_by_target.get(cancelled_run.event_id)
-                if cancel_event is None:
-                    continue
-                code_records = await asyncio.to_thread(
-                    code_runtime.cancel_run,
-                    cancelled_run.event_id,
-                    reason=(
-                        "Startup reconciled a user-cancelled Event before "
-                        "accepting new work."
-                    ),
-                )
-                layout = initialize_run_workspace(cancelled_run.event_id)
-                await asyncio.to_thread(
-                    write_run_cancellation_receipt,
-                    layout=layout,
-                    cancel_event_id=cancel_event.event_id,
-                    target_event_id=cancelled_run.event_id,
-                    code_final_records=code_records,
-                )
-
-            # REPLACE has the same crash window as CANCEL, but it preserves a
-            # distinct SUPERSEDED outcome and must also materialize the
-            # validated inheritance boundary for the replacement run.
-            superseded_runs = await self.event_store.list_runs(
-                statuses=[RunStatus.SUPERSEDED]
-            )
-            all_events = await self.event_store.list_events()
-            replace_by_target = {
-                event.target_event_id: event
-                for event in all_events
-                if (
-                    event.action is EventAction.REPLACE
-                    and event.target_event_id
-                )
-            }
-            for superseded_run in superseded_runs:
-                replacement_event = replace_by_target.get(
-                    superseded_run.event_id
-                )
-                if replacement_event is None:
-                    continue
-                code_records = await asyncio.to_thread(
-                    code_runtime.supersede_run,
-                    superseded_run.event_id,
-                    reason=(
-                        "Startup reconciled a user-superseded Event before "
-                        "accepting new work."
-                    ),
-                )
-                source_layout = initialize_run_workspace(
-                    superseded_run.event_id
-                )
-                replacement_layout = initialize_run_workspace(
-                    replacement_event.event_id
-                )
-                await asyncio.to_thread(
-                    write_run_supersession_receipt,
-                    layout=source_layout,
-                    replacement_event_id=replacement_event.event_id,
-                    target_event_id=superseded_run.event_id,
-                    code_final_records=code_records,
-                )
-                await asyncio.to_thread(
-                    inherit_replacement_workspace,
-                    source_layout=source_layout,
-                    replacement_layout=replacement_layout,
-                    replacement_event_id=replacement_event.event_id,
-                )
+            terminal_runs = await self._recover_code_startup(code_runtime)
 
             try:
                 recovered_promotions = await (
@@ -1484,14 +1392,6 @@ class ConversationRuntime:
                     "Workspace交付恢复遇到冲突；记录已保留，未猜测覆盖用户文件"
                 )
 
-            terminal_runs = await self.event_store.list_runs(
-                statuses=[
-                    RunStatus.COMPLETED,
-                    RunStatus.CANCELLED,
-                    RunStatus.SUPERSEDED,
-                    RunStatus.FAILED,
-                ]
-            )
             protected_promotions = await self.event_store.list_workspace_promotions(
                 statuses=(
                     PromotionStatus.AWAITING_APPROVAL,
@@ -2307,241 +2207,45 @@ class ConversationRuntime:
         memory_context: str,
         replacement_context: PlanningReplacementContext | None = None,
     ) -> PlanningContextPack:
-        """准备Hard节点共用的Conversation上下文。
-
-        上一轮Turn始终保留；更早最多三个Turn由本地Cross-Encoder
-        批量评分，只注入高相关Pair。
-        所有阈值均来自PlanningSettings。
-        """
-
-        planning = (
-            self.settings.planning
-        )
-
-        dialogue_turns = (
-            _extract_dialogue_turns(
-                list(
-                    state_values.get(
-                        "messages",
-                        [],
-                    )
-                )
-            )
-        )
-
-        # The immediately preceding user/assistant pair is always foregrounded.
-        # At most three older pairs are scored together by the already-resident
-        # Cross-Encoder, and only high-confidence matches are added.  Complete
-        # conversation history remains in the checkpoint; it is not copied into
-        # every Scheduler request.
-        latest_turns = dialogue_turns[-1:] if dialogue_turns else []
-        candidate_turns = dialogue_turns[-4:-1] if len(dialogue_turns) > 1 else []
-        selected_older_turns: list[list[DialogueMessage]] = []
-        retrieval_models = getattr(self, "retrieval_models", None)
-        if candidate_turns and retrieval_models is not None:
-            documents = [
-                _format_dialogue_messages(turn)
-                for turn in candidate_turns
-            ]
+        """近期原文与按 token 门槛更新的较早对话 JSON 摘要。"""
+        planning = self.settings.planning
+        dialogue_turns = _extract_dialogue_turns(list(state_values.get("messages", [])))
+        keep_turns = planning.hard_recent_dialogue_turns
+        older_end = max(0, len(dialogue_turns) - keep_turns)
+        compaction_enabled = getattr(planning, "conversation_compaction_enabled", False)
+        checkpoint = read_summary_checkpoint(
+            state_values.get("conversation_summary"), len(dialogue_turns)
+        ) if compaction_enabled else None
+        covered = checkpoint.covered_turns if checkpoint is not None else 0
+        pending_turns = dialogue_turns[covered:older_end]
+        threshold = planning.conversation_summary_trigger_tokens
+        if compaction_enabled and pending_turns and dialogue_token_estimate(pending_turns) >= threshold:
             try:
-                ranked = await retrieval_models.arerank(
-                    query=user_request,
-                    documents=documents,
-                    top_k=len(documents),
-                )
-                selected_indexes = {
-                    item.index
-                    for item in ranked
-                    if item.score >= 0.65
-                }
-                selected_older_turns = [
-                    turn
-                    for index, turn in enumerate(candidate_turns)
-                    if index in selected_indexes
-                ][-2:]
-            except Exception:
-                logger.exception(
-                    "历史Conversation Pair相关性评分失败；仅保留上一轮。"
-                )
-
-        # Only older user-facing assistant replies are summarized. Historical
-        # user requests remain exact in user_instruction_history; the latest
-        # answer and current request are also kept verbatim.
-        summary_turns: list[list[DialogueMessage]] = dialogue_turns[:-4]
-
-        summary_messages = [
-            message
-            for turn in summary_turns
-            for message in turn
-            if message.role == "assistant"
-        ]
-
-        selected_older_dialogue = [
-            message
-            for turn in selected_older_turns
-            for message in turn
-        ]
-        latest_dialogue = [
-            message
-            for turn in latest_turns
-            for message in turn
-        ]
-        # The immediately preceding pair is an exact foreground contract and
-        # is never clipped.  Only optional older pairs consume the remaining
-        # context allowance; an unusually long last turn may exceed that soft
-        # allowance by design.
-        latest_chars = sum(len(message.content) for message in latest_dialogue)
-        older_allowance = max(
-            0,
-            planning.hard_recent_dialogue_max_chars - latest_chars,
-        )
-        recent_dialogue = [
-            *_trim_recent_dialogue(
-                selected_older_dialogue,
-                max_chars=older_allowance,
-            ),
-            *latest_dialogue,
-        ]
-
-        stored_summary = (
-            state_values.get(
-                "conversation_summary",
-                "",
-            )
-        )
-
-        if not isinstance(
-            stored_summary,
-            str,
-        ):
-            stored_summary = ""
-
-        summarized_message_count = (
-            state_values.get(
-                "conversation_summary_message_count",
-                0,
-            )
-        )
-
-        if (
-            isinstance(
-                summarized_message_count,
-                bool,
-            )
-            or not isinstance(
-                summarized_message_count,
-                int,
-            )
-            or summarized_message_count < 0
-        ):
-            summarized_message_count = 0
-
-        summarized_message_count = min(
-            summarized_message_count,
-            len(
-                summary_messages
-            ),
-        )
-
-        pending_messages = (
-            summary_messages[
-                summarized_message_count:
-            ]
-        )
-
-        pending_turn_count = len(pending_messages)
-
-        if (
-            pending_messages
-            and pending_turn_count
-            >= planning
-            .conversation_summary_trigger_turns
-        ):
-            stored_summary = await (
-                summarize_conversation_history(
+                summary = await compress_dialogue(
                     self.summary_model,
-
-                    previous_summary=(
-                        stored_summary
-                    ),
-
-                    messages=(
-                        pending_messages
-                    ),
-
-                    max_chars=(
-                        planning
-                        .conversation_summary_max_chars
-                    ),
+                    previous=checkpoint.summary if checkpoint is not None else None,
+                    turns=pending_turns,
+                    first_turn=covered + 1,
+                    max_chars=planning.conversation_summary_max_chars,
                 )
-            )
-
-            summarized_message_count = len(
-                summary_messages
-            )
-
-            pending_messages = []
-
-            await agent.aupdate_state(
-                self._build_config(
-                    conversation.thread_id
-                ),
-
-                {
-                    "conversation_summary": (
-                        stored_summary
-                    ),
-
-                    "conversation_summary_message_count": (
-                        summarized_message_count
-                    ),
-                },
-
-                # 摘要是ConversationRuntime对已有Conversation
-                # 进行的外部元数据更新。
-                #
-                # 必须显式指定来源节点，
-                # 防止Planning前的状态写入因多节点历史而歧义。
-                as_node="model",
-            )
-
-        summary_blocks: list[str] = []
-
-        if stored_summary.strip():
-            summary_blocks.append(
-                stored_summary.strip()
-            )
-
-        pending_history_text = (
-            _format_dialogue_messages(
-                pending_messages
-            )
-        )
-
-        if pending_history_text:
-            summary_blocks.append(
-                (
-                    "[尚未达到批量摘要阈值的较早对话]\n"
-                    f"{pending_history_text}"
+            except Exception:
+                # Keep both the previous checkpoint and ALL pending originals.
+                # A failed/invalid summary never advances coverage or clips text.
+                logger.warning("Conversation JSON摘要失败；保留旧摘要与未摘要原文。")
+            else:
+                checkpoint = SummaryCheckpoint(covered_turns=older_end, summary=summary)
+                await agent.aupdate_state(
+                    self._build_config(conversation.thread_id),
+                    {"conversation_summary": checkpoint.model_dump_json(),
+                     "conversation_summary_turn_count": older_end},
+                    as_node="model",
                 )
-            )
-
-        conversation_summary = (
-            _compact_context_text(
-                "\n\n".join(
-                    summary_blocks
-                ),
-
-                max_chars=(
-                    planning
-                    .conversation_summary_max_chars
-                ),
-            )
-
-            if summary_blocks
-
-            else ""
-        )
+                covered = older_end
+        # A larger retention setting can expose turns covered by a prior summary.
+        # In that case, still restore the requested recent originals exactly.
+        raw_start = min(covered, older_end)
+        recent_dialogue = [item for turn in dialogue_turns[raw_start:] for item in turn]
+        conversation_summary = checkpoint.model_dump_json() if checkpoint is not None else ""
 
         selected_toolset_catalog = self.toolset_catalog
         toolset_router = getattr(self, "toolset_router", None)
@@ -2581,22 +2285,11 @@ class ConversationRuntime:
                 user_request
             ),
 
-            # Historical user instructions remain exact even when older
-            # assistant replies are summarized. The checkpoint is canonical.
-            user_instruction_history=[
-                message.content
-                for turn in dialogue_turns
-                for message in turn
-                if message.role == "user"
-            ],
-
-            conversation_summary=(
-                conversation_summary
-            ),
-
-            previous_run_summary=str(
-                state_values.get("previous_run_summary") or ""
-            ),
+            # Originals already occur in recent_dialogue. Do not reinject
+            # archived users or internal execution summaries from old checkpoints.
+            user_instruction_history=[],
+            conversation_summary=conversation_summary,
+            previous_run_summary="",
 
             recent_dialogue=(
                 recent_dialogue
@@ -3250,9 +2943,6 @@ class ConversationRuntime:
                         promotion = await self.workspace_promotions.prepare_from_run(
                             layout=initialize_run_workspace(resolved_event_id),
                             conversation_id=conversation.conversation_id,
-                            final_status=str(
-                                planning_result.get("final_status", "")
-                            ),
                         )
                         if promotion is not None:
                             promotion = await (
@@ -3276,7 +2966,7 @@ class ConversationRuntime:
                                 )
                     except Exception:
                         logger.exception(
-                            "Reviewer通过后的Workspace交付准备失败 | event_id=%s",
+                            "本轮Workspace交付准备失败 | event_id=%s",
                             resolved_event_id,
                         )
                         reply = (
@@ -3285,34 +2975,9 @@ class ConversationRuntime:
                             + "交付准备失败；没有继续覆盖用户文件。"
                         )
 
+                    # Conversation history contains only what the user sees.
+                    # Internal Step/Review evidence stays in the planning run.
                     previous_run_summary = ""
-                    if channel != "appworld" and planning_result:
-                        terminal_status = str(planning_result.get("final_status") or "UNKNOWN")
-                        if planning_result.get("overall_stop_reason") == "direct_answer":
-                            # DIRECT has no plan/report/review material to summarize.
-                            # Preserve the actual final exchange deterministically and
-                            # do not add another blocking model call before delivery.
-                            previous_run_summary = _compact_context_text(
-                                "运行终态（Harness记录）："
-                                f"{terminal_status}\n"
-                                f"用户问题：{normalized_user_text}\n"
-                                f"最终回答：{reply}",
-                                max_chars=self.settings.planning.conversation_summary_max_chars,
-                            )
-                        else:
-                            handoff_material = _planning_run_handoff_material(planning_result)
-                            previous_run_summary = await summarize_conversation_history(
-                                self.summary_model,
-                                previous_summary="",
-                                messages=[{"role": "user", "content": handoff_material}],
-                                max_chars=self.settings.planning.conversation_summary_max_chars,
-                                prompt_name="conversation/run_summary",
-                                material_label="上一轮内部规划、执行与审核记录",
-                            )
-                            previous_run_summary = _compact_context_text(
-                                f"运行终态（Harness记录）：{terminal_status}\n{previous_run_summary}",
-                                max_chars=self.settings.planning.conversation_summary_max_chars,
-                            )
 
                     # 无论上游DIRECT直接回答，
                     # 还是Worker在独立Step Thread中执行并完成审核，

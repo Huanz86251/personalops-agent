@@ -65,3 +65,23 @@ fallbacks are unchanged.
 - Unknown-provider text schemas, because those providers have not demonstrated
   native strict-schema support.
 
+
+## 2026-10-05 addition: user-visible conversation compaction
+
+`conversation_compaction.compress_dialogue` now reuses the provider-aware policy with
+`ConversationSummary`, `include_raw=True`. Qwen3.8-Flash sends the strict schema through
+the API parameter and does not repeat the schema in the prompt. Unverified providers
+retain the shared fallback. Local parsed-object, truncation and size checks remain.
+SDK HTTP request formatting was checked using a mock HTTP transport (no cloud call).
+This addition does not independently establish cloud-side enforcement.
+
+## 2026-10-05 addition: unified compaction contracts and repair
+
+Conversation and Worker output protocols are in `schemas/compaction.py`.
+`compaction_runtime.py` sends the schema through the shared strict-provider policy,
+normalizes harmless optional containers locally, validates substantive content,
+and permits at most one repair call. A schema dict keeps SDK parsing from bypassing
+Harness normalization; strict=true and the required-field API contract are unchanged.
+Field meaning lives in Schema descriptions; cross-field evidence/policy rules remain
+in `prompts/conversation/summary.md` and `prompts/conversation/worker_summary.md`.
+Failures retain originals and coverage. Tests use offline models/mock HTTP, not cloud enforcement probes.

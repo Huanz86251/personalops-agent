@@ -168,7 +168,7 @@ def test_publisher_failure_remains_failed_without_a_receipt() -> None:
             verdict="ESCALATED",
             summary="Verification passed but publication failed.",
             verification_summary="The focused test passed before publication.",
-            recommended_action="CONTINUE",
+
         ),
     )
 

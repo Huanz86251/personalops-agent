@@ -1582,7 +1582,7 @@ def _build_report_fallback(
             )
 
             for criterion
-            in current_step.success_criteria
+            in current_step.acceptance_criteria
         ],
 
         confirmed_results=[],
@@ -1597,7 +1597,7 @@ def _build_report_fallback(
         )[:2000]],
 
         unresolved_items=list(
-            current_step.success_criteria
+            current_step.acceptance_criteria
         ),
 
         next_action=(
@@ -1635,7 +1635,7 @@ def _report_matches_step(
         criterion.strip()
 
         for criterion
-        in current_step.success_criteria
+        in current_step.acceptance_criteria
     ]
 
     return (
@@ -2185,7 +2185,7 @@ async def run_step_reporter(
                 report = (
                     normalize_report(
                         response.get("parsed"),
-                        current_step.success_criteria,
+                        current_step.acceptance_criteria,
                         valid_reporter_refs,
                         aliases=material_report_aliases,
                         mode=review_evidence_mode,

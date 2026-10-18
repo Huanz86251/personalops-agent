@@ -89,6 +89,7 @@ class LeadershipWakeRequest(BaseModel):
     reason: LeadershipWakeReason
     created_at: datetime
     workers: list[LeadershipWorkerView] = Field(min_length=1, max_length=3)
+    triggering_worker_id: str | None = None
 
 
 class LeadershipDecisionResult(BaseModel):

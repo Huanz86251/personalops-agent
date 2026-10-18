@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import unittest
 from dataclasses import replace
@@ -24,15 +25,15 @@ from workers.code_review_models import (
     CodeCandidateRef,
     CodeCheckResult,
     CodeChangedFile,
-    CodeContinuationSubmission,
+
     CodeReviewFinding,
     CodeReviewLoopState,
     CodeReviewReport,
     CodeWorkerRepairResponse,
     CodeWorkerSubmission,
-    SchedulerCodeDecision,
+
     finish_code_review,
-    receive_code_continuation_submission,
+
     receive_code_worker_response,
     record_code_publication,
     request_code_repair,
@@ -237,8 +238,6 @@ class FakeReviewerGraph:
 
 def failed_review(
     loop: CodeReviewLoopState,
-    *,
-    recommended_action: str = "CONTINUE",
 ) -> tuple[CodeReviewLoopState, CodeReviewReport]:
     report = CodeReviewReport(
         candidate=loop.candidate,
@@ -260,51 +259,9 @@ def failed_review(
                 change_summary="Candidate requires another revision.",
             ),
         ),
-        recommended_action=recommended_action,
+
     )
     return finish_code_review(loop, report), report
-
-
-class ContinueWorkerGraph(FakeWorkerGraph):
-    async def ainvoke(self, state, config=None):
-        loop = CodeReviewLoopState.model_validate(state["code_review_loop"])
-        if loop.pending_scheduler_directive is None:
-            return await super().ainvoke(state, config=config)
-
-        old = loop.candidate
-        candidate = old.model_copy(
-            update={"candidate_revision": old.candidate_revision + 1}
-        )
-        continuation = CodeContinuationSubmission(
-            scheduler_epoch=loop.scheduler_epoch,
-            action="REVISION_READY",
-            candidate=candidate,
-            summary="Applied the Scheduler's focused repair instruction.",
-            changed_files=(
-                CodeChangedFile(
-                    path="app.py",
-                    change_summary="Repaired the focused behavior.",
-                ),
-            ),
-        )
-        loop = receive_code_continuation_submission(loop, continuation)
-        submission = CodeWorkerSubmission(
-            candidate=candidate,
-            summary="Implemented the feature after Scheduler guidance.",
-            requirement_status={"feature": "MET"},
-            changed_files=continuation.changed_files,
-            proposed_artifact_paths=("app.py",),
-        )
-        submission_record = dict(state["code_worker_submission"])
-        submission_record["submission"] = submission.model_dump(mode="json")
-        return {
-            "messages": [AIMessage(content="Continued candidate submitted.")],
-            "executor_model_calls_used": 1,
-            "executor_tool_calls_used": 1,
-            "code_candidate": candidate.model_dump(mode="json"),
-            "code_review_loop": loop.model_dump(mode="json"),
-            "code_worker_submission": submission_record,
-        }
 
 
 class FailOnceReviewerGraph(FakeReviewerGraph):
@@ -345,7 +302,6 @@ class RepairThenPassReviewerGraph(FakeReviewerGraph):
             findings=(
                 CodeReviewFinding(
                     finding_id="F1",
-                    category="DELIVERY_MANIFEST",
                     summary="The candidate needs one bounded repair.",
                     affected_requirement_ids=("feature",),
                     related_paths=("app.py",),
@@ -418,6 +374,65 @@ class CodeRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "executor_model_run_limit": 10,
             "executor_tool_run_limit": 10,
         }
+
+    async def test_legacy_closed_archive_does_not_block_new_code_or_other_run_controls(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            (workspace / "app.py").write_text("print('base')\n", encoding="utf-8")
+            archive = root / "archives" / "old-closed-attempt"
+            archive.mkdir(parents=True)
+            path = archive / "runtime_checkpoint.json"
+            original = json.dumps(
+                {
+                    "run_id": "old-completed-event",
+                    "phase": "RECOVERY_REQUIRED",
+                    "recovery_state": {
+                        "contract": {"implementation_guidance": ["Old hint."]},
+                        "review_loop": {
+                            "scheduler_epoch": 1,
+                            "pending_scheduler_directive": None,
+                            "scheduler_continuations": [],
+                            "pending_instruction": {
+                                "findings": [{"category": "old-category"}]
+                            },
+                        },
+                    },
+                }
+            ).encode("utf-8")
+            path.write_bytes(original)
+            manager = FakeSandboxManager()
+            runtime = CodeStepRuntime(
+                object(),
+                sandbox_manager=manager,
+                source_root=workspace,
+                target_root=workspace,
+                archive_root=root / "archives",
+                run_storage_root=root / "runs",
+                worker_factory=lambda *args, **kwargs: FakeWorkerGraph(),
+                reviewer_factory=lambda *args, **kwargs: FakeReviewerGraph(),
+            )
+
+            outcomes = runtime.recover_startup_sessions(
+                excluded_run_ids={"old-completed-event"}
+            )
+            self.assertEqual(outcomes[0]["status"], "SKIPPED")
+            self.assertFalse(runtime.startup_recovery_blockers)
+            self.assertFalse(runtime.recovered_session_ids)
+            self.assertEqual(runtime.cancel_run("unrelated-cancelled-event"), ())
+            self.assertEqual(runtime.supersede_run("unrelated-replaced-event"), ())
+            self.assertFalse(manager.events)
+
+            result = await runtime.ainvoke(
+                self.runtime_input(),
+                config={"configurable": {"thread_id": "code-after-legacy-archive"}},
+            )
+            self.assertEqual(result["code_review_loop"]["status"], "APPLIED")
+            self.assertEqual(result["code_review_report"]["verdict"], "PASSED")
+            self.assertTrue(manager.cleaned)
+            self.assertNotIn("recover_pair", manager.events)
+            self.assertEqual(path.read_bytes(), original)
 
     async def test_control_plane_failure_still_commits_recovery_checkpoint(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -787,8 +802,11 @@ class CodeRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 worker_factory=lambda *args, **kwargs: FakeWorkerGraph(),
                 reviewer_factory=lambda *args, **kwargs: FakeReviewerGraph(),
             )
-            outcomes = recovered_runtime.recover_startup_sessions()
-            self.assertEqual(outcomes[0]["status"], "RECOVERED")
+            outcomes = recovered_runtime.recover_startup_sessions(
+                excluded_run_ids={"event-code-control"}
+            )
+            self.assertEqual(outcomes[0]["status"], "SKIPPED")
+            self.assertFalse(recovered_manager.events)
 
             records = recovered_runtime.cancel_run("event-code-control")
 
@@ -862,315 +880,6 @@ class CodeRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 second["code_integration_commit"]["accepted_commit"],
                 first_commit,
             )
-
-    async def test_continue_reuses_frozen_pair_and_applies_revision(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            workspace = root / "workspace"
-            workspace.mkdir()
-            (workspace / "app.py").write_text("print('base')\n", encoding="utf-8")
-            manager = FakeSandboxManager()
-            reviewer = FailOnceReviewerGraph()
-            runtime = CodeStepRuntime(
-                object(),
-                sandbox_manager=manager,
-                source_root=workspace,
-                target_root=workspace,
-                archive_root=root / "archives",
-                run_storage_root=root / "runs",
-                worker_factory=lambda *args, **kwargs: ContinueWorkerGraph(),
-                reviewer_factory=lambda *args, **kwargs: reviewer,
-            )
-            first = await runtime.ainvoke(
-                self.runtime_input(),
-                config={"configurable": {"thread_id": "code-continue"}},
-            )
-            self.assertEqual(
-                first["code_review_loop"]["status"],
-                "ESCALATED_TO_SCHEDULER",
-            )
-            self.assertIsNotNone(first["code_runtime_session_id"])
-            self.assertFalse(manager.cleaned)
-            attempt_roots = list((root / "archives").iterdir())
-            self.assertEqual(len(attempt_roots), 1)
-            paused_checkpoint = CodeRuntimeCheckpointStore().load(
-                attempt_roots[0]
-            )
-            self.assertIsNotNone(paused_checkpoint)
-            self.assertEqual(paused_checkpoint.phase, "AWAITING_SCHEDULER")
-            self.assertFalse(paused_checkpoint.cleanup_authorized)
-            self.assertIsNone(paused_checkpoint.sandbox.active_role)
-
-            continued = {
-                **self.runtime_input(),
-                "code_runtime_session_id": first["code_runtime_session_id"],
-                "code_scheduler_decision": SchedulerCodeDecision(
-                    action="CONTINUE",
-                    reason="The defect is local and the same context is valuable.",
-                    worker_instruction="Repair the focused behavior only.",
-                    reviewer_instruction="Re-run the focused check.",
-                    repair_rounds=1,
-                ).model_dump(mode="json"),
-            }
-            second = await runtime.ainvoke(
-                continued,
-                config={"configurable": {"thread_id": "code-continue"}},
-            )
-
-            self.assertEqual(second["code_review_loop"]["status"], "APPLIED")
-            self.assertEqual(
-                second["code_review_loop"]["candidate"]["candidate_revision"],
-                2,
-            )
-            self.assertEqual(
-                len(second["code_review_loop"]["scheduler_continuations"]),
-                1,
-            )
-            self.assertEqual(
-                second["code_scheduler_decision_applied"]["action"],
-                "CONTINUE",
-            )
-            self.assertEqual(manager.events.count("create"), 1)
-            self.assertTrue(manager.cleaned)
-
-    async def test_startup_rebuilds_in_memory_session_then_continues(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            workspace = root / "workspace"
-            workspace.mkdir()
-            (workspace / "app.py").write_text("print('base')\n", encoding="utf-8")
-            first_manager = FakeSandboxManager()
-            first_runtime = CodeStepRuntime(
-                object(),
-                sandbox_manager=first_manager,
-                source_root=workspace,
-                target_root=workspace,
-                archive_root=root / "archives",
-                run_storage_root=root / "runs",
-                worker_factory=lambda *args, **kwargs: ContinueWorkerGraph(),
-                reviewer_factory=lambda *args, **kwargs: FailOnceReviewerGraph(),
-            )
-            first = await first_runtime.ainvoke(
-                self.runtime_input(),
-                config={"configurable": {"thread_id": "code-recover"}},
-            )
-            session_id = first["code_runtime_session_id"]
-
-            recovered_manager = FakeSandboxManager()
-            recovered_runtime = CodeStepRuntime(
-                object(),
-                sandbox_manager=recovered_manager,
-                source_root=workspace,
-                target_root=workspace,
-                archive_root=root / "archives",
-                run_storage_root=root / "runs",
-                worker_factory=lambda *args, **kwargs: ContinueWorkerGraph(),
-                reviewer_factory=lambda *args, **kwargs: FakeReviewerGraph(),
-            )
-            outcomes = recovered_runtime.recover_startup_sessions()
-
-            self.assertEqual(
-                outcomes,
-                (
-                    {
-                        "status": "RECOVERED",
-                        "session_id": session_id,
-                        "resource_action": "REUSED",
-                    },
-                ),
-            )
-            self.assertEqual(recovered_runtime.recovered_session_ids, (session_id,))
-            self.assertEqual(recovered_manager.events, ["recover_pair"])
-            self.assertTrue(
-                recovered_manager.recovered_candidate_snapshot.is_dir()
-            )
-
-            continued = await recovered_runtime.ainvoke(
-                {
-                    **self.runtime_input(),
-                    "code_runtime_session_id": session_id,
-                    "code_scheduler_decision": SchedulerCodeDecision(
-                        action="CONTINUE",
-                        reason="Resume the safely frozen attempt.",
-                        worker_instruction="Repair the focused behavior only.",
-                        reviewer_instruction="Re-run the focused check.",
-                        repair_rounds=1,
-                    ).model_dump(mode="json"),
-                },
-                config={"configurable": {"thread_id": "code-recover"}},
-            )
-            self.assertEqual(continued["code_review_loop"]["status"], "APPLIED")
-            self.assertTrue(recovered_manager.cleaned)
-
-    async def test_stop_archives_and_releases_frozen_pair(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            workspace = root / "workspace"
-            workspace.mkdir()
-            manager = FakeSandboxManager()
-            reviewer = FailOnceReviewerGraph()
-            runtime = CodeStepRuntime(
-                object(),
-                sandbox_manager=manager,
-                source_root=workspace,
-                target_root=workspace,
-                archive_root=root / "archives",
-                run_storage_root=root / "runs",
-                worker_factory=lambda *args, **kwargs: FakeWorkerGraph(),
-                reviewer_factory=lambda *args, **kwargs: reviewer,
-            )
-            first = await runtime.ainvoke(
-                self.runtime_input(),
-                config={"configurable": {"thread_id": "code-stop"}},
-            )
-            stopped = await runtime.ainvoke(
-                {
-                    **self.runtime_input(),
-                    "code_runtime_session_id": first["code_runtime_session_id"],
-                    "code_scheduler_decision": SchedulerCodeDecision(
-                        action="STOP",
-                        reason="The remaining work is outside the accepted scope.",
-                    ).model_dump(mode="json"),
-                },
-                config={"configurable": {"thread_id": "code-stop"}},
-            )
-            self.assertEqual(stopped["code_review_loop"]["status"], "STOPPED")
-            self.assertEqual(
-                stopped["code_attempt_final_record"]["outcome"],
-                "FAILED",
-            )
-            self.assertEqual(
-                stopped["code_attempt_final_record"]["scheduler_decision"][
-                    "action"
-                ],
-                "STOP",
-            )
-            self.assertIsNotNone(stopped["code_attempt_archive"])
-            self.assertTrue(manager.cleaned)
-
-    async def test_event_cancel_archives_and_releases_frozen_pair(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            workspace = root / "workspace"
-            workspace.mkdir()
-            manager = FakeSandboxManager()
-            runtime = CodeStepRuntime(
-                object(),
-                sandbox_manager=manager,
-                source_root=workspace,
-                target_root=workspace,
-                archive_root=root / "archives",
-                run_storage_root=root / "runs",
-                worker_factory=lambda *args, **kwargs: FakeWorkerGraph(),
-                reviewer_factory=lambda *args, **kwargs: FailOnceReviewerGraph(),
-            )
-            first = await runtime.ainvoke(
-                self.runtime_input(),
-                config={"configurable": {"thread_id": "code-event-cancel"}},
-            )
-            self.assertIsNotNone(first["code_runtime_session_id"])
-
-            records = runtime.cancel_run(
-                "event-code-control",
-                reason="The user cancelled the owning Event.",
-            )
-
-            self.assertEqual(len(records), 1)
-            self.assertEqual(records[0]["outcome"], "CANCELLED")
-            self.assertIsNone(records[0]["scheduler_decision"])
-            archive_root = Path(records[0]["archive"]["root_path"])
-            self.assertTrue((archive_root / "final_record.json").is_file())
-            checkpoint = CodeRuntimeCheckpointStore().load(archive_root)
-            self.assertEqual(checkpoint.phase, "TERMINAL")
-            self.assertTrue(checkpoint.cleanup_authorized)
-            self.assertTrue(manager.cleaned)
-            self.assertNotIn(
-                first["code_runtime_session_id"],
-                runtime.recovered_session_ids,
-            )
-
-    async def test_event_replace_archives_pair_as_superseded(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            workspace = root / "workspace"
-            workspace.mkdir()
-            manager = FakeSandboxManager()
-            runtime = CodeStepRuntime(
-                object(),
-                sandbox_manager=manager,
-                source_root=workspace,
-                target_root=workspace,
-                archive_root=root / "archives",
-                run_storage_root=root / "runs",
-                worker_factory=lambda *args, **kwargs: FakeWorkerGraph(),
-                reviewer_factory=lambda *args, **kwargs: FailOnceReviewerGraph(),
-            )
-            first = await runtime.ainvoke(
-                self.runtime_input(),
-                config={"configurable": {"thread_id": "code-event-replace"}},
-            )
-
-            records = runtime.supersede_run(
-                "event-code-control",
-                reason="A newer user request replaced this Event.",
-            )
-
-            self.assertEqual(len(records), 1)
-            self.assertEqual(records[0]["outcome"], "SUPERSEDED")
-            self.assertIsNone(records[0]["scheduler_decision"])
-            self.assertTrue(manager.cleaned)
-            self.assertNotIn(
-                first["code_runtime_session_id"],
-                runtime.recovered_session_ids,
-            )
-
-    async def test_restart_supersedes_old_attempt_and_starts_fresh_pair(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            workspace = root / "workspace"
-            workspace.mkdir()
-            manager = FakeSandboxManager()
-            reviewer = FailOnceReviewerGraph()
-            runtime = CodeStepRuntime(
-                object(),
-                sandbox_manager=manager,
-                source_root=workspace,
-                target_root=workspace,
-                archive_root=root / "archives",
-                run_storage_root=root / "runs",
-                worker_factory=lambda *args, **kwargs: FakeWorkerGraph(),
-                reviewer_factory=lambda *args, **kwargs: reviewer,
-            )
-            first = await runtime.ainvoke(
-                self.runtime_input(),
-                config={"configurable": {"thread_id": "code-restart-old"}},
-            )
-            restarted = await runtime.ainvoke(
-                {
-                    **self.runtime_input(),
-                    "code_runtime_session_id": first["code_runtime_session_id"],
-                    "code_scheduler_decision": SchedulerCodeDecision(
-                        action="RESTART",
-                        reason="The implementation direction is structurally wrong.",
-                    ).model_dump(mode="json"),
-                },
-                config={"configurable": {"thread_id": "code-restart-new"}},
-            )
-
-            self.assertEqual(restarted["code_review_loop"]["status"], "APPLIED")
-            self.assertEqual(manager.events.count("create"), 2)
-            superseded = restarted["code_superseded_attempt_records"]
-            self.assertEqual(len(superseded), 1)
-            self.assertEqual(superseded[0]["outcome"], "CANCELLED")
-            self.assertEqual(
-                superseded[0]["scheduler_decision"]["action"],
-                "RESTART",
-            )
-            self.assertEqual(
-                restarted["code_attempt_final_record"]["parent_attempt_id"],
-                superseded[0]["candidate"]["attempt_id"],
-            )
-            self.assertTrue(manager.cleaned)
 
 
 if __name__ == "__main__":

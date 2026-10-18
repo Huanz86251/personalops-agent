@@ -28,10 +28,10 @@ from integration_repository import IntegrationCommitReceipt
 from config import PlanningSettings
 from hard_planning import (
     MAX_VALIDATION_RETRIES,
-    run_hard_code_scheduler,
     run_hard_final_reviewer,
     run_hard_replanner,
     run_hard_supervisor,
+    run_hard_worker_objection,
 )
 from planning_models import (
     FinalReviewDecision,
@@ -62,7 +62,6 @@ from workers.code_review_models import (
     CodeWorkerSubmission,
     CodeReviewLoopState,
     CodeReviewReport,
-    SchedulerCodeDecision,
 )
 from progress_events import (
     ProgressCallback,
@@ -140,169 +139,6 @@ async def _audit_from_failed_worker_checkpoint(worker: Any, thread_id: str) -> d
         return {}
 
 
-def _mapping_view(value: Any) -> dict[str, Any]:
-    if value is None:
-        return {}
-    if isinstance(value, dict):
-        return value
-    dump = getattr(value, "model_dump", None)
-    if callable(dump):
-        return dump(mode="json")
-    return {}
-
-
-def _pick_mapping(value: Any, fields: tuple[str, ...]) -> dict[str, Any]:
-    source = _mapping_view(value)
-    return {field: source[field] for field in fields if field in source}
-
-
-def _project_submission_record(value: Any) -> dict[str, Any] | None:
-    """Remove raw tool bodies while retaining the Worker deliverable and claims."""
-
-    record = _mapping_view(value)
-    if not record:
-        return None
-    projected = _pick_mapping(
-        record,
-        ("submitted_at", "worker_id", "event_id", "step_id", "total_tool_calls"),
-    )
-    submission = _pick_mapping(
-        record.get("submission"),
-        (
-            "summary",
-            "answer_text",
-            "criterion_claims",
-            "artifact_candidates",
-            "unresolved_items",
-            "final_conclusion",
-            "plan_challenge",
-            "candidate",
-            "requirement_status",
-            "implemented_interfaces",
-            "changed_files",
-            "proposed_artifact_paths",
-            "self_checks",
-            "limitations",
-        ),
-    )
-    if submission:
-        projected["submission"] = submission
-    artifacts = []
-    for item in record.get("resolved_artifacts", []) or []:
-        artifact = _pick_mapping(
-            item,
-            (
-                "candidate_id",
-                "output_id",
-                "kind",
-                "description",
-                "review_ref",
-                "size_bytes",
-                "sha256",
-                "media_type",
-            ),
-        )
-        if artifact:
-            artifacts.append(artifact)
-    if artifacts:
-        projected["resolved_artifacts"] = artifacts
-    projected["resolved_evidence_count"] = len(record.get("resolved_evidence", []) or [])
-    return projected
-
-
-def _final_worker_evidence(state: "PlanningState") -> dict[str, Any]:
-    """Build a minimal final-review projection, never a second raw trace."""
-
-    step = state.get("current_step")
-    trace = dict(state.get("current_step_trace") or {})
-    if step is None or not trace:
-        return {}
-    recent_tools = []
-    for message in trace.get("messages", [])[-24:]:
-        if isinstance(message, dict):
-            kind = message.get("type", message.get("role"))
-            if kind != "tool":
-                continue
-            content = str(message.get("content", ""))
-            recent_tools.append({
-                "tool_call_id": message.get("tool_call_id"),
-                "name": message.get("name"),
-                "status": message.get("status"),
-                "result_chars": len(content),
-                "has_result": bool(content.strip()),
-            })
-    step_view = _pick_mapping(
-        step,
-        (
-            "step_id",
-            "worker_kind",
-            "objective",
-            "success_criteria",
-            "artifact_outputs",
-        ),
-    )
-    general_result = _pick_mapping(
-        trace.get("general_result"),
-        (
-            "status",
-            "summary",
-            "answer_text",
-            "criterion_claims",
-            "unresolved_items",
-            "files",
-            "plan_challenge",
-        ),
-    )
-    return {
-        "step": step_view,
-        "attempt": trace.get("attempt"),
-        "worker_id": trace.get("worker_id"),
-        "finish_reason": trace.get("finish_reason"),
-        "stop_reason": trace.get("stop_reason"),
-        "execution_summary": _pick_mapping(
-            trace.get("execution_summary"),
-            (
-                "model_call_count",
-                "tool_call_count",
-                "tool_result_count",
-                "finalization_model_call_count",
-                "finalization_tool_call_count",
-            ),
-        ),
-        "general_result": general_result or None,
-        "worker_submission": _project_submission_record(trace.get("worker_submission")),
-        "code_worker_submission": _project_submission_record(trace.get("code_worker_submission")),
-        "code_review_report": _pick_mapping(
-            trace.get("code_review_report"),
-            (
-                "summary",
-                "verification_summary",
-                "verified_requirement_ids",
-                "check_results",
-                "failed_test_summaries",
-                "changed_files",
-                "verdict",
-                "approved_artifact_paths",
-                "published_artifact_paths",
-                "delivery_location",
-                "publication_id",
-                "recommended_action",
-            ),
-        ) or None,
-        "code_publication_receipt": _pick_mapping(
-            trace.get("code_publication_receipt"),
-            (
-                "publication_id",
-                "published_artifact_paths",
-                "delivery_location",
-                "applied_revision",
-                "status",
-            ),
-        ) or None,
-        "recent_tool_results": recent_tools,
-    }
-
-
 def _trace_has_artifact_candidate(trace: dict[str, Any]) -> bool:
     result = trace.get("general_result") or {}
     submission = trace.get("worker_submission") or {}
@@ -347,17 +183,12 @@ class PlanningState(TypedDict, total=False):
     retry_current_step: bool
     step_user_interactions: list[dict[str, Any]]
     current_code_runtime_session_id: str
-    current_code_scheduler_decision: dict[str, Any] | None
-    current_code_control_rounds: int
-    code_control_history: list[dict[str, Any]]
     code_superseded_attempt_records: list[dict[str, Any]]
 
     replans_used: int
     replan_history: list[dict[str, Any]]
     pending_replan_reason: str
     pending_replan_source: str
-    plan_challenge_resume_active: bool
-    plan_challenge_scheduler_instruction: str
 
     final_review_rounds: int
     final_worker_repair_round: int
@@ -978,11 +809,10 @@ def _build_step_instruction(
         "前序Worker直接交接（无需先调用历史工具）：\n"
         + _json_text(direct_handoff)
         + "\n"
-        "validated_apis已由Harness核对结构和真实来源，可直接复用其接口契约；"
-        "不要重复查同一接口。rejected_api_leads保留了验证失败的原交接和具体原因，"
-        "只能作为查证线索，不能直接执行。worker_notes是前序Worker留下的工作说明，不等于独立验收。"
+        "worker_notes是前序Worker留下的工作说明，不等于独立验收。evidence_check只表示引用是否解析到真实记录，"
+        "RESOLVED不证明说明正确或任务完成；PARTIAL/UNSUPPORTED需留意缺失依据。错误工具结果只能支持失败。"
         "review_failures直接列出前序Reviewer或自报未通过的状态与原因，必须继续处理；"
-        "若需要原始返回细节，再调用read_execution_history补查。\n\n"
+        "若需要原始返回细节，调用read_execution_history并填step_ids：先省略references列出调用，再复制S1-1等短引用读取原始结果。\n\n"
         if direct_handoff
         else ""
     )
@@ -1063,7 +893,7 @@ def _build_step_instruction(
         f"当前Step（第{attempt}次尝试）：\n"
         f"{_json_text(current_step.model_dump(mode='json'))}\n\n"
 
-        "HARNESS_CRITERIA: " + json.dumps(criterion_registry(current_step.success_criteria), ensure_ascii=False) + "\n\n"
+        "HARNESS_CRITERIA: " + json.dumps(criterion_registry(current_step.acceptance_criteria), ensure_ascii=False) + "\n\n"
 
         f"{handoff_block}"
         f"此前StepReport：\n"
@@ -1113,7 +943,7 @@ def _replanned_skill_selection_context(
         "previous_failure": str(latest.get("request_reason") or "")[:1200],
         "new_step_id": current_step.step_id,
         "objective": current_step.objective,
-        "success_criteria": current_step.success_criteria,
+        "success_criteria": current_step.acceptance_criteria,
     }
 
 
@@ -1430,7 +1260,7 @@ def _build_forced_step_report(
     unresolved = (
         list(previous.unresolved_items)
         if previous
-        else list(current_step.success_criteria)
+        else list(current_step.acceptance_criteria)
     )
 
     return StepReport(
@@ -1447,7 +1277,7 @@ def _build_forced_step_report(
                 status="UNKNOWN",
                 evidence=[],
             )
-            for criterion in current_step.success_criteria
+            for criterion in current_step.acceptance_criteria
         ],
         confirmed_results=confirmed,
         evidence=evidence,
@@ -1542,7 +1372,7 @@ def _build_web_step_report(
     if not records:
         summaries = [attempt.summary for attempt in packet.attempts if attempt.summary]
         answer_parts = [attempt.answer_text for attempt in packet.attempts if attempt.answer_text]
-        unresolved = list(current_step.success_criteria)
+        unresolved = list(current_step.acceptance_criteria)
         return StepReport(
             step_id=current_step.step_id,
             status="PARTIAL",
@@ -1559,7 +1389,7 @@ def _build_web_step_report(
                     status="UNKNOWN",
                     evidence=[],
                 )
-                for i, criterion in enumerate(current_step.success_criteria, 1)
+                for i, criterion in enumerate(current_step.acceptance_criteria, 1)
             ],
             assessment_source="RUNTIME_FAILURE",
             errors=(report_errors or ["Web Worker did not submit a valid StepReport."]),
@@ -1602,7 +1432,7 @@ def _build_web_step_report(
 
         merged_criteria: list[StepCriterionResult] = []
         unresolved: list[str] = []
-        for index, criterion in enumerate(current_step.success_criteria, 1):
+        for index, criterion in enumerate(current_step.acceptance_criteria, 1):
             criterion_id = f"C{index}"
             rows = criteria_by_id.get(criterion_id, [])
             statuses = {row.status for row in rows}
@@ -1680,6 +1510,9 @@ def _build_web_step_report(
                 item for record in records for item in record.report.confirmed_results
             )),
             assessment_source="WEB_SELF_REPORT",
+            handoff_knowledge=[
+                item for record in records for item in record.report.handoff_knowledge
+            ],
             completed_work=list(dict.fromkeys(
                 item for record in records for item in record.report.completed_work
             )),
@@ -1788,6 +1621,38 @@ def build_planning_graph(
         return models[role] if role in models else fallback
 
     reporter_output_limits = reporter_output_limits or {}
+
+    def objection_handler(state):
+        async def decide(objection, worker_state):
+            from schemas.worker_control import WorkerObjectionDecision
+            used = sum(int(worker_state.get(k, 0) or 0) for k in (
+                "executor_model_calls_used", "worker_leadership_model_rounds_used",
+                "skill_preparation_calls_used", "worker_compaction_calls_used",
+                "worker_finalization_model_calls_used", "worker_schema_repair_model_calls_used",
+            ))
+            available = min(
+                _plan_model_rounds_remaining(state, planning) - used,
+                int(worker_state.get("executor_model_run_limit", 0) or 0) - used,
+            )
+            if available < HARD_CALL_MAX_ROUNDS:
+                decision = WorkerObjectionDecision(action="CONTINUE", reason="No Scheduler adjudication budget remains; continue the task or report actual unresolved work.")
+                return {"decision": decision.model_dump(mode="json"), "model_rounds_used": 0, "used_fallback": True}
+            replan_available = _replan_available(state, planning, from_reviewer=False)
+            result = await run_hard_worker_objection(
+                role_model("scheduler", hard_model), context=_context(state),
+                event={
+                    "objection": objection.model_dump(mode="json"),
+                    "current_step": state.get("current_step"),
+                    "worker_id": worker_state.get("worker_id"),
+                    "step_id": worker_state.get("step_id"),
+                    "replan_available": replan_available,
+                },
+            )
+            decision = result.output
+            if decision.action == "REPLAN" and not replan_available:
+                decision = WorkerObjectionDecision(action="GUIDE", reason="Replan budget is exhausted.", guidance="Continue within the current contract when possible; otherwise report the actual unresolved result.")
+            return {"decision": decision.model_dump(mode="json"), "model_rounds_used": result.model_rounds_used, "used_fallback": result.used_fallback}
+        return decide
 
     async def prepare_role(state: PlanningState, config: RunnableConfig, role: str):
         context = _context(state)
@@ -2047,18 +1912,15 @@ def build_planning_graph(
             "current_step_stop_reason": "",
             "retry_current_step": False,
             "current_code_runtime_session_id": "",
-            "current_code_scheduler_decision": None,
-            "current_code_control_rounds": 0,
-            "code_control_history": [],
+
+
             "code_superseded_attempt_records": [],
             "replans_used": 0,
             "replan_history": [],
             "pending_replan_reason": "",
             "pending_replan_source": "",
 
-            "plan_challenge_resume_active": False,
 
-            "plan_challenge_scheduler_instruction": "",
             "final_review_rounds": 0,
             "scheduler_final_decision": False,
             "harness_terminal_decision": False,
@@ -2180,7 +2042,7 @@ def build_planning_graph(
                 "toolset_route_query": json.dumps(
                     {
                         "current_step": current_step.objective,
-                        "success_criteria": current_step.success_criteria,
+                        "success_criteria": current_step.acceptance_criteria,
                         "required_context": (
                             [
                                 item.model_dump(mode="json")
@@ -2228,14 +2090,12 @@ def build_planning_graph(
                 "step_id": str(current_step.step_id),
                 "worker_criterion_refs": {
                     f"C{i}": text
-                    for i, text in enumerate(current_step.success_criteria, 1)
+                    for i, text in enumerate(current_step.acceptance_criteria, 1)
                 },
                 "worker_total_tool_calls": 0,
                 "worker_last_progress_tool_call": 0,
                 "worker_progress_reports": [],
-                "worker_plan_challenges_remaining": max(
-                    0, planning.max_replans - provisional.get("replans_used", 0)
-                ),
+                "worker_objection_outcome": None,
             }
             instruction = (
                 _build_step_instruction(
@@ -2269,7 +2129,7 @@ def build_planning_graph(
                     trace_role="web" if current_step.worker_kind == "WEB" else "general",
                     thread_id=thread_id,
                     state_update=agent_state,
-                    runtime_configurable=runtime_configurable,
+                    runtime_configurable={**(runtime_configurable or {}), "worker_objection_handler": objection_handler(provisional)},
                     return_details=True,
                 )
                 if not isinstance(raw_details, dict):
@@ -2359,6 +2219,8 @@ def build_planning_graph(
                 "execution_summary": summary,
                 "worker_terminal_action": terminal_action,
                 "worker_leadership_decisions": leadership_decisions,
+                "worker_objection_outcome": details.get("worker_objection_outcome"),
+                "worker_objection_records": details.get("worker_objection_records", []),
                 "worker_submission": worker_submission,
                 "tool_audit": details.get("tool_audit", []),
                 "tool_audit_available": bool(
@@ -2417,7 +2279,6 @@ def build_planning_graph(
     ) -> Command[
         Literal[
             "step_executor",
-            "code_controller",
             "step_reporter",
             "general_report",
             "final_reviewer",
@@ -2429,24 +2290,12 @@ def build_planning_graph(
         能力补选由Worker内的一次性控制工具管理，不占业务工具额度。
         """
 
-        raw_pending_code_decision = state.get(
-            "current_code_scheduler_decision"
-        )
-        pending_code_action = (
-            str(raw_pending_code_decision.get("action") or "")
-            if isinstance(raw_pending_code_decision, dict)
-            else ""
-        )
         if (
             _execution_budget_exhausted(
                 state,
                 planning,
             )
             and not state.get("final_worker_repair_active", False)
-            # STOP consumes no model budget inside Code Runtime.  It must still
-            # reach the frozen session so the containers are archived and
-            # released instead of leaking when the plan budget reaches zero.
-            and pending_code_action != "STOP"
         ):
             return Command(
                 update={
@@ -2486,22 +2335,12 @@ def build_planning_graph(
                     goto="final_reviewer",
                 )
 
-            raw_code_decision = state.get("current_code_scheduler_decision")
-            code_decision_action = (
-                str(raw_code_decision.get("action") or "")
-                if isinstance(raw_code_decision, dict)
-                else ""
-            )
             # Final Reviewer repairs resume the same checkpoint and receive one
             # fresh normal Worker budget. Other generic retries create a new attempt.
             final_repair_active = state.get("final_worker_repair_active", False)
-            challenge_resume_active = state.get("plan_challenge_resume_active", False)
-            same_worker_resume = final_repair_active or challenge_resume_active
+            same_worker_resume = final_repair_active
             attempt = state.get("current_step_attempt", 1)
-            if not same_worker_resume and not (
-                current_step.worker_kind == "CODE"
-                and code_decision_action in {"CONTINUE", "STOP"}
-            ):
+            if not same_worker_resume:
                 attempt += 1
 
             executor_rounds = 0 if same_worker_resume else state.get(
@@ -2533,9 +2372,6 @@ def build_planning_graph(
             code_runtime_session_id = str(
                 state.get("current_code_runtime_session_id") or ""
             )
-            code_scheduler_decision = raw_code_decision
-            code_control_rounds = state.get("current_code_control_rounds", 0)
-            code_control_history = list(state.get("code_control_history", []))
             code_superseded_attempt_records = list(
                 state.get("code_superseded_attempt_records", [])
             )
@@ -2568,12 +2404,8 @@ def build_planning_graph(
             leadership_override = ""
             replacement_history = []
             code_runtime_session_id = ""
-            code_scheduler_decision = None
-            code_control_rounds = 0
-            code_control_history = []
             code_superseded_attempt_records = []
             final_repair_active = False
-            challenge_resume_active = False
             same_worker_resume = False
 
         provisional: PlanningState = dict(
@@ -2614,9 +2446,8 @@ def build_planning_graph(
 
                 "current_step_replacement_history": replacement_history,
                 "current_code_runtime_session_id": code_runtime_session_id,
-                "current_code_scheduler_decision": code_scheduler_decision,
-                "current_code_control_rounds": code_control_rounds,
-                "code_control_history": code_control_history,
+
+
                 "code_superseded_attempt_records": (
                     code_superseded_attempt_records
                 ),
@@ -2625,12 +2456,6 @@ def build_planning_graph(
 
         if final_repair_active:
             model_limit = planning.max_step_executor_rounds
-            tool_limit = planning.max_step_tool_calls
-        elif challenge_resume_active:
-            model_limit = min(
-                planning.max_step_executor_rounds,
-                _plan_model_rounds_remaining(provisional, planning),
-            )
             tool_limit = planning.max_step_tool_calls
         else:
             (
@@ -3016,9 +2841,7 @@ def build_planning_graph(
             "worker_total_tool_calls": 0,
             "worker_last_progress_tool_call": 0,
             "worker_progress_reports": [],
-            "worker_plan_challenges_remaining": max(
-                0, planning.max_replans - state.get("replans_used", 0)
-            ),
+            "worker_objection_outcome": None,
             "final_worker_repair_request": (
                 state.get("final_worker_repair_request")
                 if final_repair_active else None
@@ -3053,8 +2876,6 @@ def build_planning_graph(
             )
             if code_runtime_session_id:
                 agent_state["code_runtime_session_id"] = code_runtime_session_id
-            if code_scheduler_decision is not None:
-                agent_state["code_scheduler_decision"] = code_scheduler_decision
             if code_superseded_attempt_records:
                 agent_state["code_superseded_attempt_records"] = (
                     code_superseded_attempt_records
@@ -3077,14 +2898,6 @@ def build_planning_graph(
                 + "\n这是验收缺口，不是接口或执行步骤。沿用本Worker已有上下文和真实工具，"
                   "保留已完成结果，只补缺口并重新提交本角色原有的完成Schema。"
             )
-        elif challenge_resume_active:
-            instruction += (
-                "\n\n[Scheduler对计划异议的裁决]\n"
-                + str(state.get("plan_challenge_scheduler_instruction") or "")
-                + "\n沿用本Worker已有上下文和真实工具结果。按裁决后的当前Step继续；"
-                  "不要重复提交已经裁决的同一异议。"
-            )
-
         stop_reason = (
             "General Worker正常结束。"
         )
@@ -3105,7 +2918,6 @@ def build_planning_graph(
         code_attempt_archive = None
         code_attempt_final_record = None
         code_runtime_session_id_result = ""
-        code_scheduler_decision_applied = None
         code_superseded_attempt_records_result = (
             code_superseded_attempt_records
         )
@@ -3127,13 +2939,9 @@ def build_planning_graph(
                     ),
 
                     runtime_configurable={
-                        key: value
-                        for key, value in (config.get("configurable") or {}).items()
-                        if key in {
-                            "event_pause_control",
-                            "resume_from_checkpoint",
-                            "progress_callback",
-                        }
+                        **{key: value for key, value in (config.get("configurable") or {}).items()
+                           if key in {"event_pause_control", "resume_from_checkpoint", "progress_callback"}},
+                        "worker_objection_handler": objection_handler(provisional),
                     },
 
                     return_details=True,
@@ -3185,31 +2993,6 @@ def build_planning_graph(
             code_runtime_session_id_result = str(
                 details.get("code_runtime_session_id") or ""
             )
-            code_scheduler_decision_applied = details.get(
-                "code_scheduler_decision_applied"
-            )
-            previous_code_report = (
-                state.get("current_step_trace", {}).get("code_review_report")
-                or {}
-            )
-            previous_recovery_proposal = (
-                previous_code_report.get("recovery_proposal")
-                if isinstance(previous_code_report, dict)
-                else None
-            )
-            if (
-                isinstance(code_review_report, dict)
-                and previous_recovery_proposal is not None
-                and isinstance(code_scheduler_decision_applied, dict)
-                and code_scheduler_decision_applied.get("action") == "STOP"
-            ):
-                # STOP archives the frozen CODE runtime. Preserve the reviewed
-                # proposal and human decision for the global Replanner; a new
-                # CONTINUE/RESTART attempt must earn a fresh review instead.
-                code_review_report = {
-                    **code_review_report,
-                    "recovery_proposal": previous_recovery_proposal,
-                }
             code_superseded_attempt_records_result = list(
                 details.get("code_superseded_attempt_records")
                 or code_superseded_attempt_records
@@ -3281,6 +3064,8 @@ def build_planning_graph(
                 "worker_terminal_action": terminal_action,
 
                 "worker_leadership_decisions": leadership_decisions,
+                "worker_objection_outcome": details.get("worker_objection_outcome"),
+                "worker_objection_records": details.get("worker_objection_records", []),
 
                 "worker_submission": worker_submission,
                 "tool_audit": details.get("tool_audit", []),
@@ -3318,9 +3103,7 @@ def build_planning_graph(
 
                 "code_attempt_final_record": code_attempt_final_record,
                 "code_runtime_session_id": code_runtime_session_id_result,
-                "code_scheduler_decision_applied": (
-                    code_scheduler_decision_applied
-                ),
+
                 "code_superseded_attempt_records": (
                     code_superseded_attempt_records_result
                 ),
@@ -3532,17 +3315,21 @@ def build_planning_graph(
                 else "Leadership要求替换Worker，但Step剩余预算不足。"
             )
 
-        if code_review_report:
+        if trace.get("worker_objection_outcome"):
+            decision = trace["worker_objection_outcome"]["decision"]
+            finish_reason = "SCHEDULER_OBJECTION_" + decision["action"]
+            stop_reason = decision["reason"]
+        elif code_review_report:
             code_report = CodeReviewReport.model_validate(code_review_report)
             finish_reason = (
                 "CODE_APPLIED"
                 if code_report.verdict == "PASSED"
-                else "CODE_ESCALATED"
+                else "CODE_REPLAN_REQUIRED"
             )
             stop_reason = (
                 "Code Reviewer已完成发布并提交APPLIED报告。"
                 if code_report.verdict == "PASSED"
-                else "Code Reviewer未批准候选并已上报Scheduler。"
+                else "Code Reviewer未批准候选，已停止归档并请求全局Replan。"
             )
         elif current_step.worker_kind == "GENERAL" and trace.get("general_result"):
             finish_reason = "GENERAL_SELF_REPORT"
@@ -3594,9 +3381,8 @@ def build_planning_graph(
                 "context": _record_skill_traces(_context(state), [trace]),
                 "current_step_stop_reason": stop_reason,
                 "current_code_runtime_session_id": code_runtime_session_id_result,
-                "current_code_scheduler_decision": None,
-                "current_code_control_rounds": code_control_rounds,
-                "code_control_history": code_control_history,
+
+
                 "code_superseded_attempt_records": code_superseded_attempt_records_result,
                 "remaining_steps": remaining_steps,
                 "model_rounds_used": model_rounds_used,
@@ -3620,13 +3406,6 @@ def build_planning_graph(
                     if current_step.worker_kind == "GENERAL"
                     else "step_reporter"
                 ),
-            )
-
-        code_requires_scheduler = False
-        if current_step.worker_kind == "CODE" and code_review_loop:
-            code_requires_scheduler = (
-                CodeReviewLoopState.model_validate(code_review_loop).status
-                == "ESCALATED_TO_SCHEDULER"
             )
 
         return Command(
@@ -3680,13 +3459,6 @@ def build_planning_graph(
                     code_runtime_session_id_result
                 ),
 
-                # The directive is single-use. The runtime result records what
-                # was applied; a later escalation must receive a fresh decision.
-                "current_code_scheduler_decision": None,
-
-                "current_code_control_rounds": code_control_rounds,
-
-                "code_control_history": code_control_history,
 
                 "code_superseded_attempt_records": (
                     code_superseded_attempt_records_result
@@ -3711,211 +3483,19 @@ def build_planning_graph(
                 ),
 
                 "retry_current_step": can_replace,
-                "plan_challenge_resume_active": False,
-                "plan_challenge_scheduler_instruction": "",
+
+
             },
 
             goto=(
                 "step_executor"
                 if can_replace
                 else (
-                    "code_controller"
-                    if code_requires_scheduler
-                    else "general_report" if current_step.worker_kind == "GENERAL" else "step_reporter"
+                    "general_report" if current_step.worker_kind == "GENERAL" else "step_reporter"
                 )
             ),
         )
 
-    async def code_controller_node(
-        state: PlanningState,
-        config: RunnableConfig,
-    ) -> Command[Literal["step_executor", "step_reporter"]]:
-        """Turn one Reviewer escalation into an executable CODE directive.
-
-        The Reviewer supplies evidence and a recommendation.  This node is the
-        Scheduler-owned policy boundary: it independently chooses CONTINUE,
-        RESTART, or STOP, persists that decision, then sends it through the
-        normal Step Executor so Code Runtime can mutate the real session.
-        """
-
-        current_step = state.get("current_step")
-        trace = dict(state.get("current_step_trace") or {})
-        raw_loop = trace.get("code_review_loop")
-        raw_report = trace.get("code_review_report")
-        session_id = str(
-            state.get("current_code_runtime_session_id") or ""
-        ).strip()
-
-        if (
-            current_step is None
-            or current_step.worker_kind != "CODE"
-            or not raw_loop
-            or not raw_report
-            or not session_id
-        ):
-            trace["code_controller_error"] = (
-                "Reviewer escalation is missing its CODE Step, report, "
-                "review loop, or live runtime session."
-            )
-            return Command(
-                update={
-                    "current_step_trace": trace,
-                    "current_step_stop_reason": trace["code_controller_error"],
-                    "retry_current_step": False,
-                },
-                goto="step_reporter",
-            )
-
-        loop = CodeReviewLoopState.model_validate(raw_loop)
-        report = CodeReviewReport.model_validate(raw_report)
-        if loop.status != "ESCALATED_TO_SCHEDULER":
-            raise ValueError(
-                "Code Controller requires an ESCALATED_TO_SCHEDULER loop."
-            )
-        if report.candidate != loop.candidate:
-            raise ValueError("Code Controller received a stale Reviewer report.")
-
-        control_rounds = state.get("current_code_control_rounds", 0)
-        model_remaining = _plan_model_rounds_remaining(state, planning)
-        proposal_rounds = 0
-        proposal_error = None
-        if (
-            report.recovery_proposal is None
-            and model_remaining >= HARD_CALL_MAX_ROUNDS + 3
-        ):
-            from review_recovery import build_recovery_proposal
-
-            proposal, proposal_rounds, proposal_error = await build_recovery_proposal(
-                role_model("code_reviewer", simple_model),
-                worker_kind="CODE",
-                user_request=_context(state).user_request,
-                current_step=current_step,
-                review_output=report,
-                trigger_source="code_reviewer",
-            )
-            if proposal is not None:
-                report = report.model_copy(update={"recovery_proposal": proposal})
-                trace["code_review_report"] = report.model_dump(mode="json")
-            model_remaining = max(0, model_remaining - proposal_rounds)
-        if report.recovery_proposal is not None:
-            from review_recovery import resolve_recovery_human_decision
-
-            resolved_proposal = await resolve_recovery_human_decision(
-                report.recovery_proposal,
-                event_id=str(
-                    state.get("event_id")
-                    or state.get("planning_run_id")
-                    or "planning"
-                ),
-                user_request=_context(state).user_request,
-                current_step=current_step,
-            )
-            report = report.model_copy(
-                update={"recovery_proposal": resolved_proposal}
-            )
-            trace["code_review_report"] = report.model_dump(mode="json")
-        forced_reason = ""
-        human_decision = (
-            (report.recovery_proposal or {}).get("human_decision") or {}
-        )
-        if human_decision.get("status") == "APPROVED":
-            forced_reason = (
-                "The user approved a Reviewer-proposed CODE contract downgrade. "
-                "Stop and archive the current frozen session; only the global "
-                "Replanner may create the revised CODE contract."
-            )
-        elif report.confirmed_plan_challenge is not None:
-            forced_reason = (
-                "Code Reviewer confirmed a material plan conflict; stop this frozen "
-                "CODE session so the Planning Graph can ask Scheduler to adjudicate it."
-            )
-        elif control_rounds >= planning.max_step_attempts:
-            forced_reason = (
-                "The CODE control-round limit was reached; stop the frozen "
-                "attempt instead of creating an unbounded repair loop."
-            )
-        elif model_remaining < HARD_CALL_MAX_ROUNDS + 2:
-            forced_reason = (
-                "The remaining plan-model budget cannot safely fund both a "
-                "Scheduler decision and another Worker/Reviewer exchange."
-            )
-
-        if forced_reason:
-            decision = SchedulerCodeDecision(
-                action="STOP",
-                reason=forced_reason,
-            )
-            controller_rounds = 0
-            used_fallback = True
-        else:
-            result = await run_hard_code_scheduler(
-                role_model("code_scheduler", hard_model),
-                context=_context(state),
-                plan_objective=state["plan_objective"],
-                current_step=current_step,
-                code_review_loop=loop,
-                code_review_report=report,
-                code_control_history=state.get("code_control_history", []),
-                remaining_budget=_remaining_budget(state, planning),
-            )
-            decision = result.output
-            controller_rounds = result.model_rounds_used
-            used_fallback = result.used_fallback
-
-        controller_rounds += proposal_rounds
-
-        history = list(state.get("code_control_history", []))
-        history.append(
-            {
-                "session_id": session_id,
-                "attempt_id": loop.candidate.attempt_id,
-                "candidate_revision": loop.candidate.candidate_revision,
-                "reviewer_verdict": report.verdict,
-                "reviewer_recommendation": report.recommended_action,
-                "scheduler_decision": decision.model_dump(mode="json"),
-                "used_fallback": used_fallback,
-                "model_rounds_used": controller_rounds,
-                "recovery_proposal_generated": report.recovery_proposal is not None,
-                "recovery_proposal_error": proposal_error,
-                "decided_at": datetime.now(timezone.utc).isoformat(),
-            }
-        )
-
-        await _emit_progress(
-            config,
-            ProgressEvent(
-                stage="STEP_STARTED",
-                message=(
-                    f"第{current_step.step_id}步的代码验收需要恢复决策；"
-                    f"Scheduler已选择{decision.action}。"
-                ),
-                step_id=current_step.step_id,
-                status=f"CONTROL_{control_rounds + 1}",
-            ),
-        )
-
-        return Command(
-            update={
-                "current_code_scheduler_decision": decision.model_dump(
-                    mode="json"
-                ),
-                "current_step_trace": trace,
-                "current_code_control_rounds": control_rounds + 1,
-                "code_control_history": history,
-                "model_rounds_used": (
-                    state.get("model_rounds_used", 0) + controller_rounds
-                ),
-                "current_step_model_rounds": (
-                    state.get("current_step_model_rounds", 0)
-                    + controller_rounds
-                ),
-                "current_step_stop_reason": (
-                    f"Scheduler chose {decision.action}: {decision.reason}"
-                ),
-                "retry_current_step": True,
-            },
-            goto="step_executor",
-        )
 
     async def finish_step(
         state: PlanningState,
@@ -3945,6 +3525,44 @@ def build_planning_graph(
 
                 goto="final_reviewer",
             )
+
+        objection_traces = state.get("current_step_worker_traces") or [state.get("current_step_trace", {})]
+        accepted = [t.get("worker_objection_outcome") for t in objection_traces if t.get("worker_objection_outcome")]
+        if accepted:
+            outcome = next((o for o in accepted if o.get("decision", {}).get("action") == "FINISH"), accepted[0])
+            action = outcome["decision"]["action"]
+            reason = outcome["decision"]["reason"]
+            objection = outcome.get("objection") or {}
+            summary = "Scheduler stopped the current execution after a Worker planning objection. " + reason
+            if objection:
+                summary += "\nWorker's stated problem (not independently verified): " + str(objection.get("problem", ""))
+                summary += "\nWorker's stated reason: " + str(objection.get("reason", ""))
+            report = StepReport(
+                step_id=current_step.step_id, status="BLOCKED", assessment_source="SCHEDULER_CONTROL",
+                summary=summary,
+                stop_reason=reason,
+                criterion_results=[StepCriterionResult(criterion=c, status="UNKNOWN", evidence=[])
+                                   for c in current_step.acceptance_criteria],
+                unresolved_items=list(current_step.acceptance_criteria),
+                request_replan=action == "REPLAN", replan_reason=reason if action == "REPLAN" else None,
+                next_action=objection.get("suggested_direction") or None,
+            )
+            group_id = state.get("current_worker_group_id", "")
+            if group_id:
+                review_id = f"{group_id}:objection"
+                claim = await worker_group_coordinator.claim_reporter(group_id=group_id, review_id=review_id, changed_at=datetime.now(timezone.utc))
+                if claim.record.report is None:
+                    if not claim.owned_by_caller:
+                        raise RuntimeError("Objection closure is owned by another reporter")
+                    await worker_group_coordinator.complete_reporter(group_id=group_id, review_id=review_id, report=report.model_dump(mode="json"), changed_at=datetime.now(timezone.utc))
+            return Command(update={
+                "completed_step_reports": _replace_step_report(state.get("completed_step_reports", []), report),
+                "pending_replan_reason": reason if action == "REPLAN" else "",
+                "pending_replan_source": "worker_objection" if action == "REPLAN" else "",
+                "overall_stop_reason": "scheduler_worker_objection_" + action.lower(),
+                "retry_current_step": False,
+                "final_worker_role_review_pending": False,
+            }, goto="replanner" if action == "REPLAN" else "final_reviewer")
 
         limit = _reporter_limit(
             state,
@@ -4203,16 +3821,12 @@ def build_planning_graph(
         # Preserve accepted worker knowledge verbatim across the review boundary.
         # Review verdicts remain separate; this is not a certification of each fact.
         from handoff_knowledge import (
-            collect_api_handoff_receipts,
-            collect_api_handoffs,
             collect_handoff_knowledge,
         )
         handoff_traces = state.get("current_step_worker_traces") or [state.get("current_step_trace", {})]
         if persisted_report is None:
             report = report.model_copy(update={
                 "handoff_knowledge": collect_handoff_knowledge(handoff_traces),
-                "handoff_apis": collect_api_handoffs(handoff_traces),
-                "handoff_api_receipts": collect_api_handoff_receipts(handoff_traces),
             })
 
         if worker_group_id and persisted_report is None:
@@ -4306,22 +3920,6 @@ def build_planning_graph(
         raw_code_report = state.get("current_step_trace", {}).get(
             "code_review_report"
         )
-        raw_code_scheduler_decision = state.get("current_step_trace", {}).get(
-            "code_scheduler_decision_applied"
-        )
-        code_effective_action = (
-            SchedulerCodeDecision.model_validate(
-                raw_code_scheduler_decision
-            ).action
-            if raw_code_scheduler_decision
-            else (
-                CodeReviewReport.model_validate(
-                    raw_code_report
-                ).recommended_action
-                if raw_code_report
-                else None
-            )
-        )
         can_retry = (
             not budget_exhausted
             # Web review is deliberately one-way: the Reporter compresses and
@@ -4362,9 +3960,8 @@ def build_planning_graph(
             )
             > 0
 
-            # Reviewer STOP is a deliberate terminal recommendation.  A
-            # generic retry would silently override the CODE control plane.
-            and code_effective_action != "STOP"
+            # Structured CODE failure reports go to global replan, not a generic retry.
+            and not raw_code_report
         )
 
         step_id = (
@@ -4558,14 +4155,6 @@ def build_planning_graph(
 
         if report.request_replan:
             if replan_available:
-                has_worker_plan_challenge = any(
-                    attempt.plan_challenge is not None
-                    for attempt in review_packet.attempts
-                ) or bool(
-                    current_step.worker_kind == "CODE"
-                    and raw_code_report
-                    and CodeReviewReport.model_validate(raw_code_report).confirmed_plan_challenge
-                )
                 update.update(
                     {
                         "pending_replan_reason": (
@@ -4573,11 +4162,7 @@ def build_planning_graph(
                             or report.summary
                         ),
 
-                        "pending_replan_source": (
-                            "worker_plan_challenge"
-                            if has_worker_plan_challenge
-                            else "step_reporter"
-                        ),
+                        "pending_replan_source": "step_reporter",
 
                         "overall_stop_reason": (
                             "step_report_requested_replan"
@@ -4683,21 +4268,13 @@ def build_planning_graph(
                 goto="final_reviewer",
             )
 
-        challenge_flow = bool(
-            state.get("pending_replan_source") == "worker_plan_challenge"
-            and state.get("current_step") is not None
-        )
         max_steps = min(
             planning.max_steps_per_plan,
 
-            _remaining_step_capacity(state, planning) + (1 if challenge_flow else 0),
+            _remaining_step_capacity(state, planning),
         )
 
-        next_step_id = (
-            state["current_step"].step_id
-            if challenge_flow
-            else _next_step_id(state)
-        )
+        next_step_id = _next_step_id(state)
 
         reason = (
             state.get(
@@ -4796,9 +4373,7 @@ def build_planning_graph(
                 ),
 
                 remaining_steps=(
-                    [state["current_step"], *state.get("remaining_steps", [])]
-                    if challenge_flow
-                    else state.get("remaining_steps", [])
+                    state.get("remaining_steps", [])
                 ),
 
                 remaining_budget=(
@@ -4982,85 +4557,6 @@ def build_planning_graph(
             }
         )
 
-        if challenge_flow and decision.action == "RETURN_TO_WORKER":
-            current_step = state["current_step"]
-            resume_same_worker = (
-                current_step.worker_kind in {"GENERAL", "WEB", "CODE"}
-                and current_step.execution_mode == "SINGLE"
-            )
-            instruction = decision.worker_instruction or decision.reason
-            return Command(
-                update={
-                    "replans_used": state.get("replans_used", 0) + 1,
-                    "replan_history": history,
-                    "pending_replan_reason": "",
-                    "pending_replan_source": "",
-                    "model_rounds_used": state.get("model_rounds_used", 0) + result.model_rounds_used,
-                    "phase_tool_calls_used": 0,
-                    "retry_current_step": True,
-                    "plan_challenge_resume_active": resume_same_worker,
-                    "plan_challenge_scheduler_instruction": instruction,
-                    "current_step_leadership_override": (
-                        "Scheduler驳回计划异议：" + instruction
-                    ),
-                    # Code Reviewer在上送计划异议时会冻结当前执行。
-                    # Scheduler驳回后沿用原线程与运行会话，但不能重放STOP。
-                    "current_code_scheduler_decision": None,
-                    "current_code_control_rounds": 0,
-                    "code_control_history": [],
-                    "overall_stop_reason": "scheduler_rejected_worker_plan_challenge",
-                },
-                goto="step_executor",
-            )
-
-        if challenge_flow and decision.action == "CONTINUE" and new_steps:
-            previous_step = state["current_step"]
-            revised_step = new_steps[0]
-            # A Scheduler-accepted replacement is a genuinely new assignment.
-            # Start a fresh role session so Worker and Reviewer skills are
-            # selected from the revised contract instead of inheriting the
-            # snapshot chosen for the rejected Step.
-            resume_same_worker = False
-            instruction = (
-                "Scheduler接受计划异议并替换了当前及后续步骤。"
-                f"裁决依据：{decision.reason}"
-            )
-            return Command(
-                update={
-                    "remaining_steps": new_steps[1:],
-                    "planned_steps": [*state.get("planned_steps", []), *new_steps],
-                    "current_step": revised_step,
-                    "current_step_trace": {},
-                    "current_step_worker_traces": [],
-                    "current_worker_group_id": "",
-                    "current_step_stop_reason": "",
-                    "current_step_executor_rounds": 0,
-                    "current_step_report_rounds": 0,
-                    "current_step_model_rounds": 0,
-                    "current_step_tool_calls": 0,
-                    "current_step_replacement_history": [],
-                    "current_code_runtime_session_id": "" if not resume_same_worker else state.get("current_code_runtime_session_id", ""),
-                    "current_code_scheduler_decision": None,
-                    "current_code_control_rounds": 0,
-                    "code_control_history": [],
-                    "code_superseded_attempt_records": [],
-                    "retry_current_step": True,
-                    "plan_challenge_resume_active": resume_same_worker,
-                    "plan_challenge_scheduler_instruction": instruction,
-                    "current_step_leadership_override": (
-                        "" if resume_same_worker else instruction
-                    ),
-                    "replans_used": state.get("replans_used", 0) + 1,
-                    "replan_history": history,
-                    "pending_replan_reason": "",
-                    "pending_replan_source": "",
-                    "model_rounds_used": state.get("model_rounds_used", 0) + result.model_rounds_used,
-                    "phase_tool_calls_used": 0,
-                    "overall_stop_reason": "scheduler_accepted_worker_plan_challenge",
-                },
-                goto="step_executor",
-            )
-
         update: dict[
             str,
             Any,
@@ -5097,11 +4593,6 @@ def build_planning_graph(
 
             "current_code_runtime_session_id": "",
 
-            "current_code_scheduler_decision": None,
-
-            "current_code_control_rounds": 0,
-
-            "code_control_history": [],
 
             "code_superseded_attempt_records": [],
 
@@ -5125,9 +4616,7 @@ def build_planning_graph(
 
             "pending_replan_source": "",
 
-            "plan_challenge_resume_active": False,
 
-            "plan_challenge_scheduler_instruction": "",
 
             "model_rounds_used": (
                     state.get(
@@ -5285,9 +4774,9 @@ def build_planning_graph(
                 )
 
         repair_round = state.get("final_worker_repair_round", 0)
-        latest_worker_evidence = _final_worker_evidence(state)
         return_available = bool(
-            latest_worker_evidence
+            state.get("current_step_trace")
+            and not state["current_step_trace"].get("worker_objection_outcome")
             and state.get("current_step") is not None
             and state["current_step"].execution_mode == "SINGLE"
             and repair_round < planning.max_final_worker_repair_rounds
@@ -5319,7 +4808,7 @@ def build_planning_graph(
             ),
             replan_available=can_replan,
             plan_steps=state.get("planned_steps", []),
-            latest_worker_evidence=latest_worker_evidence,
+            return_to_worker_available=return_available,
             repair_history=state.get("final_worker_repair_history", []),
             repair_round=repair_round,
             max_repair_rounds=(
@@ -5440,41 +4929,37 @@ def build_planning_graph(
     workflow = StateGraph(
         PlanningState
     )
-    workflow.add_node("prepare_scheduler", scheduler_node(prepare_scheduler_node, planning.scheduler_summary_trigger_tokens))
+    workflow.add_node("prepare_scheduler", scheduler_node(prepare_scheduler_node, planning.scheduler_summary_trigger_tokens, planning.scheduler_compaction_enabled))
     workflow.add_node(
         "direct_answer",
-        scheduler_node(direct_answer_node, planning.scheduler_summary_trigger_tokens),
+        scheduler_node(direct_answer_node, planning.scheduler_summary_trigger_tokens, planning.scheduler_compaction_enabled),
     )
 
     workflow.add_node(
         "supervisor",
-        scheduler_node(supervisor_node, planning.scheduler_summary_trigger_tokens),
+        scheduler_node(supervisor_node, planning.scheduler_summary_trigger_tokens, planning.scheduler_compaction_enabled),
     )
 
     workflow.add_node(
         "step_executor",
-        scheduler_node(step_executor_node, planning.scheduler_summary_trigger_tokens),
+        scheduler_node(step_executor_node, planning.scheduler_summary_trigger_tokens, planning.scheduler_compaction_enabled),
     )
 
-    workflow.add_node(
-        "code_controller",
-        scheduler_node(code_controller_node, planning.scheduler_summary_trigger_tokens),
-    )
 
     workflow.add_node(
         "step_reporter",
-        scheduler_node(step_reporter_node, planning.scheduler_summary_trigger_tokens),
+        scheduler_node(step_reporter_node, planning.scheduler_summary_trigger_tokens, planning.scheduler_compaction_enabled),
     )
-    workflow.add_node("general_report", scheduler_node(general_report_node, planning.scheduler_summary_trigger_tokens))
+    workflow.add_node("general_report", scheduler_node(general_report_node, planning.scheduler_summary_trigger_tokens, planning.scheduler_compaction_enabled))
 
     workflow.add_node(
         "replanner",
-        scheduler_node(replanner_node, planning.scheduler_summary_trigger_tokens),
+        scheduler_node(replanner_node, planning.scheduler_summary_trigger_tokens, planning.scheduler_compaction_enabled),
     )
 
     workflow.add_node(
         "final_reviewer",
-        scheduler_node(final_reviewer_node, planning.scheduler_summary_trigger_tokens),
+        scheduler_node(final_reviewer_node, planning.scheduler_summary_trigger_tokens, planning.scheduler_compaction_enabled),
     )
 
     workflow.add_edge(
@@ -5569,18 +5054,6 @@ def _build_code_step_report(
             f"integration_commit={integration_commit.accepted_commit}"
         )
 
-    raw_scheduler_decision = trace.get("code_scheduler_decision_applied")
-    scheduler_decision = (
-        SchedulerCodeDecision.model_validate(raw_scheduler_decision)
-        if raw_scheduler_decision
-        else None
-    )
-    effective_action = (
-        scheduler_decision.action
-        if scheduler_decision is not None
-        else report.recommended_action
-    )
-
     if applied:
         status = "COMPLETED"
         criterion_status = "MET"
@@ -5592,36 +5065,15 @@ def _build_code_step_report(
     else:
         status = "BLOCKED" if report.verdict == "ESCALATED" else "FAILED"
         criterion_status = "UNKNOWN"
-        unresolved = list(current_step.success_criteria)
+        unresolved = list(current_step.acceptance_criteria)
         errors = [*report.failed_test_summaries]
         if not errors:
             errors = [report.verification_summary]
-        # RESTART is now executed by Code Controller before this adapter is
-        # reached.  A terminal STOP must not accidentally fall back to the old
-        # generic retry/replan path because the Reviewer had recommended a
-        # different action one state transition earlier.
-        request_replan = (
-            report.confirmed_plan_challenge is not None
-            or report.recovery_proposal is not None
-        )
+        request_replan = True
         replan_reason = (
-            report.confirmed_plan_challenge.reason
-            if report.confirmed_plan_challenge is not None
-            else (
-                str(report.recovery_proposal.get("reason") or report.summary)
-                if report.recovery_proposal is not None
-                else None
-            )
+            str((report.recovery_proposal or {}).get("reason") or report.summary)
         )
-        stop_reason = (
-            "Code Reviewer escalated the candidate and Scheduler applied "
-            f"{effective_action}."
-        )
-        if scheduler_decision is not None:
-            evidence.append(
-                "scheduler_decision="
-                f"{scheduler_decision.action}: {scheduler_decision.reason}"
-            )
+        stop_reason = "Code Reviewer did not approve the candidate; request global replan."
 
     raw_handoff_receipts = trace.get("code_handoff_publication_receipts") or []
     if raw_handoff_receipts:
@@ -5663,16 +5115,12 @@ def _build_code_step_report(
     worker_id = str(trace.get("worker_id") or "code-worker")
 
     from handoff_knowledge import (
-        collect_api_handoff_receipts,
-        collect_api_handoffs,
         collect_handoff_knowledge,
     )
     return StepReport(
         step_id=current_step.step_id,
         answer_text=code_answer_text,
         handoff_knowledge=collect_handoff_knowledge([trace]),
-        handoff_apis=collect_api_handoffs([trace]),
-        handoff_api_receipts=collect_api_handoff_receipts([trace]),
         recovery_proposal=report.recovery_proposal,
         status=status,
         summary=report.summary,
@@ -5683,7 +5131,7 @@ def _build_code_step_report(
                 status=criterion_status,
                 evidence=evidence if applied else [],
             )
-            for criterion in current_step.success_criteria
+            for criterion in current_step.acceptance_criteria
         ],
         confirmed_results=confirmed_results,
         completed_work=completed_work,
@@ -5700,7 +5148,7 @@ def _build_code_step_report(
         next_action=(
             None
             if applied
-            else f"Scheduler action: {effective_action}."
+            else "Global Replanner must decide whether to create a new step or finish."
         ),
         request_replan=request_replan,
         replan_reason=replan_reason,

@@ -412,3 +412,5 @@ Code Worker 自己在候选容器内创建的 commit 不具有验收权；只有
 Built as a personal agent runtime for Feishu.
 
 </div>
+
+本机 Ubuntu/WSL 因空间整理移除后的恢复方法见 [环境恢复说明](docs/environment-recovery.md)。

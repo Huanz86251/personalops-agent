@@ -13,7 +13,7 @@ ROLE_NAMES = {
     "capability_selector": "Capability Selector",
     "host_file_judge": "Host File Judge",
     "scope_resolver": "Scope Resolver",
-    "scheduler": "Scheduler", "code_scheduler": "Scheduler / Code Recovery",
+    "scheduler": "Scheduler",
     "replanner": "Scheduler / Replan", "final_reviewer": "Scheduler / Final Review",
     "worker_leader": "Scheduler / Worker Leader", "general": "General Agent",
     "web": "Web Agent", "code": "Code Worker", "reviewer": "Code Reviewer", "code_reviewer": "Code Reviewer",
@@ -26,7 +26,7 @@ ROLE_NAMES = {
 
 ID_KEYS = ("event_id", "step_id", "worker_id", "attempt_id", "workspace_id",
            "candidate_revision", "thread_id", "planning_run_id", "pair_id",
-           "code_runtime_session_id", "repair_round", "scheduler_epoch", "attempt_no", "current_step_attempt")
+           "code_runtime_session_id", "repair_round",  "attempt_no", "current_step_attempt")
 
 def identities(value):
     if hasattr(value, "__dataclass_fields__"):
@@ -52,14 +52,14 @@ def summary(value):
         value = value.update
     if isinstance(value, Mapping):
         keys = (*ID_KEYS, "status", "final_status", "final_answer", "overall_stop_reason", "planning_failure",
-                "code_review_loop", "code_review_report", "code_worker_submission", "code_scheduler_decision_applied",
+                "code_review_loop", "code_review_report", "code_worker_submission",
                 "code_publication_receipt", "code_integration_status", "code_attempt_final_record",
                 "summary", "reason", "verdict", "action", "exit_code", "truncated", "phase",
                 "output", "selected", "role", "mode", "selection_method", "snapshot_sha256", "catalog_sha256", "model_calls",
                 "objective", "success_criteria", "requirements", "validation_expectations", "current_step", "remaining_steps",
                 "current_step_attempt", "completed_step_reports", "code_task", "worker_kind", "findings", "check_results",
                 "verification_summary", "failed_test_summaries", "requirement_status", "changed_files", "approved_artifact_paths",
-                "published_artifact_paths", "delivery_location", "publication_id", "applied_revision", "recommended_action",
+                "published_artifact_paths", "delivery_location", "publication_id", "applied_revision",
                 "worker_instruction", "reviewer_instruction", "repair_rounds", "statement", "description", "evidence_refs",
                 "candidate_id", "frame_id", "record_type", "candidates", "frames", "confidence", "importance", "field", "value",
                 "raw_user_text", "queued_at", "base_revision", "applied_revision", "manifest_id", "artifacts", "sha256")

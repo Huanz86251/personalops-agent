@@ -15,7 +15,7 @@ class SharedTests(RagTests):
         self.assertIn('verify ratings',q)
         self.assertNotIn('预算',q)
         self.assertNotIn('StepReport',q)
-        q=task_query('four rounds remaining',{'requirements':[{'statement':'Spotify ratings'}],'implementation_guidance':['submit JSON']})
+        q=task_query('four rounds remaining',{'requirements':[{'statement':'Spotify ratings'}],'non_goals':['submit JSON']})
         self.assertIn('Spotify',q);self.assertNotIn('four rounds',q);self.assertNotIn('submit JSON',q)
 
     def test_code_boundary_shares_one_retrieval_and_readable_grants(self):

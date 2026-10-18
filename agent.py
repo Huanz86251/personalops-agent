@@ -737,7 +737,7 @@ def _extract_current_turn_messages(
 
 
 def _extract_handoff_source_messages(result: Any, messages: list) -> list:
-    """Keep only Tool results explicitly referenced by structured API handoff.
+    """Keep request/result pairs explicitly referenced by knowledge handoff.
 
     Compaction may move early documentation results out of the current turn.
     The planning trace needs these few records to validate handoff entries, but
@@ -748,19 +748,21 @@ def _extract_handoff_source_messages(result: Any, messages: list) -> list:
 
     source_ids: set[str] = set()
 
-    def visit(value: Any, *, inside_apis: bool = False) -> None:
+    def visit(value: Any, *, inside_knowledge: bool = False) -> None:
         if hasattr(value, "model_dump"):
             value = value.model_dump(mode="json")
         if isinstance(value, dict):
             for key, item in value.items():
-                active = inside_apis or key == "handoff_apis"
-                if active and key == "tool_call_id" and isinstance(item, str):
+                active = inside_knowledge or key == "handoff_knowledge"
+                if active and key == "evidence_refs" and isinstance(item, list):
+                    source_ids.update(ref for ref in item if isinstance(ref, str))
+                elif active and key == "tool_call_id" and isinstance(item, str):
                     source_ids.add(item)
                 else:
-                    visit(item, inside_apis=active)
+                    visit(item, inside_knowledge=active)
         elif isinstance(value, (list, tuple)):
             for item in value:
-                visit(item, inside_apis=inside_apis)
+                visit(item, inside_knowledge=inside_knowledge)
 
     for key in ("general_result", "worker_submission", "code_worker_submission"):
         visit(result.get(key))
@@ -772,9 +774,12 @@ def _extract_handoff_source_messages(result: Any, messages: list) -> list:
     seen: set[str] = set()
     for message in candidates:
         call_id = _read_tool_call_id(message)
-        if call_id in source_ids and call_id not in seen:
+        raw = message.model_dump(mode="json") if hasattr(message, "model_dump") else message
+        requests = raw.get("tool_calls", []) if isinstance(raw, dict) else []
+        requested = any(call.get("id") in source_ids for call in requests)
+        if requested or (call_id in source_ids and call_id not in seen):
             selected.append(message)
-            seen.add(call_id)
+            if call_id: seen.add(call_id)
     return selected
 
 
@@ -1121,6 +1126,7 @@ async def ask_worker(
     for counter in (
         "executor_model_calls_used", "executor_tool_calls_used",
         "skill_preparation_calls_used", "worker_compaction_calls_used",
+        "worker_leadership_model_rounds_used",
     ):
         input_state.setdefault(counter, 0)
 
@@ -1264,7 +1270,8 @@ async def ask_worker(
                 )
             )
         from workers.history_archive import history_scope
-        with shared_code_scope(shared_owner), history_scope(thread_id.split(':step_', 1)[0], thread_id):
+        from workers.plan_objection import objection_scope
+        with shared_code_scope(shared_owner), history_scope(thread_id.split(':step_', 1)[0], thread_id), objection_scope((runtime_configurable or {}).get("worker_objection_handler")):
             result = await agent.ainvoke(
                 input_state,
 
@@ -1484,6 +1491,8 @@ async def ask_worker(
             )
             review_evidence = resolve_all_tool_evidence(review_messages)
             details = {
+                "worker_objection_outcome": result.get("worker_objection_outcome") if isinstance(result, dict) else None,
+                "worker_objection_records": result.get("worker_objection_records", []) if isinstance(result, dict) else [],
                 "general_result": result.get("general_result") if isinstance(result, dict) else None,
                 "final_answer": (
                     answer
@@ -1569,7 +1578,7 @@ async def ask_worker(
                     "code_attempt_archive",
                     "code_attempt_final_record",
                     "code_runtime_session_id",
-                    "code_scheduler_decision_applied",
+
                     "role_skill_snapshot",
                     "skill_preparation_calls_used",
                     "code_superseded_attempt_records",

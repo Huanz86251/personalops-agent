@@ -68,6 +68,7 @@ class RepairAwareWorker:
 class FinalLoopModel:
     def __init__(self):
         self.final_calls = 0
+        self.final_inputs = []
 
     def with_structured_output(self, schema, **kwargs):
         async def respond(messages):
@@ -84,6 +85,8 @@ class FinalLoopModel:
                     }],
                 }
             elif schema.__name__ == "FinalReviewDecision":
+                pack = json.loads(messages[1]['content'])['独立审核材料']
+                self.final_inputs.append(pack)
                 self.final_calls += 1
                 if self.final_calls == 1:
                     value = {
@@ -211,6 +214,9 @@ class FinalWorkerRepairLoopTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["final_status"], "COMPLETED")
         self.assertEqual(model.final_calls, 2)
+        self.assertTrue(model.final_inputs[0]['return_to_worker_available'])
+        self.assertTrue(model.final_inputs[0]['step_reports'])
+        self.assertTrue(all('latest_worker_evidence' not in pack for pack in model.final_inputs))
         self.assertEqual(len(worker.calls), 2)
         self.assertEqual(worker.calls[0]["thread_id"], worker.calls[1]["thread_id"])
         self.assertIsNone(worker.calls[0]["repair"])

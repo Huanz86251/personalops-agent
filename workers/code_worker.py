@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 from workers.compaction import WorkerCompactionMiddleware
+from workers.default_middleware import DisabledDefaultSummarizationMiddleware
 
 import json
 from collections.abc import Sequence
 
 from deepagents import FilesystemMiddleware, create_deep_agent
 from workers.file_access import TaskFileAccessMiddleware
+from workers.plan_objection import objection_tools, WorkerObjectionMiddleware, RAISE_PLAN_OBJECTION_NAME
 from deepagents.backends import StateBackend
 from deepagents.backends.protocol import BackendProtocol
 from langchain.agents.middleware import AgentMiddleware
@@ -22,10 +24,10 @@ from skill_runtime.middleware import RoleSkillsMiddleware
 from workers.code_state import CodeAgentState, CodeRuntimeContextMiddleware
 from workers.code_submission import (
     RESPOND_TO_CODE_REVIEW_NAME,
-    SUBMIT_CONTINUED_CODE_FOR_REVIEW_NAME,
+
     SUBMIT_CODE_FOR_REVIEW_NAME,
     respond_to_code_review,
-    submit_continued_code_for_review,
+
     submit_code_for_review,
 )
 from workers.context import WorkerRuntimeContextMiddleware
@@ -79,10 +81,11 @@ def create_code_worker(
         select_general_worker_tools(tools, allow_file_export=True)
     )
     reserved = {
+        RAISE_PLAN_OBJECTION_NAME,
         PUBLISH_WORKER_PROGRESS_NAME,
         SUBMIT_CODE_FOR_REVIEW_NAME,
         RESPOND_TO_CODE_REVIEW_NAME,
-        SUBMIT_CONTINUED_CODE_FOR_REVIEW_NAME,
+
         REQUEST_ADDITIONAL_CAPABILITIES_NAME,
         ASK_USER_NAME,
     }
@@ -116,29 +119,31 @@ def create_code_worker(
     progress = CodeWorkerProgressMiddleware(
         every_tool_calls=progress_every_tool_calls,
         schema_repair_max_rounds=schema_repair_max_rounds,
-        finalization_tools=(SUBMIT_CODE_FOR_REVIEW_NAME, RESPOND_TO_CODE_REVIEW_NAME, SUBMIT_CONTINUED_CODE_FOR_REVIEW_NAME),
+        finalization_tools=(SUBMIT_CODE_FOR_REVIEW_NAME, RESPOND_TO_CODE_REVIEW_NAME),
     )
 
     ask_user = create_ask_user_tool("CODE_WORKER")
     graph = create_deep_agent(
         model=model,
         tools=[
+            *objection_tools(),
             *business_tools,
             ask_user,
             request_additional_capabilities,
             publish_worker_progress,
             submit_code_for_review,
             respond_to_code_review,
-            submit_continued_code_for_review,
+
         ],
         system_prompt=load_prompt("workers/code_worker"),
         backend=resolved_backend,
         middleware=[
+            WorkerObjectionMiddleware(),
+            DisabledDefaultSummarizationMiddleware(),
             *policies,
             KnowledgeMiddleware('Code Worker'),
             ExecutionHistoryMiddleware(),
             ExecutionStateMiddleware(),
-            WorkerCompactionMiddleware(summary_model if summary_model is not None else model),
             RoleSkillsMiddleware(model, "code", allowed_names,
                                  policies=middleware or (), backend=resolved_backend),
             WorkerRuntimeContextMiddleware(execution_reserve=1),
@@ -148,6 +153,7 @@ def create_code_worker(
             progress,
             WorkerToolAllowlistMiddleware(allowed_names),
             EvidenceReferenceMiddleware(),
+            WorkerCompactionMiddleware(summary_model if summary_model is not None else model, request_aware=True),
         ],
         state_schema=CodeAgentState,
         checkpointer=checkpointer,

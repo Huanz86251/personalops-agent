@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 from workers.compaction import WorkerCompactionMiddleware
+from workers.default_middleware import DisabledDefaultSummarizationMiddleware
 
 import json
 from collections.abc import Sequence
@@ -121,21 +122,22 @@ def create_code_reviewer(
         system_prompt=load_prompt("reviewers/code"),
         backend=resolved_backend,
         middleware=[
+            DisabledDefaultSummarizationMiddleware(),
             *policies,
             KnowledgeMiddleware('Code Reviewer'),
             ExecutionHistoryMiddleware(),
             ExecutionStateMiddleware(),
-            WorkerCompactionMiddleware(summary_model if summary_model is not None else model),
             RoleSkillsMiddleware(model, "reviewer", allowed_names,
                                  policies=middleware or (), backend=resolved_backend),
             WorkerRuntimeContextMiddleware(execution_reserve=1),
             CodeRuntimeContextMiddleware("REVIEWER"),
             filesystem,
-            TaskFileAccessMiddleware(sandbox=resolved_backend),
+            TaskFileAccessMiddleware(sandbox=resolved_backend, import_root="/review/.private-downloads"),
             CodeAgentCompletionMiddleware(),
             progress,
             WorkerToolAllowlistMiddleware(allowed_names),
             EvidenceReferenceMiddleware(),
+            WorkerCompactionMiddleware(summary_model if summary_model is not None else model, request_aware=True),
         ],
         state_schema=CodeAgentState,
         checkpointer=checkpointer,

@@ -71,13 +71,14 @@ TOOLSET_ROUTE_USER_WEIGHT = 0.6
 # Scheduler关闭工具访问时仍需允许角色提交结果或进入既有审核协议。
 # 检索、历史、文件和业务工具都不在此集合中。
 NO_ACCESS_CONTROL_TOOL_NAMES = frozenset({
+    "raise_plan_objection",
     ASK_USER_NAME,
     "report_general_result",
     "publish_worker_progress",
     "complete_web_step",
     "submit_code_for_review",
     "respond_to_code_review",
-    "submit_continued_code_for_review",
+
     "request_code_worker_repair",
     "publish_reviewed_candidate",
     "submit_code_review",
@@ -553,7 +554,6 @@ def _tool_to_trace_item(
     }
 
 
-
 def _read_dynamic_limit(
     state: AgentState,
     field_name: str,
@@ -934,6 +934,7 @@ class DynamicExecutionBudgetMiddleware(
         )
         model_calls_used += int(state.get("skill_preparation_calls_used", 0) or 0)
         model_calls_used += int(state.get("worker_compaction_calls_used", 0) or 0)
+        model_calls_used += int(state.get("worker_leadership_model_rounds_used", 0) or 0)
         finalization_used = max(
             int(state.get("worker_finalization_model_calls_used", 0) or 0),
             0,
@@ -1096,7 +1097,7 @@ class DynamicExecutionBudgetMiddleware(
             allowed_tool_calls = [
                 tool_call
                 for tool_call in current_tool_calls
-                if _read_tool_call_name(tool_call) == terminal_tool
+                if _read_tool_call_name(tool_call) in {terminal_tool, "raise_plan_objection"}
             ][:1]
             blocked_tool_calls = [
                 tool_call
@@ -1159,7 +1160,7 @@ class DynamicExecutionBudgetMiddleware(
 
             # 能力补选是一次控制面申请，不消耗业务工具额度；第二次申请
             # 仍需真正执行，以便工具本身切换现有finalization状态。
-            if tool_name in {REQUEST_ADDITIONAL_CAPABILITIES_NAME, ASK_USER_NAME}:
+            if tool_name in {REQUEST_ADDITIONAL_CAPABILITIES_NAME, ASK_USER_NAME, "raise_plan_objection"}:
                 allowed_tool_calls.append(tool_call)
                 continue
 
@@ -1196,7 +1197,7 @@ class DynamicExecutionBudgetMiddleware(
                     [
                         call for call in allowed_tool_calls
                         if _read_tool_call_name(call)
-                        not in {REQUEST_ADDITIONAL_CAPABILITIES_NAME, ASK_USER_NAME}
+                        not in {REQUEST_ADDITIONAL_CAPABILITIES_NAME, ASK_USER_NAME, "raise_plan_objection"}
                     ]
                 )
             ),
@@ -1673,7 +1674,7 @@ class ToolsetRouterMiddleware(
                     selected_tools = [
                         current_tool
                         for current_tool in always_visible_tools
-                        if _read_tool_name(current_tool) == ASK_USER_NAME
+                        if _read_tool_name(current_tool) in {ASK_USER_NAME, "raise_plan_objection"}
                     ]
 
                 elif not tool_access_enabled:

@@ -2,7 +2,7 @@ from types import SimpleNamespace
 import pytest
 from reporting.general_gate import general_review_reasons
 from workers.general_completion import GeneralResult
-from api_handoff import ApiHandoff
+from handoff_knowledge import HandoffKnowledge
 
 @pytest.mark.parametrize("change,expected", [
     ({}, []),
@@ -25,6 +25,7 @@ def test_artifacts_do_not_force_general_review(expected, actual):
 
 def test_schema_hides_harness_flag_and_has_no_fixed_version():
     assert "forced_finalization" not in GeneralResult.model_json_schema()["properties"]
-    schema = ApiHandoff.model_json_schema()
+    schema = HandoffKnowledge.model_json_schema()
     assert "version" not in schema["properties"]
-    assert "next_action" not in schema.get("required", [])
+    assert "evidence_refs" in schema["properties"]
+    assert "evidence_check" not in schema["properties"]

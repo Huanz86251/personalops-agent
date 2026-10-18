@@ -43,7 +43,6 @@ from workers.leadership_models import (
 from workers.code_review_models import (
     CodeReviewLoopState,
     CodeReviewReport,
-    SchedulerCodeDecision,
 )
 from prompt_loader import (
     render_prompt,
@@ -188,20 +187,20 @@ def _format_hard_context(
         )
     blocks.extend(
         [
-            "[历史用户原文（按时间顺序，未经摘要）]\n"
-            f"{_prompt_text(validated_context.user_instruction_history, '没有历史用户原文。')}",
-            "[较早Conversation摘要]\n"
+            "[较早用户可见对话的JSON摘要]\n"
             f"{_prompt_text(validated_context.conversation_summary, '没有较早对话摘要。')}",
-            "[上一轮内部执行摘要（仅供参考，不能覆盖用户原话）]\n"
-            f"{_prompt_text(validated_context.previous_run_summary, '没有上一轮内部执行摘要。')}",
-            "[最近用户与最终助手对话]\n"
-            f"{_prompt_text(validated_context.recent_dialogue, '没有近期对话。')}",
+            "[尚未摘要的用户与最终助手原文（含固定保留的近期轮次）]\n"
+            f"{_prompt_text(validated_context.recent_dialogue, '没有历史对话。')}",
             "[本轮相关长期记忆]\n"
             f"{_prompt_text(validated_context.memory_context, '没有召回相关长期记忆。')}",
             "[当前可用能力目录]\n"
             f"{_prompt_text(validated_context.toolset_catalog, '当前没有可用业务能力。')}",
         ]
     )
+    if validated_context.user_instruction_history:
+        blocks.append("[兼容旧调用方的历史用户原文]\n" + _prompt_text(validated_context.user_instruction_history, ""))
+    if validated_context.previous_run_summary:
+        blocks.append("[兼容旧调用方的内部执行摘要]\n" + validated_context.previous_run_summary)
     return "\n\n".join(blocks)
 
 
@@ -1004,50 +1003,20 @@ async def run_hard_worker_leader(
     )
 
 
-def _build_code_scheduler_fallback(error: str) -> SchedulerCodeDecision:
-    """Stop safely when the CODE control decision cannot be validated."""
-
-    return SchedulerCodeDecision(
-        action="STOP",
-        reason=(
-            "Scheduler could not produce a reliable structured CODE recovery "
-            f"decision, so the safe fallback is STOP. Error: {error[:500]}"
+async def run_hard_worker_objection(hard_model, *, context, event):
+    """Brief Scheduler adjudication; a REPLAN decision delegates plan generation."""
+    from schemas.worker_control import WorkerObjectionDecision
+    return await _invoke_scheduler_stage(
+        hard_model, context=context, stage="worker_objection", event=event,
+        output_schema=WorkerObjectionDecision, trace_name="hard_worker_objection",
+        fallback_factory=lambda error: WorkerObjectionDecision(
+            action="CONTINUE", reason=f"Scheduler adjudication unavailable; continue without changing the plan. {str(error)[:400]}"
         ),
     )
 
 
-async def run_hard_code_scheduler(
-    hard_model,
-    *,
-    context: PlanningContextPack,
-    plan_objective: str,
-    current_step: PlanStep,
-    code_review_loop: CodeReviewLoopState,
-    code_review_report: CodeReviewReport,
-    code_control_history: Any,
-    remaining_budget: Any,
-) -> PlanningCallResult[SchedulerCodeDecision]:
-    """Choose CONTINUE, RESTART, or STOP for one escalated CODE attempt."""
 
-    if current_step.worker_kind != "CODE" or current_step.code_task is None:
-        raise ValueError("CODE Scheduler control requires a frozen CODE Step.")
-    if code_review_loop.status != "ESCALATED_TO_SCHEDULER":
-        raise ValueError("CODE Scheduler control requires an escalated review loop.")
-    if code_review_report.candidate != code_review_loop.candidate:
-        raise ValueError("CODE Scheduler received a stale Reviewer report.")
-    if code_review_report.verdict == "PASSED":
-        raise ValueError("An applied CODE result does not need Scheduler recovery.")
 
-    event = {"current_step": current_step, "review_loop": code_review_loop, "review_report": code_review_report, "remaining_budget": remaining_budget}
-
-    return await _invoke_scheduler_stage(
-        hard_model,
-        context=context, stage="code_controller", event=event,
-        output_schema=SchedulerCodeDecision,
-        trace_name="hard_code_scheduler",
-        fallback_factory=_build_code_scheduler_fallback,
-        additional_protocol_prompts=("planning/code_controller_recovery",),
-    )
 
 
 def _approved_recovery_proposal(
@@ -1136,8 +1105,7 @@ async def run_hard_replanner(
     """运行全局唯一的Hard Replanner。
 
     Replanner可以：
-    - CONTINUE：替换争议Step及尚未执行的步骤；
-    - RETURN_TO_WORKER：驳回计划异议并让原Worker继续；
+    - CONTINUE：生成尚未执行的新步骤；
     - FINISH：停止继续执行，交给Reviewer收口。
     """
 
@@ -1190,6 +1158,9 @@ async def run_hard_replanner(
         if prompt is not None
     )
 
+    def validate_replan(decision):
+        return _validate_approved_downgrade_replan(decision, approved_proposal)
+
     return await _invoke_scheduler_stage(
         hard_model,
         context=context, stage="replanner", event=event,
@@ -1199,10 +1170,7 @@ async def run_hard_replanner(
             _build_replanner_fallback
         ),
         additional_protocol_prompts=protocol_prompts,
-        candidate_validator=lambda decision: _validate_approved_downgrade_replan(
-            decision,
-            approved_proposal,
-        ),
+        candidate_validator=validate_replan,
     )
 
 
@@ -1228,6 +1196,7 @@ def _final_review_step_projection(value: Any) -> dict[str, Any]:
             "worker_kind",
             "objective",
             "success_criteria",
+            "code_task",
             "artifact_outputs",
         ),
     )
@@ -1301,7 +1270,7 @@ async def run_hard_final_reviewer(
     overall_stop_reason: str,
     replan_available: bool,
     plan_steps: list[PlanStep] | None = None,
-    latest_worker_evidence: dict[str, Any] | None = None,
+    return_to_worker_available: bool = False,
     repair_history: list[dict[str, Any]] | None = None,
     repair_round: int = 0,
     max_repair_rounds: int = 0,
@@ -1356,14 +1325,13 @@ async def run_hard_final_reviewer(
                     _final_review_report_projection(report)
                     for report in step_reports
                 ],
-                "latest_worker_evidence": latest_worker_evidence or {},
                 "final_worker_repair_history": _final_review_history_projection(
                     repair_history or []
                 ),
                 "stop_reason": overall_stop_reason,
                 "return_to_worker_available": (
                     repair_round < max_repair_rounds
-                    and bool(latest_worker_evidence)
+                    and return_to_worker_available
                 ),
                 "repair_round": repair_round,
                 "max_repair_rounds": max_repair_rounds,
@@ -1440,11 +1408,7 @@ async def _invoke_scheduler_stage(
                 candidate_validator=candidate_validator,
             )
             if stage == "worker_leader" and result.output.action in {"GUIDE", "ACCEPT", "CANCEL", "REPLACE"}:
-                session.set_active(
-                    "当前Worker控制",
-                    result.output.model_dump(mode="json"),
-                    role="assistant",
-                )
+                session.set_worker_control(result.output.model_dump(mode="json"), event)
             elif stage == "supervisor" and not result.used_fallback:
                 session.set_active(
                     "活动计划",

@@ -13,7 +13,7 @@ from langchain_core.utils.function_calling import convert_to_openai_tool
 FIELD_NAMES = {'evidence_tool_call_ids': 'evidence_refs', 'evidence_tool_call_id': 'evidence_ref'}
 ACTIVE_EVIDENCE_REFS = ContextVar('active_evidence_refs', default=None)
 CONTROL = {'report_general_result', 'complete_web_step', 'publish_worker_progress',
-           'submit_code_for_review', 'respond_to_code_review', 'submit_continued_code_for_review',
+           'submit_code_for_review', 'respond_to_code_review',
            'request_code_worker_repair', 'publish_reviewed_candidate', 'submit_code_review',
            'request_additional_capabilities', 'ask_user'}
 WEB_RESULT_REF_PATTERN = re.compile(r"^W[A-Z]+[1-9]\d*$")
@@ -238,6 +238,9 @@ def canonical_arguments(
         if isinstance(item, dict):
             result = {}
             for key, val in item.items():
+                if key == "handoff_knowledge":
+                    result[key] = val
+                    continue
                 target = key if (reviewer or progress) and key == 'evidence_refs' else reverse_fields.get(key, key)
                 if target in result: raise ValueError('Duplicate evidence reference fields')
                 if target in FIELD_NAMES or ((reviewer or progress) and target == 'evidence_refs'):
@@ -371,15 +374,6 @@ class EvidenceReferenceMiddleware(AgentMiddleware):
             eligible=eligible_evidence(request.state),
             tolerant=web_completion,
         )
-        # Resolve API sources without rejecting all entries for one unknown ID.
-        def handoff_refs(value, inside=False):
-            if isinstance(value,list): return [handoff_refs(v,inside) for v in value]
-            if isinstance(value,dict):
-                return {k: (next((raw for raw,short in refs.items() if short==v),v)
-                            if inside and k=='tool_call_id' and isinstance(v,str)
-                            else handoff_refs(v,inside or k in {'handoff_knowledge','handoff_apis'})) for k,v in value.items()}
-            return value
-        call['args']=handoff_refs(call['args'])
         from reporting.criteria import restore_claims, worker_registry
         if call.get('name') in CONTROL:
             call['args'] = restore_claims(call['args'], worker_registry(request.state))
@@ -493,7 +487,7 @@ class EvidenceReferenceMiddleware(AgentMiddleware):
         )
         terminal = {
             'report_general_result', 'complete_web_step', 'submit_code_for_review',
-            'respond_to_code_review', 'submit_continued_code_for_review', 'submit_code_review',
+            'respond_to_code_review',  'submit_code_review',
         }
         if name not in terminal:
             return message

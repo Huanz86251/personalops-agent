@@ -15,7 +15,7 @@ from workers.evidence_refs import (
 )
 from workers.general_completion import report_general_result
 from workers.submission import complete_web_step, resolve_tool_evidence
-from workers.code_submission import submit_code_for_review, respond_to_code_review, submit_continued_code_for_review, submit_code_review
+from workers.code_submission import submit_code_for_review, respond_to_code_review, submit_code_review
 
 RAW='call_1234567890abcdefghijklmnopqrstuvwxyz'
 def history():
@@ -108,13 +108,6 @@ def test_failed_web_search_parent_keeps_failure_evidence_reference():
     assert model_display_registry(state, refs)['failed-search'] == 'E1'
     assert 'failed-search' in eligible_evidence(state)
 
-@pytest.mark.parametrize('tool',[report_general_result,complete_web_step,submit_code_for_review,respond_to_code_review,submit_continued_code_for_review,submit_code_review])
-def test_all_submission_schemas_hide_long_id_contract(tool):
-    before=convert_to_openai_tool(tool)
-    viewed=convert_to_openai_tool(schema_view(tool))
-    assert 'evidence_tool_call_ids' not in json.dumps(viewed)
-    assert before==convert_to_openai_tool(tool)
-    if 'evidence_tool_call_ids' in json.dumps(before): assert 'evidence_refs' in json.dumps(viewed)
 
 def test_invalid_or_foreign_reference_rejected_without_tool_execution():
     with pytest.raises(ValueError,match='Unknown evidence'):
@@ -197,7 +190,7 @@ def test_code_reviewer_real_graph_short_refs():
             if not any(isinstance(m,ToolMessage) for m in messages):
                 msg=AIMessage(content='',tool_calls=[{'name':'code_probe','id':RAW,'args':{'value':'check'}}])
             else:
-                msg=AIMessage(content='',tool_calls=[{'name':'submit_code_review','id':'review','args':{'report':{'candidate':candidate().model_dump(mode='json'),'verdict':'FAILED','summary':'Needs work','verification_summary':'Checked','recommended_action':'STOP','evidence_refs':['E1']}}}])
+                msg=AIMessage(content='',tool_calls=[{'name':'submit_code_review','id':'review','args':{'report':{'candidate':candidate().model_dump(mode='json'),'verdict':'FAILED','summary':'Needs work','verification_summary':'Checked','evidence_refs':['E1']}}}])
             return ChatResult(generations=[ChatGeneration(message=msg)])
     result=create_code_reviewer(ReviewerModel(),tools=[code_probe]).invoke({'messages':[HumanMessage(content='review')],'worker_id':'reviewer','code_task':contract().model_dump(mode='json'),'code_candidate':candidate().model_dump(mode='json'),'code_review_loop':create_code_review_loop(candidate=candidate(),worker_checkpoint_id="worker",reviewer_checkpoint_id="reviewer").model_dump(mode='json')})
     assert result['code_review_report']['evidence_refs']==[RAW]

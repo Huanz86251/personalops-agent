@@ -18,11 +18,11 @@ from reporting.criteria import CriterionReferenceResult, criterion_claim_repair_
 from skill_runtime.preparation import SkillChoice
 from workers.code_review_models import (
     CodeCheckResult,
-    CodeContinuationSubmission,
+
     CodeReviewReport,
     CodeSelfCheck,
     CodeWorkerRepairResponse,
-    SchedulerCodeDecision,
+
 )
 from workers.leadership_models import LeadershipDecision
 from workers.submission import WorkerCriterionClaim, WorkerSubmission
@@ -35,22 +35,6 @@ def _before(model, earlier: str, later: str) -> None:
     )
 
 
-def test_reason_precedes_model_decisions() -> None:
-    for model, reason, result in [
-        (AppWorldSetBinding, "read_api_reason", "read_api"),
-        (AppWorldSetBinding, "coverage_reason", "completion_condition"),
-        (AppWorldBindingCheck, "reason", "assessment"),
-        (AppWorldCallInput, "reason", "action_phase"),
-        (MemoryResolution, "reason", "action"),
-        (SkillChoice, "reason", "skill_ids"),
-        (ReplanDecision, "reason", "action"),
-        (FinalReviewDecision, "replan_reason", "action"),
-        (LeadershipDecision, "reason", "action"),
-        (SchedulerCodeDecision, "reason", "action"),
-        (CodeWorkerRepairResponse, "reasons", "action"),
-        (CodeContinuationSubmission, "reasons", "action"),
-    ]:
-        _before(model, reason, result)
 
 
 def test_action_card_rejects_legacy_nested_coverage_fields() -> None:

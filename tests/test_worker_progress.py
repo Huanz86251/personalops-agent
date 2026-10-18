@@ -63,7 +63,7 @@ class FinalizationToolRoutingTests(unittest.TestCase):
         self.assertTrue(enabled._progress_is_due(state))
 
     def test_code_finalization_does_not_require_unavailable_web_submit_tool(self):
-        names = ("submit_code_for_review", "respond_to_code_review", "submit_continued_code_for_review")
+        names = ("submit_code_for_review", "respond_to_code_review")
         middleware = WorkerProgressMiddleware(finalization_tools=names)
         request = SimpleNamespace(state={"worker_finalize_requested": True},
             tools=[SimpleNamespace(name=name) for name in (*names, "execute")],
@@ -318,6 +318,7 @@ class WorkerProgressTests(
             in model.bound_tool_history
             if tool_names
             == [
+                "raise_plan_objection",
                 "ask_user",
                 PUBLISH_WORKER_PROGRESS_NAME,
             ]
@@ -334,7 +335,7 @@ class WorkerProgressTests(
         ))
         self.assertEqual(
             model.bound_tool_history[-1],
-            ["ask_user", "complete_web_step"],
+            ["raise_plan_objection", "ask_user", "complete_web_step"],
         )
         self.assertEqual(result["worker_finalize_reason"], "NATURAL_EXIT")
         self.assertEqual(result["worker_finalization_model_calls_used"], 1)
@@ -409,6 +410,7 @@ class AsyncWorkerProgressTests(
         )
         self.assertIn(
             [
+                "raise_plan_objection",
                 "ask_user",
                 PUBLISH_WORKER_PROGRESS_NAME,
             ],

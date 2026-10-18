@@ -192,6 +192,7 @@ class WorkerLeadershipBridge:
                 event_id=event_id,
                 reason=wake_reason,
                 created_at=datetime.now(timezone.utc),
+                triggering_worker_id=worker_id,
                 workers=[
                     active[active_worker_id].model_copy(
                         update={

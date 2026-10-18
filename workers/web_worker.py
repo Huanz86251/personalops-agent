@@ -1,4 +1,5 @@
 from workers.compaction import WorkerCompactionMiddleware
+from workers.default_middleware import DisabledDefaultSummarizationMiddleware
 """Dedicated Deep Agent for Web research and browser interaction."""
 
 import json
@@ -23,6 +24,7 @@ from skill_runtime.middleware import RoleSkillsMiddleware
 from workers.context import WorkerRuntimeContextMiddleware
 from workers.evidence_refs import EvidenceReferenceMiddleware
 from workers.file_access import TaskFileAccessMiddleware
+from workers.plan_objection import objection_tools, WorkerObjectionMiddleware
 from workers.general_worker import DEEP_AGENT_FILE_TOOLS
 from workers.progress import (
     PUBLISH_WORKER_PROGRESS_NAME,
@@ -111,6 +113,7 @@ def create_web_worker(
     if any(
         _tool_name(tool)
         in {
+            "raise_plan_objection",
             PUBLISH_WORKER_PROGRESS_NAME,
             COMPLETE_WEB_STEP_NAME,
             REQUEST_ADDITIONAL_CAPABILITIES_NAME,
@@ -151,6 +154,7 @@ def create_web_worker(
     graph = create_deep_agent(
         model=model,
         tools=[
+            *objection_tools(),
             *web_tools,
             download_tool,
             ask_user,
@@ -162,11 +166,12 @@ def create_web_worker(
         backend=resolved_backend,
         permissions=resolved_permissions,
         middleware=[
+            WorkerObjectionMiddleware(),
+            DisabledDefaultSummarizationMiddleware(),
             *resolved_middleware,
             KnowledgeMiddleware('Web Agent'),
             ExecutionHistoryMiddleware(),
             ExecutionStateMiddleware(),
-            WorkerCompactionMiddleware(summary_model if summary_model is not None else model),
             RoleSkillsMiddleware(model, "web", [*DEEP_AGENT_FILE_TOOLS, ASK_USER_NAME, *(_tool_name(t) for t in web_tools)],
                                  policies=middleware or (), backend=resolved_backend),
             WorkerRuntimeContextMiddleware(),
@@ -184,6 +189,7 @@ def create_web_worker(
                 progress_checkpoint_resolver=progress_checkpoint_resolver,
             ),
             EvidenceReferenceMiddleware(),
+            WorkerCompactionMiddleware(summary_model if summary_model is not None else model, request_aware=True),
         ],
         state_schema=WorkerProgressState,
         checkpointer=checkpointer,

@@ -11,10 +11,8 @@ from runtime_tracing import operation
 from typing import Any, Literal
 
 from pydantic.json_schema import SkipJsonSchema
-from api_handoff import ApiHandoffList, api_field
 from handoff_knowledge import HandoffKnowledge, knowledge_field
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from workers.plan_challenge import PlanChallenge
 from schema_normalization import (
     EvidenceRefText,
     ReportItem,
@@ -30,7 +28,7 @@ CodeReviewLoopStatus = Literal[
     "WAITING_FOR_WORKER",
     "PUBLISHED_PENDING_REPORT",
     "APPLIED",
-    "ESCALATED_TO_SCHEDULER",
+    "REPLAN_REQUIRED",
     "SUPERSEDED",
     "STOPPED",
 ]
@@ -41,14 +39,6 @@ CodeRepairResponseAction = Literal[
     "TEST_DISPUTE",
     "BLOCKED",
     "REQUEST_SCOPE_CHANGE",
-]
-
-CodeFindingCategory = Literal[
-    "CANDIDATE_DEFECT",
-    "TEST_DEFECT",
-    "ENVIRONMENT",
-    "REQUIREMENT_AMBIGUITY",
-    "DELIVERY_MANIFEST",
 ]
 
 CodeCheckStatus = Literal[
@@ -62,20 +52,6 @@ CodeReviewVerdict = Literal[
     "FAILED",
     "ESCALATED",
 ]
-
-SchedulerCodeAction = Literal[
-    "CONTINUE",
-    "RESTART",
-    "STOP",
-]
-
-CodeContinuationAction = Literal[
-    "REVISION_READY",
-    "SUBMISSION_UPDATED",
-    "BLOCKED",
-    "REQUEST_SCOPE_CHANGE",
-]
-
 
 class CodeReviewModel(BaseModel):
     model_config = ConfigDict(
@@ -120,15 +96,7 @@ class CodeSelfCheck(CodeReviewModel):
 class CodeWorkerSubmission(CodeReviewModel):
     """The bounded implementation manifest; not the Worker''s hidden trace."""
 
-    handoff_apis: ApiHandoffList = api_field()
-    handoff_knowledge: SkipJsonSchema[list[HandoffKnowledge]] = knowledge_field()
-    plan_challenge: PlanChallenge | None = Field(
-        default=None,
-        description=(
-            "Only for a material conflict between the user request and the frozen code task; "
-            "ordinary implementation difficulty or an unknown API is not a plan challenge."
-        ),
-    )
+    handoff_knowledge: list[HandoffKnowledge] = knowledge_field()
 
 
     candidate: CodeCandidateRef
@@ -182,7 +150,6 @@ class CodeWorkerSubmission(CodeReviewModel):
 
 class CodeReviewFinding(CodeReviewModel):
     finding_id: str = Field(min_length=1)
-    category: CodeFindingCategory
     summary: str = Field(min_length=1, max_length=3000)
     affected_requirement_ids: tuple[EvidenceRefText, ...] = Field(default=(), max_length=24)
     related_paths: tuple[EvidenceRefText, ...] = Field(default=(), max_length=50)
@@ -212,8 +179,8 @@ class CodeRepairInstruction(CodeReviewModel):
         return coerce_sequence(value)
 
 
-class CodeWorkerRepairResponse(CodeReviewModel):
-    round_no: int = Field(ge=1)
+class CodeWorkerRepairPayload(CodeReviewModel):
+    """Model-authored repair content; the Harness binds the pending round."""
     reasons: tuple[ReportItem, ...] = Field(default=(), max_length=24)
     action: CodeRepairResponseAction
     candidate: CodeCandidateRef
@@ -232,6 +199,12 @@ class CodeWorkerRepairResponse(CodeReviewModel):
         return coerce_sequence(value)
 
 
+class CodeWorkerRepairResponse(CodeWorkerRepairPayload):
+    """Persisted repair response, including the Harness-owned round identity."""
+
+    round_no: int = Field(ge=1)
+
+
 class CodeRepairExchange(CodeReviewModel):
     instruction: CodeRepairInstruction
     response: CodeWorkerRepairResponse
@@ -247,20 +220,12 @@ class CodeCheckResult(CodeReviewModel):
 class CodeReviewReport(CodeReviewModel):
     """Compressed CODE-specific StepReport consumed by the Scheduler."""
 
-    handoff_apis: ApiHandoffList = api_field()
-    handoff_knowledge: SkipJsonSchema[list[HandoffKnowledge]] = knowledge_field()
+    handoff_knowledge: list[HandoffKnowledge] = knowledge_field()
     recovery_proposal: SkipJsonSchema[dict[str, Any] | None] = Field(
         default=None,
         description=(
             "Harness-authored second-pass CODE recovery proposal. It is advice "
             "to the Scheduler, not approval to publish a failed candidate."
-        ),
-    )
-    confirmed_plan_challenge: PlanChallenge | None = Field(
-        default=None,
-        description=(
-            "Independent confirmation of a Worker plan challenge. If present, verdict must be "
-            "ESCALATED and recommended_action STOP so the Planning Graph can replan."
         ),
     )
 
@@ -280,7 +245,6 @@ class CodeReviewReport(CodeReviewModel):
     delivery_location: str | None = Field(default=None, max_length=2000)
     publication_id: str | None = Field(default=None, max_length=200)
     applied_revision: str | None = Field(default=None, max_length=200)
-    recommended_action: SchedulerCodeAction | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -306,20 +270,12 @@ class CodeReviewReport(CodeReviewModel):
 
     @model_validator(mode="after")
     def validate_verdict_action(self) -> "CodeReviewReport":
-        if self.confirmed_plan_challenge is not None and (
-            self.verdict != "ESCALATED" or self.recommended_action != "STOP"
-        ):
-            raise ValueError(
-                "confirmed_plan_challenge要求verdict=ESCALATED且recommended_action=STOP。"
-            )
         publication_fields = (
             self.delivery_location,
             self.publication_id,
             self.applied_revision,
         )
         if self.verdict == "PASSED":
-            if self.recommended_action is not None:
-                raise ValueError("已经APPLIED的报告不再建议Scheduler动作。")
             if any(value is None for value in publication_fields):
                 raise ValueError("PASSED报告必须包含完整发布回执摘要。")
             if self.published_artifact_paths != self.approved_artifact_paths:
@@ -327,86 +283,11 @@ class CodeReviewReport(CodeReviewModel):
             if not self.check_results:
                 raise ValueError("PASSED报告必须逐项提供测试或检查结果。")
         else:
-            if self.recommended_action is None:
-                raise ValueError("未通过的报告必须建议Scheduler恢复动作。")
             if any(value is not None for value in publication_fields):
                 raise ValueError("未通过的报告不能声称已经发布。")
             if self.published_artifact_paths:
                 raise ValueError("未通过的报告不能包含已发布文件。")
         return self
-
-
-class SchedulerCodeDecision(CodeReviewModel):
-    reason: str = Field(default="", max_length=6000, description="可选审核依据；格式错误时Harness会省略，action及条件字段仍严格校验。")
-    action: SchedulerCodeAction
-    worker_instruction: str | None = Field(default=None, max_length=5000)
-    reviewer_instruction: str | None = Field(default=None, max_length=5000)
-    repair_rounds: int | None = Field(default=None, ge=1, le=3)
-
-    @model_validator(mode="before")
-    @classmethod
-    def omit_invalid_auxiliary_fields(cls, value):
-        return drop_invalid_auxiliary_fields(cls, value, ("reason",))
-
-    @model_validator(mode="after")
-    def validate_action_fields(self) -> "SchedulerCodeDecision":
-        continuation_fields = (
-            self.worker_instruction,
-            self.reviewer_instruction,
-            self.repair_rounds,
-        )
-        if self.action == "CONTINUE":
-            if not self.worker_instruction or not self.reviewer_instruction:
-                raise ValueError(
-                    "CONTINUE必须同时给Worker和Reviewer新指令。"
-                )
-            if self.repair_rounds is None:
-                raise ValueError("CONTINUE必须提供新的repair_rounds。")
-        elif any(value is not None for value in continuation_fields):
-            raise ValueError(
-                "只有CONTINUE可以提供继续执行字段。"
-            )
-        return self
-
-
-class SchedulerContinueDirective(CodeReviewModel):
-    """One persisted Scheduler instruction for the existing Agent pair."""
-
-    scheduler_epoch: int = Field(ge=2)
-    candidate: CodeCandidateRef
-    reason: str = Field(min_length=1, max_length=6000)
-    worker_instruction: str = Field(min_length=1, max_length=5000)
-    reviewer_instruction: str = Field(min_length=1, max_length=5000)
-    repair_rounds: int = Field(ge=1, le=3)
-
-
-class CodeContinuationSubmission(CodeReviewModel):
-    """Worker result sent to Reviewer after Scheduler continuation guidance."""
-
-    scheduler_epoch: int = Field(ge=2)
-    reasons: tuple[ReportItem, ...] = Field(default=(), max_length=24)
-    action: CodeContinuationAction
-    candidate: CodeCandidateRef
-    summary: str = Field(min_length=1, max_length=4000)
-    changed_files: tuple[CodeChangedFile, ...] = Field(default=(), max_length=100)
-    evidence_tool_call_ids: tuple[EvidenceRefText, ...] = Field(default=(), max_length=100)
-
-    @field_validator("reasons", "evidence_tool_call_ids", mode="before")
-    @classmethod
-    def normalize_text_lists(cls, value):
-        return coerce_text_sequence(value)
-
-    @field_validator("changed_files", mode="before")
-    @classmethod
-    def normalize_changed_files(cls, value):
-        return coerce_sequence(value)
-
-
-class SchedulerContinuationRecord(CodeReviewModel):
-    """Auditable directive/submission pair; it is not Scheduler dialogue."""
-
-    directive: SchedulerContinueDirective
-    submission: CodeContinuationSubmission
 
 
 class CodeReviewLoopState(CodeReviewModel):
@@ -416,13 +297,10 @@ class CodeReviewLoopState(CodeReviewModel):
     worker_checkpoint_id: str = Field(min_length=1)
     reviewer_checkpoint_id: str = Field(min_length=1)
     status: CodeReviewLoopStatus = "REVIEWING"
-    scheduler_epoch: int = Field(default=1, ge=1)
     repair_round: int = Field(default=0, ge=0)
-    max_repair_rounds: int = Field(default=2, ge=1, le=3)
+    max_repair_rounds: int = Field(default=3, ge=1, le=3)
     pending_instruction: CodeRepairInstruction | None = None
-    pending_scheduler_directive: SchedulerContinueDirective | None = None
     exchanges: tuple[CodeRepairExchange, ...] = ()
-    scheduler_continuations: tuple[SchedulerContinuationRecord, ...] = ()
     terminal_summary: str | None = None
 
     @model_validator(mode="after")
@@ -430,27 +308,12 @@ class CodeReviewLoopState(CodeReviewModel):
         if self.repair_round > self.max_repair_rounds:
             raise ValueError("repair_round不能超过max_repair_rounds。")
         waiting = self.status == "WAITING_FOR_WORKER"
-        pending_count = sum(
-            item is not None
-            for item in (
-                self.pending_instruction,
-                self.pending_scheduler_directive,
-            )
-        )
-        if waiting != (pending_count == 1):
-            raise ValueError(
-                "WAITING_FOR_WORKER必须且只能保存一种Worker指令。"
-            )
-        if self.pending_scheduler_directive is not None:
-            if (
-                self.pending_scheduler_directive.scheduler_epoch
-                != self.scheduler_epoch
-            ):
-                raise ValueError("Scheduler指令epoch不是当前epoch。")
+        if waiting != (self.pending_instruction is not None):
+            raise ValueError("WAITING_FOR_WORKER必须保存Reviewer返修指令。")
         if self.status in {
             "PUBLISHED_PENDING_REPORT",
             "APPLIED",
-            "ESCALATED_TO_SCHEDULER",
+            "REPLAN_REQUIRED",
             "SUPERSEDED",
             "STOPPED",
         } and self.status != "PUBLISHED_PENDING_REPORT" and not self.terminal_summary:
@@ -464,7 +327,7 @@ def create_code_review_loop(
     candidate: CodeCandidateRef,
     worker_checkpoint_id: str,
     reviewer_checkpoint_id: str,
-    max_repair_rounds: int = 2,
+    max_repair_rounds: int = 3,
 ) -> CodeReviewLoopState:
     return CodeReviewLoopState(
         candidate=candidate,
@@ -565,60 +428,6 @@ def receive_code_worker_response(
     )
 
 
-@operation('Code Worker / Continuation Submission', fields=('submission',))
-def receive_code_continuation_submission(
-    state: CodeReviewLoopState,
-    submission: CodeContinuationSubmission,
-) -> CodeReviewLoopState:
-    """Route the same Worker's continuation result to independent review."""
-
-    directive = state.pending_scheduler_directive
-    if state.status != "WAITING_FOR_WORKER" or directive is None:
-        raise ValueError("当前没有等待中的Scheduler CONTINUE指令。")
-    if submission.scheduler_epoch != directive.scheduler_epoch:
-        raise ValueError("Worker提交的scheduler_epoch已经过期。")
-
-    old = state.candidate
-    new = submission.candidate
-    same_attempt = (
-        old.event_id,
-        old.step_id,
-        old.attempt_id,
-        old.workspace_id,
-    ) == (
-        new.event_id,
-        new.step_id,
-        new.attempt_id,
-        new.workspace_id,
-    )
-    if not same_attempt:
-        raise ValueError("CONTINUE响应不能切换attempt或workspace。")
-
-    if submission.action == "REVISION_READY":
-        if new.candidate_revision <= old.candidate_revision:
-            raise ValueError("REVISION_READY必须提高candidate_revision。")
-    else:
-        if new.candidate_revision != old.candidate_revision:
-            raise ValueError("未生成修订时不能伪造candidate revision。")
-
-    record = SchedulerContinuationRecord(
-        directive=directive,
-        submission=submission,
-    )
-    return state.model_copy(
-        update={
-            "candidate": new,
-            "status": "REVIEWING",
-            "pending_scheduler_directive": None,
-            "scheduler_continuations": (
-                *state.scheduler_continuations,
-                record,
-            ),
-            "terminal_summary": None,
-        }
-    )
-
-
 @operation('Code Review / Record Publication', fields=('candidate',))
 def record_code_publication(
     state: CodeReviewLoopState,
@@ -654,53 +463,11 @@ def finish_code_review(
     else:
         if state.status != "REVIEWING":
             raise ValueError("只有REVIEWING状态可以提交未通过报告。")
-        status = "ESCALATED_TO_SCHEDULER"
+        status = "REPLAN_REQUIRED"
 
     return state.model_copy(
         update={
             "status": status,
             "terminal_summary": report.summary,
-        }
-    )
-
-
-@operation('Code Runtime / Apply Scheduler Decision', fields=('decision',))
-def apply_scheduler_code_decision(
-    state: CodeReviewLoopState,
-    decision: SchedulerCodeDecision,
-) -> CodeReviewLoopState:
-    if state.status != "ESCALATED_TO_SCHEDULER":
-        raise ValueError("Scheduler只处理Reviewer未完成并上报的状态。")
-
-    if decision.action == "CONTINUE":
-        next_epoch = state.scheduler_epoch + 1
-        directive = SchedulerContinueDirective(
-            scheduler_epoch=next_epoch,
-            candidate=state.candidate,
-            reason=decision.reason,
-            worker_instruction=decision.worker_instruction,
-            reviewer_instruction=decision.reviewer_instruction,
-            repair_rounds=decision.repair_rounds,
-        )
-        return state.model_copy(
-            update={
-                "status": "WAITING_FOR_WORKER",
-                "scheduler_epoch": next_epoch,
-                "repair_round": 0,
-                "max_repair_rounds": decision.repair_rounds,
-                "pending_instruction": None,
-                "pending_scheduler_directive": directive,
-                "terminal_summary": None,
-            }
-        )
-
-    if decision.action == "RESTART":
-        status: CodeReviewLoopStatus = "SUPERSEDED"
-    elif decision.action == "STOP":
-        status = "STOPPED"
-    return state.model_copy(
-        update={
-            "status": status,
-            "terminal_summary": decision.reason,
         }
     )

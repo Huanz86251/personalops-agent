@@ -44,8 +44,6 @@ from workers.code_review_models import (
     CodeCandidateRef,
     CodeReviewLoopState,
     CodeReviewReport,
-    SchedulerCodeDecision,
-    apply_scheduler_code_decision,
     create_code_review_loop,
 )
 from workers.code_reviewer import create_code_reviewer
@@ -129,7 +127,7 @@ class _InvocationUsage:
 
 @dataclass
 class _CodeRuntimeSession:
-    """Live Worker/Reviewer pair retained while Scheduler decides recovery."""
+    """Worker/Reviewer pair retained only for bounded crash recovery."""
 
     session_id: str
     run_id: str
@@ -160,7 +158,7 @@ class _CodeRuntimeSession:
     )
     runtime_generation: int = 1
     latest_reviewer_checkpoint_relative: str | None = None
-    recovery_phase: CodeRuntimePhase = "AWAITING_SCHEDULER"
+    recovery_phase: CodeRuntimePhase = "AWAITING_REPLAN"
 
 
 class CodeStepRuntime:
@@ -185,7 +183,7 @@ class CodeStepRuntime:
         tools: Sequence[Any] = (),
         reviewer_tools: Sequence[Any] | None = None,
         max_writers: int = 1,
-        max_repair_rounds: int = 2,
+        max_repair_rounds: int = 3,
         archive_retention_minutes: int = 10 * 24 * 60,
         progress_every_tool_calls: int = 4,
         schema_repair_max_rounds: int = 3,
@@ -230,8 +228,7 @@ class CodeStepRuntime:
             runtime_checkpoint_store or CodeRuntimeCheckpointStore()
         )
         self._writer_slots = asyncio.Semaphore(max_writers)
-        # An escalated pair is frozen, not destroyed, until Scheduler applies
-        # exactly one CONTINUE / RESTART / STOP decision.
+        # Sessions retain crash-recovery boundaries; failed reviews are archived immediately.
         self._sessions: dict[str, _CodeRuntimeSession] = {}
         self._startup_recovery_blockers: list[str] = []
 
@@ -248,13 +245,19 @@ class CodeStepRuntime:
     def startup_recovery_blockers(self) -> tuple[str, ...]:
         return tuple(self._startup_recovery_blockers)
 
-    def recover_startup_sessions(self) -> tuple[dict[str, str], ...]:
+    def recover_startup_sessions(
+        self,
+        *,
+        excluded_run_ids: set[str] | frozenset[str] = frozenset(),
+    ) -> tuple[dict[str, str], ...]:
         """Rebuild safe non-terminal CODE sessions before accepting work.
 
         LangGraph owns the Worker/Reviewer message checkpoints. This scan
         restores the separate resource plane: run-local Git integration,
         Docker volumes/containers, and the small orchestration state needed to
-        route the next Scheduler decision back to the same pair.
+        route the next Scheduler decision back to the same pair. Terminal Event
+        runs are historical evidence, even if their resource checkpoint still
+        says RECOVERY_REQUIRED; never validate or revive their old contracts.
         """
 
         self.archive_root.mkdir(parents=True, exist_ok=True)
@@ -265,6 +268,19 @@ class CodeStepRuntime:
             if not attempt_root.is_dir():
                 continue
             try:
+                run_id = self.runtime_checkpoint_store.read_run_id(attempt_root)
+                if run_id in excluded_run_ids:
+                    outcomes.append(
+                        {
+                            "status": "SKIPPED",
+                            "run_id": run_id,
+                            "detail": (
+                                f"{attempt_root.name}: owning run is terminal; "
+                                "historical checkpoint preserved without recovery"
+                            ),
+                        }
+                    )
+                    continue
                 checkpoint = self.runtime_checkpoint_store.load(attempt_root)
             except Exception as error:
                 message = (
@@ -464,6 +480,13 @@ class CodeStepRuntime:
         for attempt_root in sorted(self.archive_root.iterdir()):
             if not attempt_root.is_dir():
                 continue
+            # Cancellation/replacement owns one run, not the entire archive.
+            # An unrelated legacy contract must never reach current validation.
+            if (
+                self.runtime_checkpoint_store.read_run_id(attempt_root)
+                != normalized_run_id
+            ):
+                continue
             checkpoint = self.runtime_checkpoint_store.load(attempt_root)
             if (
                 checkpoint is None
@@ -498,7 +521,7 @@ class CodeStepRuntime:
             )
         if checkpoint.phase not in {
             "CANDIDATE_READY",
-            "AWAITING_SCHEDULER",
+            "AWAITING_REPLAN",
             "RECOVERY_REQUIRED",
         }:
             raise RuntimeError(
@@ -512,14 +535,14 @@ class CodeStepRuntime:
                 and checkpoint.candidate_snapshot_path
             ):
                 resume_phase = "CANDIDATE_READY"
-            elif recovery.review_loop.status == "ESCALATED_TO_SCHEDULER":
-                resume_phase = "AWAITING_SCHEDULER"
+            elif recovery.review_loop.status == "REPLAN_REQUIRED":
+                resume_phase = "AWAITING_REPLAN"
             else:
                 raise RuntimeError(
                     "RECOVERY_REQUIRED does not contain a safe role boundary"
                 )
         if resume_phase != "CANDIDATE_READY" and (
-            recovery.review_loop.status != "ESCALATED_TO_SCHEDULER"
+            recovery.review_loop.status != "REPLAN_REQUIRED"
         ):
             raise RuntimeError(
                 "Only CANDIDATE_READY or a session awaiting Scheduler control "
@@ -871,25 +894,6 @@ class CodeStepRuntime:
         thread_id: str,
         pause_control=None,
     ) -> dict[str, Any]:
-        raw_scheduler_decision = input_state.get("code_scheduler_decision")
-        if raw_scheduler_decision is not None:
-            session_id = str(
-                input_state.get("code_runtime_session_id") or ""
-            ).strip()
-            if not session_id:
-                raise ValueError(
-                    "Scheduler CODE decision requires code_runtime_session_id"
-                )
-            return await self._resume_session(
-                input_state,
-                thread_id=thread_id,
-                session_id=session_id,
-                decision=SchedulerCodeDecision.model_validate(
-                    raw_scheduler_decision
-                ),
-                pause_control=pause_control,
-            )
-
         run_id = str(
             input_state.get("event_id")
             or input_state.get("planning_run_id")
@@ -911,10 +915,19 @@ class CodeStepRuntime:
                 session=interrupted_session,
             )
 
+        pending = next((item for item in self._sessions.values()
+                        if item.run_id == run_id and item.candidate.attempt_id == thread_id
+                        and item.loop.status == "REPLAN_REQUIRED"), None)
+        if pending is not None:
+            return self._finish_unpublished_session(
+                pending, outcome="FAILED", failure_stage="REVIEWER",
+                usage=_InvocationUsage(model_limit=0, tool_limit=0),
+            )
+
         if self._sessions:
             raise RuntimeError(
-                "A CODE pair is awaiting Scheduler control; another writer "
-                "cannot start until that pair is continued, restarted, or stopped"
+                "A CODE pair requires recovery; another writer "
+                "cannot start until that pair has been recovered or archived"
             )
 
         raw_contract = input_state.get("code_task")
@@ -1091,6 +1104,24 @@ class CodeStepRuntime:
                 store=self.store,
             )
 
+            def finish_objection(details):
+                session = _CodeRuntimeSession(
+                    session_id=runtime_session_id, run_id=run_id, run_layout=run_layout,
+                    contract=contract, candidate=candidate, loop=loop, pair=pair,
+                    worker=worker, reviewer=reviewer, worker_thread_id=worker_thread_id,
+                    reviewer_thread_id=reviewer_thread_id, integration_root=integration_root,
+                    integration_repository=integration_repository, base_revision=base_revision,
+                    archive_id=archive_id, attempt_root=attempt_root, started_at=started_at,
+                    parent_attempt_id=parent_attempt_id, worker_id=candidate.workspace_id,
+                    worker_submission=worker_submission or {}, all_messages=all_messages,
+                    superseded_attempt_records=superseded_attempt_records,
+                    runtime_generation=runtime_generation,
+                )
+                return self._finish_objection_session(session, details, _InvocationUsage(
+                    model_limit=total_model_limit, tool_limit=total_tool_limit,
+                    model_calls=model_calls_used, tool_calls=tool_calls_used,
+                ))
+
             worker_details = await self._invoke(
                 worker,
                 initial_instruction,
@@ -1107,6 +1138,10 @@ class CodeStepRuntime:
             model_calls_used += self._used(worker_details, "model_call_count")
             tool_calls_used += self._used(worker_details, "tool_call_count")
             worker_submission = worker_details.get("code_worker_submission")
+            if worker_details.get("worker_objection_outcome"):
+                result = finish_objection(worker_details)
+                pair = None
+                return result
             if not isinstance(worker_submission, dict):
                 from workers.code_finalization import missing_handoff_message
                 raise RuntimeError(missing_handoff_message(worker_details, "INITIAL_SUBMISSION"))
@@ -1232,7 +1267,7 @@ class CodeStepRuntime:
                     # CodeReviewReport; validating one here would turn a
                     # successful repair request into a None-validation crash.
                     boundary_report = None
-                elif loop.status in {"APPLIED", "ESCALATED_TO_SCHEDULER"}:
+                elif loop.status in {"APPLIED", "REPLAN_REQUIRED"}:
                     boundary_report = CodeReviewReport.model_validate(
                         review_details.get("code_review_report")
                     )
@@ -1269,7 +1304,7 @@ class CodeStepRuntime:
                     ),
                     reason="Reviewer completed its indivisible role turn.",
                 )
-                if loop.status in {"APPLIED", "ESCALATED_TO_SCHEDULER"}:
+                if loop.status in {"APPLIED", "REPLAN_REQUIRED"}:
                     break
 
                 pair = self.sandbox_manager.handoff(pair, "WORKER")
@@ -1328,6 +1363,10 @@ class CodeStepRuntime:
                     worker_details,
                     "tool_call_count",
                 )
+                if worker_details.get("worker_objection_outcome"):
+                    result = finish_objection(worker_details)
+                    pair = None
+                    return result
                 loop = CodeReviewLoopState.model_validate(
                     worker_details.get("code_review_loop")
                 )
@@ -1346,7 +1385,7 @@ class CodeStepRuntime:
             report = CodeReviewReport.model_validate(
                 review_details.get("code_review_report")
             )
-            if loop.status == "ESCALATED_TO_SCHEDULER":
+            if loop.status == "REPLAN_REQUIRED":
                 pair = self.sandbox_manager.freeze(pair)
                 session = _CodeRuntimeSession(
                     session_id=runtime_session_id,
@@ -1376,38 +1415,18 @@ class CodeStepRuntime:
                     superseded_attempt_records=superseded_attempt_records,
                     runtime_generation=runtime_generation,
                 )
-                current_runtime_phase = "AWAITING_SCHEDULER"
                 self._commit_session_checkpoint(
-                    session,
-                    phase=current_runtime_phase,
-                    reason="Frozen pair is waiting for Scheduler control.",
+                    session, phase="AWAITING_REPLAN",
+                    reason="Failed review is committed before terminal archival; no Code controller resumes it.",
                 )
-                self._sessions[runtime_session_id] = session
-                # Ownership moves into _sessions; the finally block must not
-                # destroy the containers or volumes that CONTINUE relies on.
-                pair = None
-                return {
-                    "messages": [AIMessage(content=report.summary)],
-                    "executor_model_calls_used": model_calls_used,
-                    "executor_tool_calls_used": tool_calls_used,
-                    "code_worker_submission": worker_submission,
-                    "code_review_loop": loop.model_dump(mode="json"),
-                    "code_review_report": report.model_dump(mode="json"),
-                    "code_artifact_manifest": None,
-                    "code_publication_receipt": None,
-                    "code_handoff_publication_receipts": [],
-                    "code_integration_commit": None,
-                    "code_integration_status": (
-                        integration_repository.status().model_dump(mode="json")
-                    ),
-                    "code_attempt_archive": None,
-                    "code_attempt_final_record": None,
-                    "code_runtime_session_id": runtime_session_id,
-                    "code_superseded_attempt_records": (
-                        session.superseded_attempt_records
-                    ),
-                    "code_agent_messages": all_messages,
-                }
+                result = self._finish_unpublished_session(
+                    session, outcome="FAILED", failure_stage="REVIEWER",
+                    usage=_InvocationUsage(model_limit=0, tool_limit=0,
+                                           model_calls=model_calls_used,
+                                           tool_calls=tool_calls_used),
+                )
+                pair = None  # The terminal helper has archived and released ownership.
+                return result
             pair = self.sandbox_manager.freeze(pair)
             reviewer_relative = "reviewer"
             self.sandbox_manager.export_review(
@@ -1629,7 +1648,6 @@ class CodeStepRuntime:
     ) -> dict[str, Any]:
         ignored = {
             "messages",
-            "code_scheduler_decision",
             "code_runtime_session_id",
         }
         state = {
@@ -1644,6 +1662,7 @@ class CodeStepRuntime:
                 "code_candidate": session.candidate.model_dump(mode="json"),
                 "code_review_loop": session.loop.model_dump(mode="json"),
                 "code_worker_submission": session.worker_submission,
+                "code_repair_instruction": (session.loop.pending_instruction.model_dump(mode="json") if session.loop.pending_instruction else None),
                 "code_integration_status": (
                     session.integration_repository.status().model_dump(mode="json")
                 ),
@@ -1693,39 +1712,6 @@ class CodeStepRuntime:
             reason=reason,
         )
 
-    def _paused_result(
-        self,
-        session: _CodeRuntimeSession,
-        *,
-        report: CodeReviewReport,
-        usage: _InvocationUsage,
-        scheduler_decision: SchedulerCodeDecision | None = None,
-    ) -> dict[str, Any]:
-        return {
-            "messages": [AIMessage(content=report.summary)],
-            "executor_model_calls_used": usage.model_calls,
-            "executor_tool_calls_used": usage.tool_calls,
-            "code_worker_submission": session.worker_submission,
-            "code_review_loop": session.loop.model_dump(mode="json"),
-            "code_review_report": report.model_dump(mode="json"),
-            "code_artifact_manifest": None,
-            "code_publication_receipt": None,
-            "code_handoff_publication_receipts": [],
-            "code_integration_commit": None,
-            "code_integration_status": (
-                session.integration_repository.status().model_dump(mode="json")
-            ),
-            "code_attempt_archive": None,
-            "code_attempt_final_record": None,
-            "code_runtime_session_id": session.session_id,
-            "code_scheduler_decision_applied": (
-                scheduler_decision.model_dump(mode="json")
-                if scheduler_decision is not None
-                else None
-            ),
-            "code_superseded_attempt_records": session.superseded_attempt_records,
-            "code_agent_messages": session.all_messages,
-        }
 
     async def _resume_candidate_review(
         self,
@@ -1795,41 +1781,10 @@ class CodeStepRuntime:
                     session,
                     report=report,
                     usage=usage,
-                    scheduler_decision=None,
                 )
             if session.loop.status == "WAITING_FOR_WORKER":
-                # Recovery deliberately avoids silently starting a new repair
-                # cycle. The Scheduler receives the Reviewer's concise report
-                # and decides whether preserving this attempt is still useful.
-                instruction = session.loop.pending_instruction
-                if instruction is None:
-                    raise RuntimeError(
-                        "Recovered Code Reviewer requested repair without a "
-                        "repair instruction"
-                    )
-                report = CodeReviewReport(
-                    candidate=session.candidate,
-                    verdict="ESCALATED",
-                    summary=instruction.summary,
-                    verification_summary=(
-                        "Crash recovery preserved the Reviewer's accepted repair "
-                        "instruction; no final review report was expected at the "
-                        "WAITING_FOR_WORKER boundary."
-                    ),
-                    failed_test_summaries=tuple(
-                        finding.summary for finding in instruction.findings
-                    ),
-                    recommended_action="CONTINUE",
-                )
-                session.loop = session.loop.model_copy(
-                    update={
-                        "status": "ESCALATED_TO_SCHEDULER",
-                        "pending_instruction": None,
-                        "pending_scheduler_directive": None,
-                        "terminal_summary": report.summary,
-                    }
-                )
-            elif session.loop.status == "ESCALATED_TO_SCHEDULER":
+                return await self._resume_repair(input_state, session=session, usage=usage)
+            elif session.loop.status == "REPLAN_REQUIRED":
                 report = CodeReviewReport.model_validate(
                     review_details.get("code_review_report")
                 )
@@ -1839,18 +1794,13 @@ class CodeStepRuntime:
                     f"{session.loop.status}"
                 )
             session.last_report = report
-            session.pair = self.sandbox_manager.freeze(session.pair)
-            session.recovery_phase = "AWAITING_SCHEDULER"
             self._commit_session_checkpoint(
-                session,
-                phase="AWAITING_SCHEDULER",
-                reason=(
-                    "Recovered Reviewer result is waiting for an explicit "
-                    "Scheduler decision."
-                ),
+                session, phase="AWAITING_REPLAN",
+                reason="Recovered failed review is committed before terminal archival.",
             )
-            self._sessions[session.session_id] = session
-            return self._paused_result(session, report=report, usage=usage)
+            return self._finish_unpublished_session(
+                session, outcome="FAILED", failure_stage="REVIEWER", usage=usage,
+            )
         except Exception as error:
             session.pair = self.sandbox_manager.freeze(session.pair)
             session.recovery_phase = "RECOVERY_REQUIRED"
@@ -1886,6 +1836,34 @@ class CodeStepRuntime:
                 preserved_at + timedelta(minutes=self.archive_retention_minutes)
             ),
         )
+
+    def _finish_objection_session(self, session, details, usage):
+        """Stop unreviewed execution, archive it, then release its sandbox."""
+        outcome = details["worker_objection_outcome"]
+        session.pair = self.sandbox_manager.freeze(session.pair)
+        session.latest_candidate_relative = f"candidate/objection-{uuid4().hex[:16]}"
+        self.sandbox_manager.export_candidate(session.pair, session.attempt_root / session.latest_candidate_relative)
+        record = self._finish_terminated_session(
+            session, reason=outcome["decision"]["reason"],
+            outcome="SUPERSEDED" if outcome["decision"]["action"] == "REPLAN" else "CANCELLED",
+        )
+        return {
+            "messages": [AIMessage(content=outcome["decision"]["reason"])],
+            "executor_model_calls_used": usage.model_calls,
+            "executor_tool_calls_used": usage.tool_calls,
+            "worker_objection_outcome": outcome,
+            "worker_objection_records": details.get("worker_objection_records", []),
+            "code_worker_submission": session.worker_submission or None,
+            "code_review_loop": session.loop.model_dump(mode="json"),
+            "code_review_report": None,
+            "code_artifact_manifest": record["artifact_manifest"],
+            "code_publication_receipt": None, "code_handoff_publication_receipts": [],
+            "code_integration_commit": None,
+            "code_attempt_archive": record["archive"], "code_attempt_final_record": record,
+            "code_runtime_session_id": None,
+            "code_superseded_attempt_records": session.superseded_attempt_records,
+            "code_agent_messages": session.all_messages,
+        }
 
     def _finish_cancelled_session(
         self,
@@ -1963,7 +1941,6 @@ class CodeStepRuntime:
         self,
         session: _CodeRuntimeSession,
         *,
-        decision: SchedulerCodeDecision,
         outcome: str,
         failure_stage: str | None,
         usage: _InvocationUsage,
@@ -1982,7 +1959,7 @@ class CodeStepRuntime:
             candidate=session.candidate,
             parent_attempt_id=session.parent_attempt_id,
             outcome=outcome,
-            terminal_reason=decision.reason,
+            terminal_reason=session.last_report.summary,
             failure_stage=failure_stage,
             started_at=session.started_at,
             finalized_at=datetime.now(timezone.utc),
@@ -1992,7 +1969,6 @@ class CodeStepRuntime:
             archive=archive,
             artifact_manifest=manifest,
             review_report=session.last_report,
-            scheduler_decision=decision,
         )
         record_value = final_record.model_dump(mode="json")
         (session.attempt_root / "final_record.json").write_text(
@@ -2030,7 +2006,6 @@ class CodeStepRuntime:
             "code_attempt_archive": archive.model_dump(mode="json"),
             "code_attempt_final_record": record_value,
             "code_runtime_session_id": None,
-            "code_scheduler_decision_applied": decision.model_dump(mode="json"),
             "code_superseded_attempt_records": session.superseded_attempt_records,
             "code_agent_messages": session.all_messages,
         }
@@ -2042,7 +2017,6 @@ class CodeStepRuntime:
         *,
         report: CodeReviewReport,
         usage: _InvocationUsage,
-        scheduler_decision: SchedulerCodeDecision | None,
     ) -> dict[str, Any]:
         review_details = session.last_review_details or {}
         manifest = CodeArtifactManifest.model_validate(
@@ -2146,91 +2120,29 @@ class CodeStepRuntime:
             "code_attempt_archive": archive.model_dump(mode="json"),
             "code_attempt_final_record": record_value,
             "code_runtime_session_id": None,
-            "code_scheduler_decision_applied": (
-                scheduler_decision.model_dump(mode="json")
-                if scheduler_decision is not None
-                else None
-            ),
             "code_superseded_attempt_records": session.superseded_attempt_records,
             "code_agent_messages": session.all_messages,
         }
 
-    @operation('Code Runtime / Resume', fields=())
-    async def _resume_session(
-        self,
-        input_state: dict[str, Any],
-        *,
-        thread_id: str,
-        session_id: str,
-        decision: SchedulerCodeDecision,
-        pause_control=None,
+    @operation('Code Runtime / Resume Local Repair', fields=())
+    async def _resume_repair(
+        self, input_state: dict[str, Any], *, session: _CodeRuntimeSession,
+        usage: _InvocationUsage, pause_control=None,
     ) -> dict[str, Any]:
-        session = self._sessions.get(session_id)
-        if session is None:
-            raise RuntimeError(
-                "The CODE runtime session is unavailable; it may have already "
-                "terminated or the process may have restarted"
-            )
-        if session.loop.status != "ESCALATED_TO_SCHEDULER":
-            raise RuntimeError("CODE session is not awaiting Scheduler control")
-        session.loop = apply_scheduler_code_decision(session.loop, decision)
-        usage = _InvocationUsage(
-            model_limit=max(
-                int(input_state.get("executor_model_run_limit", 0) or 0),
-                0,
-            ),
-            tool_limit=max(
-                int(input_state.get("executor_tool_run_limit", 0) or 0),
-                0,
-            ),
-        )
-
-        if decision.action == "STOP":
-            return self._finish_unpublished_session(
-                session,
-                decision=decision,
-                outcome="FAILED",
-                failure_stage="REVIEWER",
-                usage=usage,
-            )
-
-        if decision.action == "RESTART":
-            old_attempt_id = session.candidate.attempt_id
-            terminal = self._finish_unpublished_session(
-                session,
-                decision=decision,
-                outcome="CANCELLED",
-                failure_stage=None,
-                usage=usage,
-            )
-            next_input = {
-                key: value
-                for key, value in input_state.items()
-                if key not in {"code_scheduler_decision", "code_runtime_session_id"}
-            }
-            next_input["code_parent_attempt_id"] = old_attempt_id
-            next_input["code_superseded_attempt_records"] = [
-                *session.superseded_attempt_records,
-                terminal["code_attempt_final_record"],
-            ]
-            return await self._run(
-                next_input,
-                thread_id=thread_id,
-                pause_control=pause_control,
-            )
-
+        if session.loop.status != "WAITING_FOR_WORKER" or session.loop.pending_instruction is None:
+            raise RuntimeError("Recovered repair requires an accepted Reviewer instruction")
         try:
             session.pair = self.sandbox_manager.handoff(session.pair, "WORKER")
             self._commit_session_checkpoint(
                 session,
                 phase="WORKER_RUNNING",
-                reason="Scheduler CONTINUE returned ownership to Worker.",
+                reason="Crash recovery resumed the accepted local repair.",
             )
             worker_details = await self._invoke(
                 session.worker,
                 render_prompt(
-                    "runtime/code_scheduler_continue_handoff",
-                    scheduler_epoch=session.loop.scheduler_epoch,
+                    "runtime/code_repair_handoff",
+                    repair_round=session.loop.repair_round,
                 ),
                 thread_id=session.worker_thread_id,
                 state=usage.state(
@@ -2252,17 +2164,17 @@ class CodeStepRuntime:
                 session.worker_submission = updated_submission
             if session.loop.status != "REVIEWING":
                 from workers.code_finalization import missing_handoff_message
-                raise RuntimeError(missing_handoff_message(worker_details, "SCHEDULER_CONTINUE"))
+                raise RuntimeError(missing_handoff_message(worker_details, "RECOVERED_REPAIR_RESPONSE"))
 
             review_details: dict[str, Any] = {}
-            for review_pass in range(session.loop.max_repair_rounds + 1):
+            for review_pass in range(session.loop.max_repair_rounds - session.loop.repair_round + 1):
                 session.pair = self.sandbox_manager.handoff(
                     session.pair,
                     "REVIEWER",
                 )
                 session.latest_candidate_relative = (
                     f"candidate/revision-{session.candidate.candidate_revision}-"
-                    f"epoch-{session.loop.scheduler_epoch}-review-{review_pass + 1}"
+                    f"recovery-review-{review_pass + 1}"
                 )
                 candidate_snapshot = (
                     session.attempt_root / session.latest_candidate_relative
@@ -2327,7 +2239,7 @@ class CodeStepRuntime:
                     boundary_report = None
                 elif session.loop.status in {
                     "APPLIED",
-                    "ESCALATED_TO_SCHEDULER",
+                    "REPLAN_REQUIRED",
                 }:
                     boundary_report = CodeReviewReport.model_validate(
                         review_details.get("code_review_report")
@@ -2346,7 +2258,7 @@ class CodeStepRuntime:
                 )
                 if session.loop.status in {
                     "APPLIED",
-                    "ESCALATED_TO_SCHEDULER",
+                    "REPLAN_REQUIRED",
                 }:
                     break
                 session.pair = self.sandbox_manager.handoff(
@@ -2385,6 +2297,8 @@ class CodeStepRuntime:
                 session.all_messages.extend(
                     worker_details.get("current_turn_messages", [])
                 )
+                if worker_details.get("worker_objection_outcome"):
+                    return self._finish_objection_session(session, worker_details, usage)
                 session.loop = CodeReviewLoopState.model_validate(
                     worker_details.get("code_review_loop")
                 )
@@ -2408,20 +2322,9 @@ class CodeStepRuntime:
                     session,
                     report=report,
                     usage=usage,
-                    scheduler_decision=decision,
                 )
-            session.pair = self.sandbox_manager.freeze(session.pair)
-            self._commit_session_checkpoint(
-                session,
-                phase="AWAITING_SCHEDULER",
-                reason="Frozen pair is waiting for another Scheduler decision.",
-            )
-            self._sessions[session.session_id] = session
-            return self._paused_result(
-                session,
-                report=report,
-                usage=usage,
-                scheduler_decision=decision,
+            return self._finish_unpublished_session(
+                session, outcome="FAILED", failure_stage="REVIEWER", usage=usage,
             )
         except Exception as error:
             try:

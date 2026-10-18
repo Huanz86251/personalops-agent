@@ -1,4 +1,4 @@
-本次是全局Replanner处理CODE审核结果，不是CODE执行控制器。当前失败候选已停止并归档；你只能生成新的CODE Step或FINISH，不能让失败候选直接发布。
+本次是全局Replanner处理CODE审核结果，独立CODE执行控制器已移除。当前失败候选已停止并归档；你只能生成新的CODE Step或FINISH，不能让失败候选直接发布。
 
 若downgrade_recommended=false：CONTINUE产生的新CODE Step必须保持原用户合同，并保留已验证接口、文件和行为；没有可信新路径时FINISH。
 

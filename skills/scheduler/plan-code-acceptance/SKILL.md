@@ -17,7 +17,7 @@ metadata:
 - requirements：每项 MUST 描述输入/前置状态、操作及可观察结果；SHOULD 单列偏好。不要把某种实现手法和额外美化升级为硬要求。
 - interfaces：用真实 kind 与 details 写清公开入口和参数/格式。未知接口先安排读取或探索，不编造仓库路径与函数。
 - validation_expectations：要求独立检查哪些行为及证据层级，不给 Reviewer 一段必须照抄的测试代码。检查设计应允许揭示实现错误。
-- implementation_guidance 与 non_goals：承载建议、环境限制和明确不做的事情，不能替代 MUST。
+- non_goals：承载明确不做的事情和环境限制，不能替代 MUST。
 
 ## 根据任务选择检查
 
@@ -29,4 +29,6 @@ CSV实测契约明确“金额>=阈值、零合法、非法配置退出2、不�
 
 具体写出容器可见输入、源码/命令入口和输出位置：/handoff 只读输入，Worker 的 /workspace 候选由 Reviewer 只读访问，Reviewer 测试输出在 /review。不要把“文件已写出”当作其他角色能读到，更不要给宿主路径让容器执行。明确依赖是否可用；本机镜像只有被实际检查过的能力，宿主装了 Pydantic 不代表容器也有。
 
-Step 的 success_criteria 与 code_task 保持一致，skill_topics 用最多三个业务/技术主题辅助候选，不强迫所有角色选相同 Skill。提交前问：Reviewer 不看 Worker 对话，能否知道调用什么、什么算正确、哪些仍无法验证？若答案是否，就补缺失契约，不再增加口号。
+CODE Step 的验收要求只写 code_task.requirements，success_criteria 填 []；skill_topics 用最多三个业务/技术主题辅助候选，不强迫所有角色选相同 Skill。提交前问：Reviewer 不看 Worker 对话，能否知道调用什么、什么算正确、哪些仍无法验证？若答案是否，就补缺失契约，不再增加口号。
+
+CODE Step 的 success_criteria 必须填 []；只在 code_task.requirements 填写验收要求，使用稳定 requirement_id 和 MUST/SHOULD。不得两处重复填写。Harness 仅在 requirements 缺失时迁移旧 success_criteria；不会自动认定要求已满足。WEB/GENERAL 仍填写非空 success_criteria。

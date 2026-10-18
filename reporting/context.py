@@ -346,14 +346,12 @@ def _build_attempt(
             unresolved_items=submission.unresolved_items,
             tool_audit=audit, tool_audit_available=audit_available,
             handoff_knowledge=[k.model_dump(mode="json") for k in submission.handoff_knowledge],
-            handoff_apis=[k.model_dump(mode="json") for k in submission.handoff_apis],
             execution_metrics=execution_metrics,
             applied_limits=dict(applied_limits),
             leadership_terminal_action=trace.get(
                 "worker_terminal_action"
             ),
             final_reviewer_request=trace.get("final_reviewer_request"),
-            plan_challenge=submission.plan_challenge,
         )
 
     fallback = _fallback_text(trace)
@@ -370,7 +368,7 @@ def _build_attempt(
         criterion_claims=[],
         resolved_evidence=[],
         resolved_artifacts=[],
-        unresolved_items=list(current_step.success_criteria),
+        unresolved_items=list(current_step.acceptance_criteria),
         tool_audit=audit, tool_audit_available=audit_available,
         execution_metrics=execution_metrics,
         applied_limits=dict(applied_limits),
@@ -378,7 +376,6 @@ def _build_attempt(
             "worker_terminal_action"
         ),
         final_reviewer_request=trace.get("final_reviewer_request"),
-        plan_challenge=None,
     )
 
 
@@ -424,7 +421,7 @@ def build_step_review_packet(
             step_id=current_step.step_id,
             step_assignment=current_step.objective,
             execution_guidance=current_step.execution_guidance,
-            success_criteria=list(current_step.success_criteria),
+            success_criteria=list(current_step.acceptance_criteria),
             artifact_outputs=list(current_step.artifact_outputs),
             user_interactions=[dict(item) for item in user_interactions],
         ),

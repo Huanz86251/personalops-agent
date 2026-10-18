@@ -79,7 +79,7 @@ def inventory():
                 "publish_worker_progress",
                 "submit_code_for_review",
                 "respond_to_code_review",
-                "submit_continued_code_for_review",
+
             ],
             "CODE_REVIEWER": [
                 "request_code_worker_repair",

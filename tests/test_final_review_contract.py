@@ -314,6 +314,30 @@ class ReviewContractTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(request, wire)
             self.assertIn('计划自身不能替代原请求', wire)
 
+    async def test_final_review_uses_step_reports_and_explicit_harness_repair_gate(self):
+        report = StepReport(
+            step_id=1, status="PARTIAL", summary="仍缺交付正文。",
+            answer_text="实际交付正文", stop_reason="submitted",
+        )
+        for available, repair_round in ((True, 0), (False, 0), (True, 3)):
+            model = Scripted([{'parsed': {
+                'action': 'FINAL', 'final_answer': '结果与缺口已说明。',
+                'unmet_success_criteria': ['待补齐'],
+            }}])
+            await run_hard_final_reviewer(
+                model,
+                context=PlanningContextPack(current_time='now', user_request='交付正文'),
+                plan_objective='交付正文', plan_success_criteria=['正文完整'],
+                step_reports=[report], replan_history=[], overall_stop_reason='submitted',
+                replan_available=False, return_to_worker_available=available,
+                repair_round=repair_round, max_repair_rounds=3,
+            )
+            pack = json.loads(model.requests[0][1]['content'])['独立审核材料']
+            self.assertEqual(pack['step_reports'][0]['answer_text'], '实际交付正文')
+            self.assertNotIn('latest_worker_evidence', pack)
+            self.assertNotIn('worker_submission', pack)
+            self.assertEqual(pack['return_to_worker_available'], available and repair_round < 3)
+
     async def test_final_review_uses_independent_minimal_evidence_pack(self):
         context = PlanningContextPack(
             current_time='SHOULD_NOT_APPEAR',

@@ -224,6 +224,8 @@ class WorkerProgressState(
     """Unified Conversation, execution-budget, and Worker progress state."""
 
     conversation_id: NotRequired[str]
+    worker_objection_records: NotRequired[list[dict[str, Any]]]
+    worker_objection_outcome: NotRequired[dict[str, Any] | None]
     # web_search首轮只向模型展示少量结果；同一次上游响应的其余结果
     # 留在checkpoint中，后续翻页只读本地缓存，不再次请求搜索服务。
     web_search_cache: NotRequired[
@@ -274,12 +276,14 @@ class WorkerProgressState(
     role_skill_snapshot: NotRequired[dict[str, Any]]
     skill_preparation_calls_used: NotRequired[int]
     worker_compaction_calls_used: NotRequired[int]
+    worker_compaction_deferred_signature: NotRequired[str]
     worker_archived_messages: NotRequired[list[Any]]
     worker_control_fingerprint: NotRequired[str]
     runtime_context_fingerprint: NotRequired[str]
     code_context_fingerprint: NotRequired[str]
     conversation_summary: NotRequired[str]
-    conversation_summary_message_count: NotRequired[int]
+    conversation_summary_message_count: NotRequired[int]  # legacy checkpoints
+    conversation_summary_turn_count: NotRequired[int]
     previous_run_summary: NotRequired[str]
 
     executor_model_run_limit: NotRequired[int]
@@ -386,6 +390,9 @@ def _keep_one_progress_call(response: ModelResponse) -> ModelResponse:
     messages = list(response.result)
     all_calls = [call for message in messages
                  for call in (getattr(message, "tool_calls", ()) or ())]
+    if any(call.get("name") == "raise_plan_objection" for call in all_calls):
+        # Objection middleware arbitrates this batch and blocks other tools.
+        return response
     from step_user_question import ASK_USER_NAME
     ask_calls = [call for call in all_calls if call.get("name") == ASK_USER_NAME]
     progress_calls = [call for call in all_calls
@@ -849,7 +856,7 @@ class WorkerProgressMiddleware(
             submit_tools = [
                 current_tool
                 for current_tool in request.tools
-                if self._tool_name(current_tool) in {*active_names, ASK_USER_NAME}
+                if self._tool_name(current_tool) in {*active_names, ASK_USER_NAME, "raise_plan_objection"}
             ]
             visible_names = {self._tool_name(tool) for tool in submit_tools}
             if not set(active_names).issubset(visible_names):
@@ -876,7 +883,7 @@ class WorkerProgressMiddleware(
                 self._tool_name(
                     current_tool
                 )
-                in {PUBLISH_WORKER_PROGRESS_NAME, ASK_USER_NAME}
+                in {PUBLISH_WORKER_PROGRESS_NAME, ASK_USER_NAME, "raise_plan_objection"}
             )
         ]
 

@@ -85,7 +85,6 @@ def test_scalar_sequence_repair_is_shared_across_worker_schemas():
 
     finding = CodeReviewFinding.model_validate({
         "finding_id": "F1",
-        "category": "CANDIDATE_DEFECT",
         "summary": "Observed defect.",
         "affected_requirement_ids": "r1",
     })

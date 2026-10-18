@@ -19,11 +19,12 @@ from workers.code_review_models import (
     CodeReviewLoopState,
     CodeReviewReport,
     CodeWorkerRepairResponse,
+    CodeWorkerRepairPayload,
     CodeWorkerSubmission,
-    CodeContinuationSubmission,
+
     finish_code_review,
     receive_code_worker_response,
-    receive_code_continuation_submission,
+
     request_code_repair as advance_repair_state,
 )
 from workers.code_attempt_models import (
@@ -37,7 +38,6 @@ from workers.control_protocol import defer_terminal_call_if_mixed
 
 SUBMIT_CODE_FOR_REVIEW_NAME = "submit_code_for_review"
 RESPOND_TO_CODE_REVIEW_NAME = "respond_to_code_review"
-SUBMIT_CONTINUED_CODE_FOR_REVIEW_NAME = "submit_continued_code_for_review"
 REQUEST_CODE_WORKER_REPAIR_NAME = "request_code_worker_repair"
 SUBMIT_CODE_REVIEW_NAME = "submit_code_review"
 
@@ -45,7 +45,7 @@ CODE_CONTROL_TOOL_NAMES = frozenset(
     {
         SUBMIT_CODE_FOR_REVIEW_NAME,
         RESPOND_TO_CODE_REVIEW_NAME,
-        SUBMIT_CONTINUED_CODE_FOR_REVIEW_NAME,
+
         REQUEST_CODE_WORKER_REPAIR_NAME,
         SUBMIT_CODE_REVIEW_NAME,
         PUBLISH_REVIEWED_CANDIDATE_NAME,
@@ -116,23 +116,13 @@ def _build_submission_record(
     state: dict[str, Any],
     submission: CodeWorkerSubmission,
 ) -> CodeWorkerSubmissionRecord:
-    if submission.plan_challenge is not None and int(
-        state.get("worker_plan_challenges_remaining", 0) or 0
-    ) <= 0:
-        raise ValueError(
-            "the global plan-challenge budget is exhausted; continue the current code task "
-            "or resubmit with plan_challenge=null"
-        )
     _validate_submission_contract(state, submission)
+    from handoff_knowledge import check_handoff_knowledge
+    submission = submission.model_copy(update={"handoff_knowledge": check_handoff_knowledge(submission.handoff_knowledge, state)})
     evidence = resolve_tool_evidence(
         list(state.get("worker_archived_messages", [])) + list(state.get("messages", [])),
         [
             *submission.evidence_tool_call_ids,
-            *(
-                submission.plan_challenge.evidence_tool_call_ids
-                if submission.plan_challenge is not None
-                else []
-            ),
         ],
     )
     forbidden = [
@@ -204,16 +194,6 @@ def submit_code_for_review(
     if deferred is not None:
         return deferred
 
-    if submission.plan_challenge is not None and int(
-        runtime.state.get("worker_plan_challenges_remaining", 0) or 0
-    ) <= 0:
-        return Command(update={"messages": [_tool_message(
-            runtime,
-            "Plan challenge rejected by Harness: the global challenge budget is exhausted. "
-            "Continue the current code task when possible or resubmit the real unresolved result "
-            "with plan_challenge=null; no Reviewer or Scheduler was called.",
-            SUBMIT_CODE_FOR_REVIEW_NAME,
-        )]})
     try:
         record = _build_submission_record(runtime.state, submission)
     except (ValueError, TypeError) as error:
@@ -257,7 +237,7 @@ def submit_code_for_review(
     description=load_prompt("workers/code_repair_response_tool"),
 )
 def respond_to_code_review(
-    response: CodeWorkerRepairResponse,
+    response: CodeWorkerRepairPayload,
     updated_submission: CodeWorkerSubmission | None,
     runtime: ToolRuntime,
 ) -> Command:
@@ -269,6 +249,12 @@ def respond_to_code_review(
 
     try:
         loop = _read_loop(runtime.state)
+        if loop.status != "WAITING_FOR_WORKER" or loop.pending_instruction is None:
+            raise ValueError("当前没有等待中的Code Worker修复请求。")
+        response = CodeWorkerRepairResponse.model_validate({
+            **response.model_dump(mode="json"),
+            "round_no": loop.repair_round,
+        })
         updated_loop = receive_code_worker_response(loop, response)
         record_value = None
         if response.action in {"REVISION_READY", "SUBMISSION_UPDATED"}:
@@ -333,94 +319,6 @@ def respond_to_code_review(
         {
             "type": "code_worker_repair_response",
             "response": response.model_dump(mode="json"),
-        }
-    )
-    return Command(update=update)
-
-
-@tool(
-    SUBMIT_CONTINUED_CODE_FOR_REVIEW_NAME,
-    description=load_prompt("workers/code_continuation_submit_tool"),
-)
-def submit_continued_code_for_review(
-    submission: CodeContinuationSubmission,
-    updated_submission: CodeWorkerSubmission | None,
-    runtime: ToolRuntime,
-) -> Command:
-    """Send continuation output to Reviewer, never directly to Scheduler."""
-
-    deferred = defer_terminal_call_if_mixed(
-        runtime, SUBMIT_CONTINUED_CODE_FOR_REVIEW_NAME
-    )
-    if deferred is not None:
-        return deferred
-
-    try:
-        loop = _read_loop(runtime.state)
-        updated_loop = receive_code_continuation_submission(loop, submission)
-        record_value = None
-        if submission.action in {"REVISION_READY", "SUBMISSION_UPDATED"}:
-            if updated_submission is None:
-                raise ValueError(
-                    f"{submission.action} requires updated_submission"
-                )
-            if updated_submission.candidate != submission.candidate:
-                raise ValueError(
-                    "updated_submission and continuation candidates differ"
-                )
-            record_value = _build_submission_record(
-                {
-                    **runtime.state,
-                    "code_candidate": submission.candidate.model_dump(
-                        mode="json"
-                    ),
-                },
-                updated_submission,
-            ).model_dump(mode="json")
-        elif updated_submission is not None:
-            raise ValueError(
-                "only REVISION_READY or SUBMISSION_UPDATED may include "
-                "updated_submission"
-            )
-    except (ValueError, TypeError) as error:
-        return Command(
-            update={
-                "messages": [
-                    _tool_message(
-                        runtime,
-                        (
-                            "Continued candidate submission rejected: "
-                            f"{error}. Correct it and submit again."
-                        ),
-                        SUBMIT_CONTINUED_CODE_FOR_REVIEW_NAME,
-                    )
-                ]
-            }
-        )
-
-    update: dict[str, Any] = {
-        "code_candidate": submission.candidate.model_dump(mode="json"),
-        "code_review_loop": updated_loop.model_dump(mode="json"),
-        "code_continuation_submission": submission.model_dump(mode="json"),
-        "code_agent_finished": True,
-        "worker_review_requested": True,
-        "messages": [
-            _tool_message(
-                runtime,
-                (
-                    "Continuation submission accepted for Reviewer with action "
-                    f"{submission.action}."
-                ),
-                SUBMIT_CONTINUED_CODE_FOR_REVIEW_NAME,
-            )
-        ],
-    }
-    if record_value is not None:
-        update["code_worker_submission"] = record_value
-    runtime.stream_writer(
-        {
-            "type": "code_continuation_submission",
-            "submission": submission.model_dump(mode="json"),
         }
     )
     return Command(update=update)
@@ -518,6 +416,8 @@ def submit_code_review(
         loop = _read_loop(runtime.state)
         validate_review_requirements(runtime.state, report)
         _validate_review_publication(runtime.state, report)
+        from handoff_knowledge import check_handoff_knowledge
+        report = report.model_copy(update={"handoff_knowledge": check_handoff_knowledge(report.handoff_knowledge, runtime.state)})
         updated = finish_code_review(loop, report)
     except (ValueError, TypeError) as error:
         return Command(
@@ -572,13 +472,12 @@ __all__ = [
     "CODE_CONTROL_TOOL_NAMES",
     "REQUEST_CODE_WORKER_REPAIR_NAME",
     "RESPOND_TO_CODE_REVIEW_NAME",
-    "SUBMIT_CONTINUED_CODE_FOR_REVIEW_NAME",
+
     "SUBMIT_CODE_FOR_REVIEW_NAME",
     "SUBMIT_CODE_REVIEW_NAME",
     "CodeWorkerSubmissionRecord",
     "request_code_worker_repair",
     "respond_to_code_review",
-    "submit_continued_code_for_review",
     "submit_code_for_review",
     "submit_code_review",
 ]

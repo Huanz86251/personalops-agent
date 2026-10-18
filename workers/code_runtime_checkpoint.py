@@ -7,6 +7,7 @@ snapshots, and the accepted integration baseline after a process restart.
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,7 +30,7 @@ CodeRuntimePhase = Literal[
     "CANDIDATE_READY",
     "REVIEWER_RUNNING",
     "WAITING_FOR_WORKER",
-    "AWAITING_SCHEDULER",
+    "AWAITING_REPLAN",
     "REVIEW_COMPLETED",
     "RECOVERY_REQUIRED",
     "TERMINAL",
@@ -153,9 +154,9 @@ class CodeRuntimeCheckpoint(CodeRuntimeCheckpointModel):
             raise ValueError(
                 "Cleanup authorization requires candidate and Reviewer snapshots"
             )
-        if self.phase == "AWAITING_SCHEDULER" and self.recovery_state is None:
+        if self.phase == "AWAITING_REPLAN" and self.recovery_state is None:
             raise ValueError(
-                "AWAITING_SCHEDULER requires a serializable recovery state"
+                "AWAITING_REPLAN requires a serializable recovery state"
             )
         return self
 
@@ -168,6 +169,24 @@ class CodeRuntimeCheckpointStore:
     @classmethod
     def path_for(cls, attempt_root: Path) -> Path:
         return Path(attempt_root).resolve() / cls.filename
+
+    def read_run_id(self, attempt_root: Path) -> str | None:
+        """Read ownership without interpreting a historical contract's schema.
+
+        Closed or unrelated runs must be filtered before ``load`` applies the
+        current strict Worker/Reviewer models. The original record is retained.
+        """
+
+        path = self.path_for(attempt_root)
+        if not path.is_file():
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("CODE runtime checkpoint must be a JSON object")
+        run_id = payload.get("run_id")
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("CODE runtime checkpoint has no valid run_id")
+        return run_id.strip()
 
     def load(self, attempt_root: Path) -> CodeRuntimeCheckpoint | None:
         path = self.path_for(attempt_root)

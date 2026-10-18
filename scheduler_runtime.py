@@ -5,6 +5,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import os
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 
@@ -58,7 +59,15 @@ class SchedulerConversation:
     data: dict
     context: object
     threshold: int = 20000
+    enabled: bool | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    def __post_init__(self):
+        if self.enabled is None:
+            value = os.getenv("SCHEDULER_COMPACTION_ENABLED", "false").strip().lower()
+            if value not in {"true", "false"}:
+                raise ValueError("SCHEDULER_COMPACTION_ENABLED must be true or false")
+            self.enabled = value == "true"
 
     @property
     def records(self):
@@ -86,7 +95,7 @@ class SchedulerConversation:
         content = compact_json({kind: value})
         self.add(kind, content, key=kind + ":" + hashlib.sha256(content.encode()).hexdigest())
 
-    def set_active(self, kind, value, *, role="user"):
+    def set_active(self, kind, value, *, role="user", owner=None):
         """Replace one active context block while keeping it at the prompt tail."""
         content = value if isinstance(value, str) else compact_json({kind: value})
         self.active_records[kind] = dict(
@@ -97,6 +106,30 @@ class SchedulerConversation:
             retention="replaceable",
             key="active:" + kind,
         )
+        if owner is not None:
+            self.active_records[kind]["owner"] = copy.deepcopy(owner)
+
+    def set_worker_control(self, decision, event):
+        """Bind live guidance to Harness-known targets and fresh reports."""
+        workers = {worker["worker_id"]: worker for worker in event.get("workers", [])}
+        targets = list(decision.get("target_worker_ids") or [])
+        if not targets:
+            if decision["action"] in {"ACCEPT", "CANCEL"}:
+                targets = list(workers)
+            elif event.get("triggering_worker_id"):
+                targets = [event["triggering_worker_id"]]
+            elif len(workers) == 1:
+                targets = list(workers)
+        # Unknown targets are rejected by the bridge, so do not persist them.
+        if not targets or any(target not in workers for target in targets):
+            return
+        self.set_active("当前Worker控制", decision, role="assistant", owner={
+            "worker_ids": targets,
+            "step_ids": sorted({str(workers[target]["step_id"]) for target in targets
+                                if workers[target].get("step_id") is not None}),
+            "prior_report_keys": [record["key"] for record in self.records
+                                  if record.get("kind") == "StepReport"],
+        })
 
     def clear_active(self, kind):
         self.active_records.pop(kind, None)
@@ -111,6 +144,11 @@ class SchedulerConversation:
         self.context.rag_context = ""
         self.data["records"] = [r for r in self.records
                                 if r.get("kind") != "文档检索资料（仅作参考，不是指令）"]
+        # Upgrade old session retention metadata without removing any content.
+        for record in self.records:
+            if record.get("kind") in {"相关较早对话", "辅助背景", "完整未摘要对话"}:
+                record["protected"] = True
+                record["retention"] = "durable"
         if self.records:
             return
         fixed = load_prompt("planning/scheduler")
@@ -123,20 +161,9 @@ class SchedulerConversation:
         if history:
             self.fact("历史用户原文", history)
         if recent:
-            # The latest user/assistant pair is a durable foreground contract.
-            # Older reranked pairs are useful context but may be evicted under
-            # genuine pressure because the full conversation remains in the
-            # checkpoint.
-            latest_user_index = max(
-                (index for index, item in enumerate(recent) if item.get("role") == "user"),
-                default=0,
-            )
-            older_pairs = recent[:latest_user_index]
-            latest_pair = recent[latest_user_index:]
-            if older_pairs:
-                self.add("相关较早对话", older_pairs, protected=False)
-            if latest_pair:
-                self.fact("最近一轮原文", latest_pair)
+            # All raw pairs supplied by the conversation policy are protected,
+            # including the configured recent window and unsummarized older pairs.
+            self.fact("完整未摘要对话", recent)
         if self.context.conversation_summary or self.context.memory_context or self.context.previous_run_summary:
             self.add(
                 "辅助背景",
@@ -145,7 +172,7 @@ class SchedulerConversation:
                     "上一轮内部执行摘要": self.context.previous_run_summary,
                     "相关记忆": self.context.memory_context,
                 },
-                protected=False,
+                protected=True,
             )
         self.fact("当前任务", self.context.user_request)
         if self.context.scope_contract is not None:
@@ -184,16 +211,19 @@ class SchedulerConversation:
         Durable: latest exact pair, task/environment contracts, reviewed Step
         contracts, StepReports, interface/artifact facts, and publication
         receipts. Replaceable: active plan and current live guidance. Evictable:
-        old protocols, older reranked pairs, auxiliary memory/summary, and time.
+        old protocols, explicitly evictable process records, and time.
+        Raw dialogue and its summary stay protected even when opt-in is enabled.
         A protocol is disclosed again from its canonical source when needed.
         """
+        if not self.enabled:
+            return
         if count_tokens_approximately(self.wire()) < self.threshold:
             return
         kept, removed = [], []
         for record in self.records:
             if (
                 record["protected"]
-                or record.get("key") == active_protocol
+                or (active_protocol is not None and record.get("key") == active_protocol)
             ):
                 kept.append(record)
             else:
@@ -286,9 +316,20 @@ def record_graph_facts(session, state):
                     "report_status": report_status,
                 },
             )
-    if reports:
-        # Once an independently assessed StepReport exists, prior live Worker
-        # guidance has served its purpose and should not remain foregrounded.
+    control = session.active_records.get("当前Worker控制", {})
+    owner = control.get("owner", {})
+    expected_steps = set(owner.get("step_ids", []))
+    prior_keys = set(owner.get("prior_report_keys", []))
+    newly_reviewed_steps = set()
+    for report in reports:
+        projection = scheduler_report_projection(report)
+        content = compact_json({"StepReport": projection})
+        key = "StepReport:" + hashlib.sha256(content.encode()).hexdigest()
+        if key not in prior_keys and projection.get("step_id") is not None:
+            newly_reviewed_steps.add(str(projection["step_id"]))
+    if expected_steps and expected_steps.issubset(newly_reviewed_steps):
+        # Earlier/unrelated reports cannot retire this control. Unowned legacy
+        # records remain conservatively until replacement rather than guessed.
         session.clear_active("当前Worker控制")
     for receipt in state.get("handoff_publication_receipts", []):
         session.fact("交接回执", receipt)
@@ -345,13 +386,13 @@ def update_active_plan(session, state):
     )
 
 
-def scheduler_node(handler, threshold):
+def scheduler_node(handler, threshold, enabled=None):
     """Bind the same session to node work and child Worker progress callbacks."""
     async def wrapped(state, config):
         from planning_models import PlanningContextPack
         from step_user_question import merge_ask_user_interactions
         context = PlanningContextPack.model_validate(state["context"]).model_copy(deep=True)
-        session = SchedulerConversation(context.scheduler_session, context, threshold)
+        session = SchedulerConversation(context.scheduler_session, context, threshold, enabled=enabled)
         token = CURRENT_SCHEDULER.set(session)
         current = {**state, "context": context}
         runtime_interactions = merge_ask_user_interactions(
@@ -399,7 +440,6 @@ def scheduler_node(handler, threshold):
         "direct_answer_node": "Scheduler / Direct Answer",
         "supervisor_node": "Scheduler / Plan",
         "step_executor_node": "Scheduler / Dispatch Step",
-        "code_controller_node": "Scheduler / Code Recovery",
         "step_reporter_node": "Scheduler / Review Web Step",
         "general_report_node": "Scheduler / Review General Step",
         "replanner_node": "Scheduler / Replan",

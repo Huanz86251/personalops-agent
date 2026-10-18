@@ -8,7 +8,6 @@ from langchain.messages import ToolMessage
 from langchain.tools import ToolRuntime, tool
 from langgraph.types import Command
 from pydantic.json_schema import SkipJsonSchema
-from api_handoff import ApiHandoffList, api_field
 from handoff_knowledge import HandoffKnowledge, knowledge_field
 from pydantic import BaseModel, Field, field_validator
 from prompt_loader import load_prompt
@@ -21,7 +20,6 @@ from workers.submission import (
     resolve_artifact_candidates,
     resolve_tool_evidence,
 )
-from workers.plan_challenge import PlanChallenge
 from middlewares import DynamicExecutionBudgetMiddleware
 from workers.control_protocol import defer_terminal_call_if_mixed
 from schema_normalization import (
@@ -63,7 +61,7 @@ class GeneralBudgetMiddleware(DynamicExecutionBudgetMiddleware):
         if limit is None:
             return None
         used = sum(int(state.get(k, 0) or 0) for k in (
-            "executor_model_calls_used", "skill_preparation_calls_used", "worker_compaction_calls_used"))
+            "executor_model_calls_used", "skill_preparation_calls_used", "worker_compaction_calls_used", "worker_leadership_model_rounds_used"))
         if used >= limit:
             return {"jump_to": "end"}
         tools_used = int(state.get("executor_tool_calls_used", 0) or 0)
@@ -95,7 +93,7 @@ class GeneralBudgetMiddleware(DynamicExecutionBudgetMiddleware):
         allowed = (
             ask_calls[:1]
             if ask_calls
-            else [c for c in calls if c.get("name") == GENERAL_REPORT_NAME][:1]
+            else [c for c in calls if c.get("name") in {GENERAL_REPORT_NAME, "raise_plan_objection"}][:1]
         )
         update = {
             "worker_finalization_model_calls_used": int(state.get("worker_finalization_model_calls_used", 0)) + 1,
@@ -142,19 +140,11 @@ class GeneralResult(BaseModel):
         max_length=24,
         description="逐项覆盖当前标准，最多24项；Claims are not independent approval.",
     )
-    handoff_apis: ApiHandoffList = api_field()
-    handoff_knowledge: SkipJsonSchema[list[HandoffKnowledge]] = knowledge_field()
-    plan_challenge: PlanChallenge | None = Field(
-        default=None,
-        description=(
-            "当前Step或ScopeContract实质改变了用户要求的对象、条件归属、集合关系"
-            "或读写效果时填写；不要把接口不熟、调用失败或执行困难写成计划异议。"
-        ),
-    )
+    handoff_knowledge: list[HandoffKnowledge] = knowledge_field()
 
     status: SkipJsonSchema[Literal["COMPLETED", "PARTIAL", "BLOCKED", "FAILED"]] = Field(
         default="BLOCKED",
-        description="Harness根据未解决项、计划异议和收尾原因确定；模型不要填写。",
+        description="Harness根据未解决项和收尾原因确定；模型不要填写。",
     )
     summary: str = Field(
         min_length=1,
@@ -215,21 +205,6 @@ def report_general_result(result: GeneralResult, runtime: ToolRuntime) -> Comman
     if deferred is not None:
         return deferred
     state = runtime.state
-    if result.plan_challenge is not None and int(
-        state.get("worker_plan_challenges_remaining", 0) or 0
-    ) <= 0:
-        return Command(update={
-            "messages": [ToolMessage(
-                content=(
-                    "Plan challenge rejected by Harness: the global challenge budget is exhausted. "
-                    "Continue within the current Step when possible; otherwise report the real unresolved "
-                    "result with plan_challenge=null. No Reviewer or Scheduler was called."
-                ),
-                tool_call_id=runtime.tool_call_id or GENERAL_REPORT_NAME,
-                name=GENERAL_REPORT_NAME,
-                status="error",
-            )],
-        })
     from reporting.criteria import (
         complete_missing_worker_claims,
         criterion_claim_repair_feedback,
@@ -267,6 +242,7 @@ def report_general_result(result: GeneralResult, runtime: ToolRuntime) -> Comman
             "executor_model_calls_used",
             "skill_preparation_calls_used",
             "worker_compaction_calls_used",
+            "worker_leadership_model_rounds_used",
         )
     )
     tool_limit = state.get("executor_tool_run_limit")
@@ -278,16 +254,16 @@ def report_general_result(result: GeneralResult, runtime: ToolRuntime) -> Comman
     )
     derived_status = (
         "BLOCKED"
-        if result.plan_challenge is not None or result.forced_finalization or exhausted
+        if result.forced_finalization or exhausted
         else "PARTIAL"
         if result.unresolved_items
         else "COMPLETED"
     )
     result = result.model_copy(update={"status": derived_status})
+    from handoff_knowledge import check_handoff_knowledge
+    result = result.model_copy(update={"handoff_knowledge": check_handoff_knowledge(result.handoff_knowledge, state)})
     ids = list(result.evidence_tool_call_ids)
     ids.extend(ref for claim in result.criterion_claims for ref in claim.evidence_tool_call_ids)
-    if result.plan_challenge is not None:
-        ids.extend(result.plan_challenge.evidence_tool_call_ids)
     candidates = []
     downloads = {r["candidate_id"]: r for r in state.get("worker_downloaded_artifacts", [])}
     for index, file in enumerate(result.files):
@@ -315,14 +291,12 @@ def report_general_result(result: GeneralResult, runtime: ToolRuntime) -> Comman
         step_id=state.get("step_id"),
         total_tool_calls=int(state.get("worker_total_tool_calls", 0)),
         submission=WorkerSubmission(
-            plan_challenge=result.plan_challenge,
             criterion_claims=result.criterion_claims,
             summary=result.summary,
             answer_text=result.answer_text,
             final_conclusion=result.summary,
             unresolved_items=result.unresolved_items,
             handoff_knowledge=result.handoff_knowledge,
-            handoff_apis=result.handoff_apis,
         ),
         resolved_evidence=evidence,
         resolved_artifacts=artifacts,
@@ -381,7 +355,7 @@ class GeneralCompletionMiddleware(AgentMiddleware[WorkerProgressState]):
         if not request.state.get("worker_finalize_requested"):
             return request
         from step_user_question import ASK_USER_NAME
-        allowed = {GENERAL_REPORT_NAME, ASK_USER_NAME}
+        allowed = {GENERAL_REPORT_NAME, ASK_USER_NAME, "raise_plan_objection"}
         tools = [t for t in request.tools if (getattr(t, "name", None) or
                  (t.get("name") if isinstance(t, dict) else None)) in allowed]
         return request.override(tools=tools, tool_choice="required")

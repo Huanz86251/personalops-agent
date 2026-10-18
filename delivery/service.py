@@ -172,12 +172,9 @@ class WorkspacePromotionService:
         *,
         layout: RunWorkspaceLayout,
         conversation_id: str,
-        final_status: str,
     ) -> WorkspacePromotion | None:
-        """Create a durable request only for a fully accepted CODE run."""
+        """Deliver available reviewed files independently of the final task status."""
 
-        if str(final_status).strip().upper() != "COMPLETED":
-            return None
         existing_for_run = await self.event_store.list_workspace_promotions(
             run_id=layout.run_id,
             limit=2,

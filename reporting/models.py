@@ -13,7 +13,6 @@ from workers.submission import (
 )
 from artifact_models import ResolvedArtifactCandidate
 from planning_models import StepArtifactOutput
-from workers.plan_challenge import PlanChallenge
 
 
 ReviewSubmissionSource = Literal[
@@ -68,12 +67,10 @@ class ReviewAttempt(BaseModel):
     tool_audit: list[dict[str, Any]] = Field(default_factory=list)
     tool_audit_available: bool = False
     handoff_knowledge: list[dict[str, Any]] = Field(default_factory=list)
-    handoff_apis: list[dict[str, Any]] = Field(default_factory=list)
     execution_metrics: dict[str, Any] = Field(default_factory=dict)
     applied_limits: dict[str, Any] = Field(default_factory=dict)
     leadership_terminal_action: str | None = None
     final_reviewer_request: dict[str, Any] | None = None
-    plan_challenge: PlanChallenge | None = None
 
 
 class StepReviewPacket(BaseModel):

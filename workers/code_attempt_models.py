@@ -17,7 +17,6 @@ from integration_repository import IntegrationCommitReceipt
 from .code_review_models import (
     CodeCandidateRef,
     CodeReviewReport,
-    SchedulerCodeDecision,
 )
 
 
@@ -154,7 +153,6 @@ class CodeAttemptFinalRecord(CodeAttemptModel):
     archive: CodeAttemptArchive | None
     artifact_manifest: CodeArtifactManifest
     review_report: CodeReviewReport | None = None
-    scheduler_decision: SchedulerCodeDecision | None = None
     publication: CodePublicationReceipt | None = None
     integration_commit: IntegrationCommitReceipt | None = None
 
@@ -181,8 +179,6 @@ class CodeAttemptFinalRecord(CodeAttemptModel):
                 raise ValueError("An APPLIED attempt cannot have failure_stage.")
             if self.review_report is None or self.review_report.verdict != "PASSED":
                 raise ValueError("APPLIED requires a PASSED Reviewer report.")
-            if self.scheduler_decision is not None:
-                raise ValueError("APPLIED does not require a Scheduler decision.")
             if self.archive is None:
                 raise ValueError("APPLIED requires a durable archive.")
             if self.publication is None:

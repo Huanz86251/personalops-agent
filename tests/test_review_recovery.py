@@ -174,7 +174,6 @@ class ReviewRecoveryTests(unittest.IsolatedAsyncioTestCase):
             status="PARTIAL",
             answer_text="full worker draft",
             handoff_knowledge=[],
-            handoff_apis=[],
             recovery_proposal={"proposal_kind": "WEB"},
             request_replan=True,
             replan_reason="Need a recovery decision.",
