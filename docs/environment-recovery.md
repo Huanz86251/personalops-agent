@@ -17,6 +17,10 @@ Windows 项目源码和私有任务记录仍在；本次没有恢复旧任务、
 
 ## 从完整备份恢复到 D 盘
 
+先检查 `%USERPROFILE%\.wslconfig`：原配置有32GB swap，且 swapFile 指向 C 盘。
+在首次启动 Ubuntu 前，将其中 swapFile 改为 `D:\\WSL\\wsl-swap.vhdx`，保留其他参数，
+避免再次产生 C 盘交换磁盘。本次未擅自修改全局配置，原文件副本在备份目录。
+
 在 PowerShell 中执行。先确认没有同名 Ubuntu；已有同名环境时不要覆盖：
 
 ```powershell
@@ -47,10 +51,6 @@ wsl -d Ubuntu -u root -- sh -lc 'getent passwd 1000 | cut -d: -f1'
 # 把下面的 linux_user 替换成上一条实际输出：
 wsl --manage Ubuntu --set-default-user linux_user
 ```
-
-原 `%USERPROFILE%\.wslconfig` 配置过32GB swap，并将 swapFile 放在 C 盘。
-恢复前建议将其中 swapFile 改为 `D:\\WSL\\wsl-swap.vhdx`，保留其他参数，
-避免以后再次产生 C 盘交换磁盘。本次未擅自修改这份全局配置。
 
 ## 恢复后只做基础检查
 
